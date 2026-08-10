@@ -1,0 +1,328 @@
+"""Content-diff collector for the overwrite-only ``scoredatalog`` table."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+import logging
+import sqlite3
+import time
+
+from oraja_training.collect.normalize import derive_play, payload_hash
+from oraja_training.collect.source import SourceSignature, source_signature
+from oraja_training.db import readers, store
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class SourceChangedDuringRead(RuntimeError):
+    """Raised when the two source databases could not be read consistently."""
+
+
+@dataclass(frozen=True, slots=True)
+class TickResult:
+    new_plays: int
+    lost_events: int
+    generation_changed: bool
+    scanned: bool = True
+
+
+def _same_persisted_signal(
+    signature: SourceSignature, last_mtime: float | None, last_size: int | None
+) -> bool:
+    if last_mtime is None or last_size is None:
+        return False
+    current_mtime = signature.last_mtime
+    if current_mtime is None:
+        return False
+    return abs(current_mtime - float(last_mtime)) < 0.000_000_5 and (
+        signature.total_size == int(last_size)
+    )
+
+
+class Poller:
+    """Poll and persist the latest row for every changed chart.
+
+    File mtimes merely decide whether to scan.  Once scanning begins, every
+    ``scoredatalog`` row is compared by ``playcount`` and canonical payload
+    hash with the assistant-owned cursor.
+    """
+
+    def __init__(
+        self,
+        db_dir: str | Path,
+        assistant_db: str | Path | sqlite3.Connection = Path("assistant.db"),
+        *,
+        poll_interval: float = 5.0,
+        busy_timeout_ms: int = 1_000,
+        max_retries: int = 3,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.db_dir = Path(db_dir).expanduser().resolve()
+        self.scoredatalog_path = self.db_dir / "scoredatalog.db"
+        self.score_path = self.db_dir / "score.db"
+        self.poll_interval = float(poll_interval)
+        self.busy_timeout_ms = int(busy_timeout_ms)
+        self.max_retries = max(1, int(max_retries))
+        self.clock = clock
+        self._last_signature: SourceSignature | None = None
+        self._owns_connection = not isinstance(assistant_db, sqlite3.Connection)
+
+        if isinstance(assistant_db, sqlite3.Connection):
+            self.conn = assistant_db
+            self.conn.row_factory = sqlite3.Row
+            self._assert_connection_is_not_source()
+            store.migrate(self.conn)
+        else:
+            assistant_path = Path(assistant_db).expanduser().resolve()
+            source_paths = {
+                self.scoredatalog_path.resolve(),
+                self.score_path.resolve(),
+                (self.db_dir / "scorelog.db").resolve(),
+                (self.db_dir / "songdata.db").resolve(),
+                (self.db_dir / "songinfo.db").resolve(),
+            }
+            if assistant_path in source_paths:
+                raise ValueError("assistant_db must not be a beatoraja source database")
+            self.conn = store.init(assistant_path)
+
+    def _assert_connection_is_not_source(self) -> None:
+        row = self.conn.execute("PRAGMA database_list").fetchone()
+        if row is None or not row[2]:
+            return
+        connected = Path(str(row[2])).resolve()
+        source_paths = {
+            self.db_dir / name
+            for name in (
+                "score.db",
+                "scoredatalog.db",
+                "scorelog.db",
+                "songdata.db",
+                "songinfo.db",
+            )
+        }
+        if connected in {path.resolve() for path in source_paths}:
+            raise ValueError("assistant connection points at a beatoraja source database")
+
+    def close(self) -> None:
+        if self._owns_connection:
+            self.conn.close()
+
+    def __enter__(self) -> "Poller":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _state(self) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM collector_state WHERE key = 'scoredatalog'"
+        ).fetchone()
+
+    def _read_consistent_snapshot(
+        self,
+    ) -> tuple[list[readers.ScoreRow], dict[tuple[str, int], readers.ScoreRow], SourceSignature]:
+        for _attempt in range(self.max_retries):
+            scoredatalog_before = source_signature(self.scoredatalog_path)
+            score_before = source_signature(self.score_path)
+            scoredatalog_conn = readers.open_live(
+                self.scoredatalog_path, busy_timeout_ms=self.busy_timeout_ms
+            )
+            try:
+                score_conn = readers.open_live(
+                    self.score_path, busy_timeout_ms=self.busy_timeout_ms
+                )
+                try:
+                    scoredatalog_version_before = int(
+                        scoredatalog_conn.execute(
+                            "PRAGMA data_version"
+                        ).fetchone()[0]
+                    )
+                    score_version_before = int(
+                        score_conn.execute("PRAGMA data_version").fetchone()[0]
+                    )
+                    rows = readers.read_scoredatalog(scoredatalog_conn)
+                    aggregate_rows = readers.read_score(score_conn)
+                    scoredatalog_version_after = int(
+                        scoredatalog_conn.execute(
+                            "PRAGMA data_version"
+                        ).fetchone()[0]
+                    )
+                    score_version_after = int(
+                        score_conn.execute("PRAGMA data_version").fetchone()[0]
+                    )
+                    scoredatalog_after = source_signature(
+                        self.scoredatalog_path
+                    )
+                    score_after = source_signature(self.score_path)
+                finally:
+                    score_conn.close()
+            finally:
+                scoredatalog_conn.close()
+
+            if (
+                scoredatalog_before == scoredatalog_after
+                and score_before == score_after
+                and scoredatalog_version_before == scoredatalog_version_after
+                and score_version_before == score_version_after
+            ):
+                aggregate = {
+                    (str(row["sha256"]), int(row["mode"])): row
+                    for row in aggregate_rows
+                }
+                return rows, aggregate, scoredatalog_after
+
+        raise SourceChangedDuringRead(
+            "scoredatalog.db or score.db changed during "
+            f"{self.max_retries} consecutive reads"
+        )
+
+    def _record_error(self, error: Exception, signature: SourceSignature | None) -> None:
+        state = self._state()
+        generation = int(state["source_generation"]) if state is not None else 0
+        store.upsert_collector_state(
+            self.conn,
+            key="scoredatalog",
+            source_generation=generation,
+            last_mtime=signature.last_mtime if signature else None,
+            last_size=signature.total_size if signature else None,
+            last_run_at=int(self.clock()),
+            last_error=f"{type(error).__name__}: {error}",
+        )
+        self.conn.commit()
+
+    def tick(self, *, force: bool = False) -> TickResult:
+        """Run at most one complete content scan."""
+
+        try:
+            trigger = source_signature(self.scoredatalog_path)
+        except OSError as exc:
+            self._record_error(exc, None)
+            raise
+        state = self._state()
+        if not force:
+            if self._last_signature is not None and trigger == self._last_signature:
+                return TickResult(0, 0, False, scanned=False)
+            if (
+                self._last_signature is None
+                and state is not None
+                and state["last_error"] is None
+                and _same_persisted_signal(
+                    trigger, state["last_mtime"], state["last_size"]
+                )
+            ):
+                self._last_signature = trigger
+                return TickResult(0, 0, False, scanned=False)
+
+        try:
+            rows, aggregate, stable_signature = self._read_consistent_snapshot()
+            state = self._state()
+            generation = int(state["source_generation"]) if state is not None else 0
+            cursors = store.load_cursors(self.conn, generation)
+            current_keys = {
+                (str(row["sha256"]), int(row["mode"])) for row in rows
+            }
+
+            replacement = (
+                self._last_signature is not None
+                and self._last_signature.main_identity
+                != stable_signature.main_identity
+            )
+            # scoredatalog is append-by-chart and overwrite-by-key; wholesale
+            # key disappearance is therefore another regeneration signal.
+            replacement = replacement or bool(set(cursors).difference(current_keys))
+            rollback = any(
+                (key := (str(row["sha256"]), int(row["mode"]))) in cursors
+                and int(row["playcount"]) < cursors[key][0]
+                for row in rows
+            )
+            generation_changed = replacement or rollback
+            if generation_changed:
+                generation += 1
+                cursors = {}
+
+            now = int(self.clock())
+            new_plays = 0
+            lost_total = 0
+            with self.conn:
+                for row in rows:
+                    key = (str(row["sha256"]), int(row["mode"]))
+                    current_playcount = int(row["playcount"])
+                    current_hash = payload_hash(row)
+                    cursor = cursors.get(key)
+
+                    should_insert = cursor is None or current_playcount > cursor[0]
+                    payload_changed = (
+                        cursor is not None
+                        and current_playcount == cursor[0]
+                        and current_hash != cursor[1]
+                    )
+                    if should_insert:
+                        lost = (
+                            max(0, current_playcount - cursor[0] - 1)
+                            if cursor is not None
+                            else 0
+                        )
+                        play = derive_play(
+                            row,
+                            source="collector",
+                            source_generation=generation,
+                            aggregate_row=aggregate.get(key),
+                            lost_events=lost,
+                            ingested_at=now,
+                        )
+                        if store.insert_play(self.conn, play):
+                            new_plays += 1
+                            lost_total += lost
+                    elif payload_changed:
+                        play = derive_play(
+                            row,
+                            source="collector",
+                            source_generation=generation,
+                            aggregate_row=aggregate.get(key),
+                            ingested_at=now,
+                        )
+                        store.insert_play(self.conn, play, update_existing=True)
+
+                    if should_insert or payload_changed:
+                        store.upsert_cursor(
+                            self.conn,
+                            source_generation=generation,
+                            sha256=key[0],
+                            mode=key[1],
+                            playcount=current_playcount,
+                            payload_hash=current_hash,
+                        )
+
+                store.upsert_collector_state(
+                    self.conn,
+                    key="scoredatalog",
+                    source_generation=generation,
+                    last_mtime=stable_signature.last_mtime,
+                    last_size=stable_signature.total_size,
+                    last_run_at=now,
+                    last_error=None,
+                )
+
+            self._last_signature = stable_signature
+            return TickResult(new_plays, lost_total, generation_changed)
+        except Exception as exc:
+            self._record_error(exc, trigger)
+            raise
+
+    def run_daemon(
+        self, on_tick: Callable[[TickResult], None] | None = None
+    ) -> None:
+        """Poll forever until interrupted by the caller."""
+
+        while True:
+            try:
+                result = self.tick()
+            except (OSError, sqlite3.Error, SourceChangedDuringRead) as exc:
+                LOGGER.error("collector tick failed; retrying: %s", exc)
+            else:
+                if on_tick is not None:
+                    on_tick(result)
+            time.sleep(self.poll_interval)

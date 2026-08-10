@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+player-file/
+assistant.db
+assistant.db-journal
+assistant.db-shm
+assistant.db-wal
+.cache/
+.DS_Store
+.sites/
+export/
+data/
