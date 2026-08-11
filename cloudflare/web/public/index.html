@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>oraja-training</title>
+    <style>
+      :root { font-family: system-ui, sans-serif; line-height: 1.5; }
+      body { max-width: 58rem; margin: 0 auto; padding: 2rem 1rem; }
+      nav { display: flex; justify-content: space-between; gap: 1rem; }
+      section { border: 1px solid #8886; border-radius: .7rem; padding: 1rem; margin: 1rem 0; }
+      button, input { font: inherit; padding: .45rem .6rem; }
+      button { cursor: pointer; }
+      .muted { opacity: .75; }
+      [hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <nav aria-label="Language and account">
+      <strong>oraja-training</strong>
+      <span><button id="ja" type="button">日本語</button> <button id="ko" type="button">한국어</button> <a href="/auth.html" data-i18n="account">アカウント</a></span>
+    </nav>
+    <main>
+      <h1 data-i18n="title">練習ダッシュボード</h1>
+      <p class="muted" data-i18n="intro">プロフィールごとの最新表、IR端末、データ操作を安全に管理します。</p>
+      <section aria-labelledby="profile-title">
+        <h2 id="profile-title" data-i18n="profile">プロフィール</h2>
+        <label><span data-i18n="profileId">プロフィールID</span> <input id="profile" autocomplete="off" /></label>
+        <button id="load" type="button" data-i18n="load">概要を取得</button>
+        <pre id="summary" aria-live="polite"></pre>
+      </section>
+      <section aria-labelledby="actions-title">
+        <h2 id="actions-title" data-i18n="actions">操作</h2>
+        <button id="export" type="button" data-i18n="export">データをExport</button>
+        <button id="delete" type="button" data-i18n="delete">削除を申請</button>
+        <button id="cancel" type="button" data-i18n="cancel">7日取消</button>
+        <p id="message" role="status"></p>
+      </section>
+      <p class="muted" data-i18n="privacy">raw DB、token、会話全文は画面やMCPへ公開しません。</p>
+    </main>
+    <script>
+      const translations = {
+        ja: { account: "アカウント", title: "練習ダッシュボード", intro: "プロフィールごとの最新表、IR端末、データ操作を安全に管理します。", profile: "プロフィール", profileId: "プロフィールID", load: "概要を取得", actions: "操作", export: "データをExport", delete: "削除を申請", cancel: "7日取消", privacy: "raw DB、token、会話全文は画面やMCPへ公開しません。" },
+        ko: { account: "계정", title: "연습 대시보드", intro: "프로필별 최신 표, IR 장치와 데이터 작업을 안전하게 관리합니다.", profile: "프로필", profileId: "프로필 ID", load: "요약 가져오기", actions: "작업", export: "데이터 Export", delete: "삭제 신청", cancel: "7일 취소", privacy: "raw DB, token, 대화 전문은 화면이나 MCP에 공개하지 않습니다." },
+      };
+      const $ = (id) => document.getElementById(id);
+      const state = { lang: "ja" };
+      function setLanguage(lang) {
+        state.lang = lang;
+        document.documentElement.lang = lang;
+        for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = translations[lang][node.dataset.i18n];
+      }
+      async function post(path) {
+        const profile = $("profile").value.trim();
+        const response = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": document.cookie.match(/(?:^|; )oraja_csrf=([^;]+)/)?.[1] || "" }, body: JSON.stringify({ profile_id: profile }) });
+        const payload = await response.json().catch(() => ({}));
+        $("message").textContent = response.ok ? JSON.stringify(payload) : `${response.status}: ${payload.error?.code || "error"}`;
+      }
+      $("ja").onclick = () => setLanguage("ja");
+      $("ko").onclick = () => setLanguage("ko");
+      $("load").onclick = async () => { const profile = $("profile").value.trim(); const response = await fetch(`/t/${encodeURIComponent(profile)}/recommend/header.json`); $("summary").textContent = JSON.stringify(await response.json().catch(() => ({})), null, 2); };
+      $("export").onclick = () => post("/v1/privacy/export");
+      $("delete").onclick = () => post("/v1/privacy/delete");
+      $("cancel").onclick = () => post("/v1/privacy/delete/cancel");
+    </script>
+  </body>
+</html>
