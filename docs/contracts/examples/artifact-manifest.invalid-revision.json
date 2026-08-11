@@ -18,6 +18,7 @@
   ],
   "latest_pointer": {
     "profile_id": "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f",
+    "trust_domain": "official",
     "revision": 0,
     "recommendation_version_id": "018f0f0f-0f31-7f0f-8f0f-0f0f0f0f0f0f",
     "manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",

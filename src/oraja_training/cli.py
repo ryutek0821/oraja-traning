@@ -13,9 +13,11 @@ from typing import Sequence
 from oraja_training.collect import backfill, snapshot
 from oraja_training.collect.poller import Poller, TickResult
 from oraja_training.db import readers, store
+from oraja_training.db.recommendation_adapter import SQLiteRecommendationRepository
+from oraja_training.domain import ProfileContext
 from oraja_training.features import build_all
 from oraja_training.model import fit_latest
-from oraja_training.plan import build_session, write_export
+from oraja_training.plan import build_session, recommendation_output, write_export
 from oraja_training.serve import serve
 from oraja_training.tables import fetch_table, resolve
 
@@ -68,6 +70,9 @@ def _parser() -> argparse.ArgumentParser:
     daily.add_argument("--output-dir", type=Path, default=Path("export/current"))
     daily.add_argument("--menu-date")
     daily.add_argument("--readiness", choices=("normal", "tired"), default="normal")
+    daily.add_argument("--profile-id", default="local-profile")
+    daily.add_argument("--profile-name", default="Personal")
+    daily.add_argument("--timezone", default="Asia/Tokyo")
 
     tables = subcommands.add_parser("tables", help="difficulty table operations")
     table_commands = tables.add_subparsers(dest="tables_command", required=True)
@@ -90,6 +95,9 @@ def _parser() -> argparse.ArgumentParser:
     menu.add_argument("--output-dir", type=Path, default=Path("export/current"))
     menu.add_argument("--date", default=date.today().isoformat())
     menu.add_argument("--readiness", choices=("normal", "tired"), default="normal")
+    menu.add_argument("--profile-id", default="local-profile")
+    menu.add_argument("--profile-name", default="Personal")
+    menu.add_argument("--timezone", default="Asia/Tokyo")
 
     review = subcommands.add_parser("review", help="show latest daily training summary")
     review.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
@@ -105,6 +113,14 @@ def _parser() -> argparse.ArgumentParser:
 def _render_tick(result: TickResult) -> None:
     if result.scanned or result.new_plays or result.lost_events:
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _profile_context(args: argparse.Namespace) -> ProfileContext:
+    return ProfileContext(
+        profile_id=args.profile_id,
+        display_name=args.profile_name,
+        timezone=args.timezone,
+    )
 
 
 def _table_specs(values: Sequence[str]) -> tuple[tuple[str, str], ...]:
@@ -205,35 +221,9 @@ def _build_features(songinfo_db: Path, assistant_db: Path) -> int:
 
 
 def _persist_session(assistant_db: Path, session: object) -> None:
-    payload = json.dumps(asdict(session), ensure_ascii=False, separators=(",", ":"))
     conn = store.init(assistant_db)
     try:
-        with conn:
-            conn.execute(
-                "INSERT INTO sessions(created_at, arm, slots_json) VALUES (?, ?, ?)",
-                (
-                    int(getattr(session, "generated_at")),
-                    "model" if int(getattr(session, "model_version")) else "heuristic",
-                    payload,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO recommendation_versions(
-                  generated_at, menu_date, import_id, model_version,
-                  seed, readiness, manifest_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(getattr(session, "generated_at")),
-                    str(getattr(session, "menu_date")),
-                    int(getattr(session, "import_id")),
-                    int(getattr(session, "model_version")),
-                    str(getattr(session, "seed")),
-                    str(getattr(session, "readiness")),
-                    payload,
-                ),
-            )
+        SQLiteRecommendationRepository(conn).save_output(recommendation_output(session))
     finally:
         conn.close()
 
@@ -333,7 +323,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             model = fit_latest(conn)
             session = build_session(
-                conn, menu_date=menu_date, readiness=args.readiness
+                conn,
+                menu_date=menu_date,
+                readiness=args.readiness,
+                profile=_profile_context(args),
             )
         finally:
             conn.close()
@@ -378,7 +371,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "menu":
         conn = store.init(args.assistant_db)
         try:
-            session = build_session(conn, menu_date=args.date, readiness=args.readiness)
+            session = build_session(
+                conn,
+                menu_date=args.date,
+                readiness=args.readiness,
+                profile=_profile_context(args),
+            )
         finally:
             conn.close()
         write_export(session, args.output_dir)

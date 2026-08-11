@@ -43,6 +43,6 @@
   "provenance": {
     "trust_domain": "official",
     "source": "official_ir",
-    "aggregate_eligible": true
+    "aggregate_eligible": false
   }
 }

@@ -2,6 +2,19 @@
 
 これはサービス層の wire contract であり、現行の `serve/app.py` の localhost API をこの issue で変更するものではない。
 
+## 受理前の canonicalization と provenance
+
+request body は JSON Schema 検証後、[ADR-0003](adr/0003-revision-idempotency.md) の
+RFC 8785 JCS で canonical 化して digest を作る。`account_id`、`profile_id`、
+`trust_domain`、`aggregate_eligible` は request body の値を認可・集合学習の根拠に
+しない。Worker は credential/grant と control-plane の所有権から provenance を
+決め、正規化後にだけ保存する。
+
+IR event の `provenance.aggregate_eligible` は常に `false` とし、集合学習へ渡す derived record には、同じ source digest を参照する
+`aggregate-eligibility.v1` の server-attested decision が必要である。decision は
+公式 provenance、SP7、非course、明示かつ未取消の同意をすべて満たす場合だけ
+`aggregate_eligible=true` を発行し、self-hosted には発行しない。
+
 ## 認証方式
 
 | 入口 | 認証 | 必須 scope | owner の決定 |

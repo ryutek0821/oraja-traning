@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oraja-training.dev/contracts/ir-event/v1/schema.json",
   "title": "oraja-training IR play event v1",
-  "description": "Allowlisted one-play envelope. BMS content, replay keyinput, and arbitrary values are not part of this contract.",
+  "description": "Allowlisted one-play client envelope. BMS content, replay keyinput, arbitrary values, and aggregate eligibility claims are not accepted from the client.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -133,7 +133,10 @@
       "properties": {
         "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
         "source": { "enum": ["official_ir", "self_hosted_import"] },
-        "aggregate_eligible": { "type": "boolean" }
+        "aggregate_eligible": {
+          "const": false,
+          "description": "Client events can never attest aggregate eligibility; the official Worker issues aggregate-eligibility.v1 separately."
+        }
       }
     }
   },

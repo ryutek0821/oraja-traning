@@ -10,6 +10,8 @@
     "schema_version",
     "job_id",
     "idempotency_key",
+    "job_type",
+    "input_digest",
     "account_id",
     "profile_id",
     "trust_domain",
@@ -24,6 +26,8 @@
     "schema_version": { "const": "1" },
     "job_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "idempotency_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/idempotencyKey" },
+    "job_type": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/jobType" },
+    "input_digest": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
     "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
@@ -31,7 +35,7 @@
     "input_bundle": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["object_key", "sha256", "size_bytes", "encryption"],
+      "required": ["object_key", "sha256", "size_bytes", "encryption", "key_ref"],
       "properties": {
         "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" },
         "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },

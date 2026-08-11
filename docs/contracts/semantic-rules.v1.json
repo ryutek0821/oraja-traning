@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/semantic-rules/v1/schema.json",
+  "contract": "semantic-rules",
+  "schema_version": "1",
+  "canonicalization": {
+    "algorithm": "RFC8785-JCS",
+    "encoding": "UTF-8",
+    "digest": "SHA-256",
+    "reject_before_canonicalization": [
+      "duplicate_object_names",
+      "NaN",
+      "Infinity",
+      "unpaired_surrogates"
+    ],
+    "digest_is_lowercase_hex": true,
+    "preimages": {
+      "payload_digest": "JCS of the accepted contract object, excluding transport headers and server receipt metadata",
+      "manifest_sha256": "JCS of the persisted manifest object; never include a field containing its own digest",
+      "input_digest": "JCS of {contract_versions,input_manifest_sha256,profile_id,trust_domain,job_type}",
+      "job_idempotency_key": "job:<profile_id>:<input_digest>",
+      "upload_idempotency_key": "<profile_id>:<manifest_sha256>"
+    }
+  },
+  "rules": [
+    {
+      "id": "owner-chain",
+      "assertions": [
+        "account_id owns profile_id",
+        "profile_id owns device_id, event_id, job_id, and recommendation_version_id",
+        "request body IDs never override the owner resolved from the credential or grant"
+      ]
+    },
+    {
+      "id": "digest-chain",
+      "assertions": [
+        "container input references the accepted upload manifest digest",
+        "container output references the input manifest digest",
+        "artifact manifest references the output manifest digest",
+        "container input and output carry the same job_type and input_digest",
+        "a digest mismatch rejects the transition without creating a new effect"
+      ]
+    },
+    {
+      "id": "latest-pointer-cas",
+      "assertions": [
+        "candidate profile_id, recommendation_version_id, and revision equal the outer artifact manifest",
+        "candidate trust_domain equals the outer artifact trust_domain",
+        "candidate manifest_sha256 equals the RFC8785-JCS digest of the outer manifest",
+        "first revision has previous_revision null; later revisions have previous_revision equal to current revision",
+        "update occurs only when candidate_revision is greater than current_revision within the same profile and trust_domain",
+        "a stale candidate may remain immutable but must not replace latest_pointer"
+      ]
+    },
+    {
+      "id": "aggregate-gate",
+      "assertions": [
+        "an IR client event must carry aggregate_eligible=false",
+        "aggregate_eligible is never trusted from an IR client",
+        "an aggregate-eligibility.v1 decision from official_worker is required",
+        "the decision requires official provenance, explicit non-revoked consent, SP7, and is_course=false",
+        "self_hosted records can never satisfy the decision"
+      ]
+    }
+  ]
+}

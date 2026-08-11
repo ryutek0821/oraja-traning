@@ -1,0 +1,49 @@
+{
+  "manifest_version": 1,
+  "source_revision": "3679083b1dac709884ba575b08ba7c35dc4ec12e",
+  "test_functions": 42,
+  "collected_cases": 56,
+  "parametrized_functions": [
+    {
+      "path": "tests/test_features.py::test_decoders_reject_corrupt_values",
+      "cases": 6,
+      "values": [
+        "decode_distribution:#0000",
+        "decode_distribution:#0000000000000!",
+        "decode_speedchange:180,0,120",
+        "decode_speedchange:180,100,180,50",
+        "decode_lanenotes:1,2",
+        "decode_lanenotes:1,-2,0"
+      ]
+    },
+    {
+      "path": "tests/test_normalize.py::test_clear_only_identifies_unambiguous_credited_gauges",
+      "cases": 10,
+      "values": [
+        "clear=0",
+        "clear=1",
+        "clear=2",
+        "clear=3",
+        "clear=4",
+        "clear=5",
+        "clear=6",
+        "clear=7",
+        "clear=8",
+        "clear=10"
+      ]
+    }
+  ],
+  "test_files": {
+    "tests/test_backfill.py": 4,
+    "tests/test_features.py": 5,
+    "tests/test_menu.py": 3,
+    "tests/test_model.py": 3,
+    "tests/test_normalize.py": 4,
+    "tests/test_poller.py": 3,
+    "tests/test_readers.py": 3,
+    "tests/test_serve.py": 5,
+    "tests/test_snapshot.py": 2,
+    "tests/test_store.py": 4,
+    "tests/test_tables.py": 6
+  }
+}

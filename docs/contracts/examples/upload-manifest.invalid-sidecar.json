@@ -16,5 +16,6 @@
     {"file_name": "score.db-wal", "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "size_bytes": 1, "object_key": "profiles/p/uploads/score.db-wal"}
   ],
   "snapshot": {"static_snapshot": true, "wal_present": false, "shm_present": false, "source_generation": "018f0f0f-0f11-7f0f-8f0f-0f0f0f0f0f0f"},
+  "encryption": {"scheme": "envelope-v1", "scope": "profile"},
   "privacy": {"contains_bms": false, "contains_replay": false, "aggregate_eligible": false}
 }

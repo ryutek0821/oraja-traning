@@ -1,0 +1,24 @@
+{
+  "contract": "aggregate-eligibility",
+  "schema_version": "1",
+  "decision_id": "018f0f0f-0f05-7f0f-8f0f-0f0f0f0f0f0f",
+  "account_id": "018f0f0f-0f00-7f0f-8f0f-0f0f0f0f0f0f",
+  "profile_id": "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f",
+  "source_record_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "trust_domain": "self_hosted",
+  "source_kind": "self_hosted_import",
+  "game_mode": "SP7",
+  "is_course": false,
+  "consent": {
+    "aggregate_training": true,
+    "consent_version": "consent-v1",
+    "consented_at": "2026-08-11T03:00:00Z",
+    "revoked_at": null
+  },
+  "aggregate_eligible": true,
+  "attestation": {
+    "issuer": "official_worker",
+    "issued_at": "2026-08-11T03:01:00Z",
+    "contract": "aggregate-eligibility.v1"
+  }
+}

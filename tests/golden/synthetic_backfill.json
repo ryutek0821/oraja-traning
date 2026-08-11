@@ -1,0 +1,36 @@
+{
+  "fixture_version": 2,
+  "backfill": {
+    "result": {
+      "charts": 4,
+      "legacy_plays": 4,
+      "ir_imports": 2,
+      "song_rows_seen": 5,
+      "skipped_ir_noplay": 2
+    },
+    "legacy": {
+      "rows": 4,
+      "course_rows": 2,
+      "completed_rows": 3,
+      "full_judgement_rows": 1,
+      "max_survival": 1.0,
+      "empty_poor_sum": 4,
+      "empty_poor_max": 3,
+      "zero_empty_poor_rows": 2,
+      "exceeded_aggregate_rows": 1,
+      "credited_gauge_counts": {
+        "EASY": 1,
+        "HARD": 1,
+        "null": 2
+      },
+      "ir_null_derived_rows": 2
+    }
+  },
+  "snapshot": {
+    "effective_date": "2023-11-16",
+    "baseline_judged": 140,
+    "cumulative_playcount": 12,
+    "delta_judged": 30,
+    "score_state_rows": 4
+  }
+}

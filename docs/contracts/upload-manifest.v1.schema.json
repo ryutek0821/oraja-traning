@@ -16,6 +16,7 @@
     "trust_domain",
     "files",
     "snapshot",
+    "encryption",
     "privacy"
   ],
   "properties": {
@@ -70,6 +71,15 @@
         "wal_present": { "const": false },
         "shm_present": { "const": false },
         "source_generation": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" }
+      }
+    },
+    "encryption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "scope"],
+      "properties": {
+        "scheme": { "const": "envelope-v1" },
+        "scope": { "const": "profile" }
       }
     },
     "privacy": {

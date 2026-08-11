@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/aggregate-eligibility/v1/schema.json",
+  "title": "oraja-training aggregate eligibility decision v1",
+  "description": "A server-attested decision. This is not accepted from an IR client payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "decision_id",
+    "account_id",
+    "profile_id",
+    "source_record_digest",
+    "trust_domain",
+    "source_kind",
+    "game_mode",
+    "is_course",
+    "consent",
+    "aggregate_eligible",
+    "attestation"
+  ],
+  "properties": {
+    "contract": { "const": "aggregate-eligibility" },
+    "schema_version": { "const": "1" },
+    "decision_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "source_record_digest": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+    "trust_domain": { "const": "official" },
+    "source_kind": { "enum": ["official_ir", "official_normalized"] },
+    "game_mode": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/gameMode" },
+    "is_course": { "const": false },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aggregate_training", "consent_version", "consented_at", "revoked_at"],
+      "properties": {
+        "aggregate_training": { "const": true },
+        "consent_version": { "type": "string", "pattern": "^consent-v[0-9]+$" },
+        "consented_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+        "revoked_at": {
+          "const": null,
+          "description": "An eligibility decision is never issued for revoked consent."
+        }
+      }
+    },
+    "aggregate_eligible": { "const": true },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuer", "issued_at", "contract"],
+      "properties": {
+        "issuer": { "const": "official_worker" },
+        "issued_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+        "contract": { "const": "aggregate-eligibility.v1" }
+      }
+    }
+  }
+}

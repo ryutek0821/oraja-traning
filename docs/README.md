@@ -6,6 +6,7 @@
 - [データ分類](data-classification.md)
 - [API・認証・監査契約](api-contract.md)
 - [移行と rollback](migration-rollback.md)
+- [Python core / adapter boundary](core-api.md)
 - [ドメインエンティティ](contracts/domain-entities.md)
 - [機械可読契約](contracts/README.md)
 - [ADR-0001: 信頼境界](adr/0001-trust-boundaries.md)

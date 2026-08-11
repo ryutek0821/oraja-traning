@@ -83,6 +83,7 @@
       "additionalProperties": false,
       "required": [
         "profile_id",
+        "trust_domain",
         "revision",
         "recommendation_version_id",
         "manifest_sha256",
@@ -90,6 +91,7 @@
       ],
       "properties": {
         "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+        "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
         "revision": {
           "type": "integer",
           "minimum": 1,

@@ -6,7 +6,9 @@
     "setting": "PROFILE_LIMIT",
     "default": 1,
     "minimum": 1,
-    "enforcement": "account-slot-transaction"
+    "enforcement": "account-slot-transaction",
+    "occupying_lifecycles": ["active", "suspended", "pending_delete"],
+    "released_lifecycle": "deleted"
   },
   "entities": [
     {

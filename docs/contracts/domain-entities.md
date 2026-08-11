@@ -19,7 +19,7 @@
 PROFILE_LIMIT = 1
 ```
 
-`PROFILE_LIMIT` は将来変更できる設定値として扱うが、初期版では account の profile slot を transaction 内で予約してから Profile を作成する。`active` または `pending_delete` の profile 数が limit 以上なら作成を拒否する。削除済み slot は再利用できる。API の事前 count だけに頼らず、account row の compare-and-set と slot の一意制約を同じ transaction で実行する。
+`PROFILE_LIMIT` は将来変更できる設定値として扱うが、初期版では account の profile slot を transaction 内で予約してから Profile を作成する。`active`、`suspended`、または `pending_delete` の profile 数が limit 以上なら作成を拒否する。`deleted` になった slot だけを再利用できる。API の事前 count だけに頼らず、account row の compare-and-set と slot の一意制約を同じ transaction で実行する。
 
 ```sql
 -- 概念契約。D1/DO adapter が同じ原子性を実現する。

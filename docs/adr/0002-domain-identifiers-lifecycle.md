@@ -9,7 +9,7 @@
 - `Account`、`Profile`、`Device`、`PlayEvent`、`Job`、`RecommendationVersion` はすべて UUIDv7 を使う。
 - service-side ID は URL の意味付けや認可に使わず、parent owner row を照合する。
 - Account は Profile の親、Profile は Device/PlayEvent/Job/RecommendationVersion の親である。
-- 初期設定 `PROFILE_LIMIT=1` はドメイン制約として扱い、active/pending_delete profile の予約を account slot transaction で直列化する。
+- 初期設定 `PROFILE_LIMIT=1` はドメイン制約として扱い、active/suspended/pending_delete profile の予約を account slot transaction で直列化する。deleted になった時だけ slot を解放する。
 - password、recovery code、device token、OAuth token は平文を保存しない。token は hash、必要な暗号化 secret は別 key hierarchy で保護する。
 - deletion は7日取消 window とし、確定後の backup は最大30日で失効する。匿名集合モデルの既生成 parameter は個人データへ逆参照できない限り保持する。
 

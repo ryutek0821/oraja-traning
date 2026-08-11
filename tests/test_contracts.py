@@ -190,8 +190,20 @@ def _refs(value: Any) -> list[str]:
     return []
 
 
+def _assert_latest_pointer_matches(manifest: dict[str, Any]) -> None:
+    pointer = manifest["latest_pointer"]
+    for field in ("profile_id", "trust_domain", "revision", "recommendation_version_id"):
+        if pointer[field] != manifest[field]:
+            raise SchemaViolation(f"latest_pointer.{field} does not match outer manifest")
+
+
 SCHEMA_FIXTURES = (
     ("ir-event.v1.schema.json", "ir-event.valid.json", "ir-event.invalid-extra-field.json"),
+    (
+        "aggregate-eligibility.v1.schema.json",
+        "aggregate-eligibility.valid.json",
+        "aggregate-eligibility.invalid-self-hosted.json",
+    ),
     ("upload-manifest.v1.schema.json", "upload-manifest.valid.json", "upload-manifest.invalid-sidecar.json"),
     ("container-input-manifest.v1.schema.json", "container-input.valid.json", "container-input.invalid-self-hosted-aggregate.json"),
     ("container-output-manifest.v1.schema.json", "container-output.valid.json", "container-output.invalid-self-hosted-aggregate.json"),
@@ -233,6 +245,12 @@ def test_common_schema_refs_resolve_from_the_declared_schema_ids() -> None:
 def test_domain_entity_catalog_fixes_profile_limit_and_ownership() -> None:
     catalog = json.loads((CONTRACTS / "domain-entities.v1.json").read_text())
     assert catalog["profile_limit"]["default"] == 1
+    assert catalog["profile_limit"]["occupying_lifecycles"] == [
+        "active",
+        "suspended",
+        "pending_delete",
+    ]
+    assert catalog["profile_limit"]["released_lifecycle"] == "deleted"
     entities = {entity["name"]: entity for entity in catalog["entities"]}
     assert entities["Profile"]["owner"] == "account_id"
     assert entities["Device"]["owner"] == "profile_id"
@@ -283,6 +301,37 @@ def test_ir_event_course_id_is_required_only_for_course_events() -> None:
     _validate(schema, regular, document=schema, common=common)
 
 
+def test_ir_client_cannot_self_attest_aggregate_eligibility() -> None:
+    schema, common = _load("ir-event.v1.schema.json")
+    payload = json.loads((EXAMPLES / "ir-event.valid.json").read_text())
+    assert payload["provenance"]["aggregate_eligible"] is False
+
+    payload["provenance"]["aggregate_eligible"] = True
+    with pytest.raises(SchemaViolation):
+        _validate(schema, payload, document=schema, common=common)
+
+
+def test_aggregate_eligibility_requires_server_attested_consent() -> None:
+    schema, common = _load("aggregate-eligibility.v1.schema.json")
+    valid = json.loads((EXAMPLES / "aggregate-eligibility.valid.json").read_text())
+    _validate(schema, valid, document=schema, common=common)
+
+    without_consent = json.loads(json.dumps(valid))
+    without_consent["consent"]["aggregate_training"] = False
+    with pytest.raises(SchemaViolation):
+        _validate(schema, without_consent, document=schema, common=common)
+
+    revoked = json.loads(json.dumps(valid))
+    revoked["consent"]["revoked_at"] = "2026-08-11T04:00:00Z"
+    with pytest.raises(SchemaViolation):
+        _validate(schema, revoked, document=schema, common=common)
+
+    client_claim = json.loads(json.dumps(valid))
+    client_claim["attestation"]["issuer"] = "ir_client"
+    with pytest.raises(SchemaViolation):
+        _validate(schema, client_claim, document=schema, common=common)
+
+
 def test_self_hosted_cannot_become_aggregate_input() -> None:
     for name in (
         "container-input.invalid-self-hosted-aggregate.json",
@@ -292,3 +341,50 @@ def test_self_hosted_cannot_become_aggregate_input() -> None:
         assert payload["trust_domain"] == "self_hosted"
         aggregate_eligible = payload["aggregate_eligible"] if "aggregate_eligible" in payload else payload["policy"]["aggregate_eligible"]
         assert aggregate_eligible is True
+
+
+def test_semantic_rules_fix_digest_and_latest_pointer_boundaries() -> None:
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())
+    canonicalization = rules["canonicalization"]
+    assert canonicalization["algorithm"] == "RFC8785-JCS"
+    assert canonicalization["encoding"] == "UTF-8"
+    assert canonicalization["digest"] == "SHA-256"
+    assert canonicalization["digest_is_lowercase_hex"] is True
+    assert set(canonicalization["reject_before_canonicalization"]) == {
+        "duplicate_object_names",
+        "NaN",
+        "Infinity",
+        "unpaired_surrogates",
+    }
+    assert canonicalization["preimages"]["manifest_sha256"].startswith("JCS of the persisted manifest")
+    assert canonicalization["preimages"]["job_idempotency_key"] == "job:<profile_id>:<input_digest>"
+    rule_ids = {rule["id"] for rule in rules["rules"]}
+    assert {"owner-chain", "digest-chain", "latest-pointer-cas", "aggregate-gate"} <= rule_ids
+
+
+def test_job_input_digest_is_explicitly_bound_to_the_idempotency_key() -> None:
+    for name in ("container-input.valid.json", "container-output.valid.json"):
+        payload = json.loads((EXAMPLES / name).read_text())
+        assert payload["job_type"]
+        assert payload["input_digest"]
+        assert payload["idempotency_key"] == (
+            f"job:{payload['profile_id']}:{payload['input_digest']}"
+        )
+
+
+def test_latest_pointer_keeps_profile_and_trust_partition() -> None:
+    schema, common = _load("artifact-manifest.v1.schema.json")
+    payload = json.loads((EXAMPLES / "artifact-manifest.valid.json").read_text())
+    _validate(schema, payload, document=schema, common=common)
+    _assert_latest_pointer_matches(payload)
+    pointer = payload["latest_pointer"]
+    assert pointer["profile_id"] == payload["profile_id"]
+    assert pointer["trust_domain"] == payload["trust_domain"]
+    assert pointer["revision"] == payload["revision"]
+    assert pointer["recommendation_version_id"] == payload["recommendation_version_id"]
+
+    # JSON Schema can validate the field shape, while equality is a
+    # cross-record semantic rule enforced by the publisher transaction.
+    pointer["trust_domain"] = "self_hosted"
+    with pytest.raises(SchemaViolation):
+        _assert_latest_pointer_matches(payload)

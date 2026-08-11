@@ -20,6 +20,7 @@
     "shm_present": false,
     "source_generation": "018f0f0f-0f11-7f0f-8f0f-0f0f0f0f0f0f"
   },
+  "encryption": {"scheme": "envelope-v1", "scope": "profile"},
   "privacy": {
     "contains_bms": false,
     "contains_replay": false,
