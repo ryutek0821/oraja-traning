@@ -1,6 +1,6 @@
 # oraja-training
 
-beatoraja のローカルSQLite DBを**読み取り専用**で取り込み、Ryuhei向けの
+beatoraja のローカルSQLite DBを**読み取り専用**で取り込み、プロフィール単位の
 Personal Recommend難易度表と、1日10万判定ノーツの日替わりメニューを生成する
 ローカルツールです。履歴・特徴・推薦結果は専用の`assistant.db`だけに保存します。
 

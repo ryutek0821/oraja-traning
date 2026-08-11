@@ -7,6 +7,26 @@
 
 ---
 
+## A-0. 適用範囲とサービスEpicとの関係
+
+この `SPEC.md` の v1 は、読み取り専用の beatoraja DB とローカル
+`assistant.db` を使う **self-hosted MVP** の実装正典である。ここでいう v1 の
+「IR連携なし」「書き込み先は `assistant.db` のみ」「ローカルHTTP配信」は、
+意図した制約であり、公式収集サービスの完成を意味しない。
+
+親Epic #1 の公式サービス計画（アカウント、公式IR、Cloudflare、Remote MCP、
+匿名集合学習）は、この文書の v1 を置き換える仕様ではない。サービス境界・wire
+contract・データ分類は `docs/architecture.md` と `docs/contracts/` を正典とし、
+各機能の実装と受入は #1 配下の Phase/実装issue（#2〜#23）で個別に完了させる。
+サービス実装が v1 のローカル挙動を変更するときは、先に adapter 契約と golden
+互換条件を更新する。
+
+2026-08-11 時点で、ローカル MVP と Phase 0 の設計資料は存在する。一方、公式
+Worker の実デプロイ、IR JAR、5DB upload、生成ジョブ、Remote MCP/OAuth、削除・
+復元、β運用、OSS公開はこの仕様の完了証拠に含まれず、未完了として扱う。
+
+---
+
 ## A-1. 目的と非目標
 
 **目的**: beatoraja のローカルDBを読み取り専用で監視し、プレイ単位の練習ログを蓄積した上で、次のセッションで叩くべき譜面・順序・回数を提示する。

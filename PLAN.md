@@ -298,7 +298,7 @@ course生成とプレイ中の動的再推定はv1の非目標。
 | **P4: モデル** | 段階モデルを時間順holdoutで評価 | **実装済み**。十分な履歴とゲート通過までは決定的cold-startを使用 |
 | **P5: メニュー + 配信** | 10万判定メニュー、ローカル難易度表、最小Web UI | **実装済み**。Personal/Today表、Webキュー、疲労日モードを生成 |
 | **P6: 自己実験** | 翌日保持・転移・校正をランダム選曲と比較 | **未着手**。§6の検証結果が出ること |
-| **P7以降** | 状態空間化、リプレイ判定再現、IR adapter、一般公開 | MVP後 |
+| **P7以降** | 状態空間化、リプレイ判定再現 | ローカルMVP後。公式IR・Cloudflare・一般公開は親Epic #1 の Phase 0〜5（#24〜#29）と実装issue #2〜#23で管理する |
 
 ---
 
@@ -326,8 +326,8 @@ course生成とプレイ中の動的再推定はv1の非目標。
 4. 難易度表の取得・キャッシュ・sha256/md5突合を実装する
 5. `songinfo` 特徴、Replayメタデータ、モデル、メニュー、配信の順に進める
 
-運用メモ: 現在の作業ディレクトリはGitリポジトリではない。GitHub管理を始める場合は、
-リポジトリ初期化とremote設定後、グローバル運用方針どおりissueを起点にする。
+運用メモ: このプロジェクトはGitHubリポジトリで管理し、コード変更は issue 起点とする。
+親Epic #1 の実装issueは、ユーザーの明示承認、専用ブランチ、受入確認の順に進める。
 
 ---
 
@@ -451,7 +451,7 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 | 3 | `score` のIR集約は派生4項目をNULLにし、モデル教師から除外する |
 | 4 | `clear` は結果ランプ、`.brd.gauge` は開始ゲージ。`credited_gauge_kind` と `selected_gauge_kind` を分離する |
 | 5 | `clear=2/3` は開始ゲージを復元できない。結果側推定は `clear=4..7` のみ |
-| 6 | schema versionは2。version 1から復元不能なのでin-place移行せず、削除してbackfillし直す |
+| 6 | schema versionは3。version 1から復元不能なのでin-place移行せず、version 2は履歴を保持してversion 3へ移行する |
 | 7 | v1特徴量は `songinfo` に限定し、BMSパーサ・固定レーン特徴・RANDOM Monte Carloを作らない |
 | 8 | 難易度表突合は必須。表ごとのレベル効果は単一軸に潰さない |
 | 9 | コレクタ稼働後2〜4週間は、予測より記録と可視化を優先する |
@@ -480,6 +480,58 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 - 全テスト成功。入力DBのハッシュ・mtimeは前後一致し、WAL/SHMは生成されていない
 
 ---
+
+## 13. #1 親Epicの現状監査（2026-08-11）
+
+### 13.1 仕様の読み分け
+
+この文書の前半（§1〜§12）は、ローカル self-hosted MVP の調査結果と実装計画で
+ある。公式収集サービスの目標状態は、親Epic #1 と `docs/architecture.md`、
+`docs/api-contract.md`、`docs/contracts/` が定義する。両者を同じ「完了」として
+数えない。
+
+`SPEC.md` の A-0 にもこの境界を記載した。したがって、v1 の「IR連携なし」は
+公式IRを永続的に禁止する意味ではなく、ローカルMVPの受入範囲を示す。
+
+### 13.2 現行実装と #1 の目標との差分
+
+| 境界 | 監査時に確認できる実体 | 判定 | 担当issue |
+|---|---|---|---|
+| ローカル収集・推薦 | `src/oraja_training/collect`、`db/store.py`、`serve/app.py` と既存pytest | ローカルMVPの範囲で実装済み。単一 `player_name`、`assistant.db`、localhost配信のまま | #3/#4、既存MVP |
+| Phase 0 契約 | `docs/architecture.md`、ADR、`docs/contracts/`、契約テスト | 設計成果物はある。GitHub上の #2 は受入・クローズ前であり、サービス実装完了の証拠ではない | #2 |
+| Cloudflare基盤 | `cloudflare/wrangler.jsonc`、migration、Workerのhealth/version/auth、設定検査 | 作業ツリーに基盤草案はあるが、Profile DO/Container/Workflowはhealth骨格。preview/staging/productionのデプロイ証跡なし | #5〜#11 |
+| 公式IR | `cloudflare/ir/README.md` はJava/Gradle境界の予約だけ | `IRConnection` JAR、`IR_SEND_ALWAYS`、spool、ACK/再送は未実装 | #12/#13 |
+| 5DB提出・生成・表配信 | service contract上のAPI定義のみ。現行CLIは2DBのローカル提出、表はlocalhost配信 | multipart、暗号化R2、Container生成、revision公開、capability URLは未受入 | #9〜#14 |
+| Web・削除・復元 | 最小静的Webと認証骨格、既存migration/rollbackメモ | 日韓ダッシュボード、export、7日取消、30日backup、`deleteAll()`/restore drillは未完了 | #15/#16 |
+| OAuth / Remote MCP / AI記憶 | Workerの `/mcp` route、OAuth metadata、Resources/Tools、journal受入の証跡なし | 未実装 | #17〜#19 |
+| β・OSS・一般公開 | `LICENSE`、`SECURITY.md`、`CONTRIBUTING.md`、30日運用記録、release artifactなし | 未実装。公開・改名・一般登録・本番deployは実行していない | #20〜#23 |
+
+「作業ツリーに存在する」「設計に書かれている」「受入済み」「デプロイ済み」は
+別の状態である。特に未コミットの別worker成果物や `.example.invalid` の環境設定は、
+本番接続・実データ移行・公開の証拠として扱わない。
+
+### 13.3 親Epicの完了ゲート
+
+親Epic本文のチェックリストだけで子issueを完了扱いにしない。Phase Epic #24〜#29
+と実装issue #2〜#23のGitHub上の受入状態を正とし、次の順序を守る。
+
+1. #2〜#4で契約、合成fixture、domain coreの受入を完了する。
+2. #5〜#19で公式基盤、収集、生成、Web、削除、OAuth、MCP、AI journalを実装し、
+   自動試験と越境negative testを通す。
+3. #20で脅威モデル・SLO・復元/削除runbook、#21で招待β30日、#22でOSS公開準備を
+   完了する。
+4. #21/#22のgo判定後に限り、#23のlaunch runbookを別途承認して改名・公開・一般登録・
+   本番deployを実行する。
+
+監査時点では #2〜#23 はすべてOPENであるため、#1 は未完了である。今回の担当では
+issue状態の変更、実装issueの代行、外部環境への接続・公開を行わない。
+
+### 13.4 外部操作の扱い
+
+デプロイ、migration、実データ移行、GitHub公開/改名、一般登録は、
+[`cloudflare/runbooks/epic-1-release-gates.md`](cloudflare/runbooks/epic-1-release-gates.md)
+の承認ゲートと証跡様式に従う。runbookは手順と停止/rollback条件だけを定義し、
+この監査ではコマンドを実行しない。
 
 ## 参考リンク
 
