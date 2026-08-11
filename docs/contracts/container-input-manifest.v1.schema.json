@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/container-input/v1/schema.json",
+  "title": "oraja-training Container input manifest v1",
+  "description": "Authenticated, encrypted input handed to a single-profile Container job.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "job_id",
+    "idempotency_key",
+    "account_id",
+    "profile_id",
+    "trust_domain",
+    "source_manifest_sha256",
+    "input_bundle",
+    "requested_at",
+    "game_mode",
+    "policy"
+  ],
+  "properties": {
+    "contract": { "const": "container-input-manifest" },
+    "schema_version": { "const": "1" },
+    "job_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "idempotency_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/idempotencyKey" },
+    "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
+    "source_manifest_sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+    "input_bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_key", "sha256", "size_bytes", "encryption"],
+      "properties": {
+        "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" },
+        "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5368709120
+        },
+        "encryption": { "const": "envelope-v1" },
+        "key_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:/-]+$"
+        }
+      }
+    },
+    "requested_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+    "game_mode": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/gameMode" },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aggregate_eligible", "include_raw_db_in_model"],
+      "properties": {
+        "aggregate_eligible": { "type": "boolean" },
+        "include_raw_db_in_model": { "const": false }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "trust_domain": { "const": "self_hosted" } } },
+      "then": {
+        "properties": {
+          "policy": { "properties": { "aggregate_eligible": { "const": false } } }
+        }
+      }
+    }
+  ]
+}

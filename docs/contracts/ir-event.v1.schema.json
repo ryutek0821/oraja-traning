@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/ir-event/v1/schema.json",
+  "title": "oraja-training IR play event v1",
+  "description": "Allowlisted one-play envelope. BMS content, replay keyinput, and arbitrary values are not part of this contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "event_id",
+    "profile_id",
+    "device_id",
+    "occurred_at",
+    "game_mode",
+    "rule",
+    "chart",
+    "play",
+    "is_course",
+    "provenance"
+  ],
+  "properties": {
+    "contract": { "const": "ir-event" },
+    "schema_version": { "const": "1" },
+    "event_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "device_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "occurred_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+    "game_mode": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/gameMode" },
+    "rule": { "enum": ["BEATORAJA-SP7"] },
+    "chart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "ln_mode"],
+      "properties": {
+        "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+        "md5": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/md5" },
+        "ln_mode": { "type": "integer", "enum": [0, 1, 2] }
+      }
+    },
+    "play": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clear",
+        "gauge_kind",
+        "assist_kind",
+        "notes",
+        "passnotes",
+        "minbp",
+        "ex_score",
+        "combo",
+        "options",
+        "seed",
+        "random",
+        "judgements"
+      ],
+      "properties": {
+        "clear": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "gauge_kind": {
+          "enum": ["ASSIST_EASY", "EASY", "NORMAL", "HARD", "EXHARD", "HAZARD"]
+        },
+        "assist_kind": {
+          "enum": ["NONE", "ASSIST_EASY", "LIGHT_ASSIST_EASY"]
+        },
+        "notes": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "passnotes": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "minbp": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "ex_score": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "combo": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "NORMAL",
+              "MIRROR",
+              "RANDOM",
+              "R-RANDOM",
+              "S-RANDOM",
+              "H-RANDOM",
+              "SPIRAL",
+              "ALL-SCR",
+              "EX-RANDOM",
+              "EX-S-RANDOM",
+              "BATTLE",
+              "BATTLE-ASSIST"
+            ]
+          }
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "random": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "judgements": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "epg", "lpg", "egr", "lgr", "egd", "lgd",
+            "ebd", "lbd", "epr", "lpr", "ems", "lms"
+          ],
+          "properties": {
+            "epg": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lpg": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "egr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lgr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "egd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lgd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "ebd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lbd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "epr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lpr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "ems": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lms": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" }
+          }
+        }
+      }
+    },
+    "is_course": { "type": "boolean" },
+    "course_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trust_domain", "source", "aggregate_eligible"],
+      "properties": {
+        "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
+        "source": { "enum": ["official_ir", "self_hosted_import"] },
+        "aggregate_eligible": { "type": "boolean" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "is_course": { "const": true } } },
+      "then": { "required": ["course_id"] }
+    },
+    {
+      "if": { "properties": { "is_course": { "const": false } } },
+      "then": { "not": { "required": ["course_id"] } }
+    },
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "properties": { "trust_domain": { "const": "self_hosted" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "provenance": {
+            "properties": {
+              "source": { "const": "self_hosted_import" },
+              "aggregate_eligible": { "const": false }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "properties": { "trust_domain": { "const": "official" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "provenance": {
+            "properties": { "source": { "const": "official_ir" } }
+          }
+        }
+      }
+    }
+  ]
+}

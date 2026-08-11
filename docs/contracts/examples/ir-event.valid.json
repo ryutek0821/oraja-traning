@@ -1,0 +1,48 @@
+{
+  "contract": "ir-event",
+  "schema_version": "1",
+  "event_id": "018f0f0f-0f03-7f0f-8f0f-0f0f0f0f0f0f",
+  "profile_id": "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f",
+  "device_id": "018f0f0f-0f02-7f0f-8f0f-0f0f0f0f0f0f",
+  "occurred_at": "2026-08-11T03:00:00Z",
+  "game_mode": "SP7",
+  "rule": "BEATORAJA-SP7",
+  "chart": {
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "md5": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "ln_mode": 0
+  },
+  "play": {
+    "clear": 6,
+    "gauge_kind": "HARD",
+    "assist_kind": "NONE",
+    "notes": 1200,
+    "passnotes": 1200,
+    "minbp": 18,
+    "ex_score": 2100,
+    "combo": 800,
+    "options": ["RANDOM"],
+    "seed": 42,
+    "random": 7,
+    "judgements": {
+      "epg": 500,
+      "lpg": 100,
+      "egr": 300,
+      "lgr": 100,
+      "egd": 50,
+      "lgd": 30,
+      "ebd": 10,
+      "lbd": 5,
+      "epr": 3,
+      "lpr": 2,
+      "ems": 0,
+      "lms": 0
+    }
+  },
+  "is_course": false,
+  "provenance": {
+    "trust_domain": "official",
+    "source": "official_ir",
+    "aggregate_eligible": true
+  }
+}

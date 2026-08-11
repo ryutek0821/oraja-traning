@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/artifact-manifest/v1/schema.json",
+  "title": "oraja-training generated artifact manifest v1",
+  "description": "Immutable profile-scoped recommendation/export release and its monotonic latest-pointer candidate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "manifest_id",
+    "recommendation_version_id",
+    "job_id",
+    "account_id",
+    "profile_id",
+    "trust_domain",
+    "aggregate_eligible",
+    "revision",
+    "previous_revision",
+    "menu_date",
+    "generated_at",
+    "source_output_manifest_sha256",
+    "artifacts",
+    "latest_pointer"
+  ],
+  "properties": {
+    "contract": { "const": "artifact-manifest" },
+    "schema_version": { "const": "1" },
+    "manifest_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "recommendation_version_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "job_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
+    "aggregate_eligible": { "type": "boolean" },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "previous_revision": {
+      "anyOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ]
+    },
+    "menu_date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "generated_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+    "source_output_manifest_sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "object_key",
+          "sha256",
+          "size_bytes",
+          "content_type",
+          "visibility",
+          "capability_ref"
+        ],
+        "properties": {
+          "kind": {
+            "enum": ["recommend_table", "daily_menu", "web_export", "model_snapshot"]
+          },
+          "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" },
+          "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+          "size_bytes": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+          "content_type": { "enum": ["application/json", "application/zstd"] },
+          "visibility": { "enum": ["profile_private", "capability_readonly"] },
+          "capability_ref": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidOrNull" }
+        }
+      }
+    },
+    "latest_pointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "revision",
+        "recommendation_version_id",
+        "manifest_sha256",
+        "update_condition"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "recommendation_version_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+        "manifest_sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+        "update_condition": { "const": "candidate_revision_gt_current" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "trust_domain": { "const": "self_hosted" } } },
+      "then": { "properties": { "aggregate_eligible": { "const": false } } }
+    }
+  ]
+}
