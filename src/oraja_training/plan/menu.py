@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict, dataclass, replace
-from datetime import date, datetime
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
-import sqlite3
 import time
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
-from oraja_training.model import predict_latest
+from oraja_training.domain import DomainError, RecommendationRepository
+from oraja_training.domain.types import (
+    ModelSnapshot,
+    ProfileContext,
+    ProfileSettings,
+    RecommendationInput,
+    RecommendationOutput,
+)
+from oraja_training.model.core import predict_snapshot
 
 
 TARGET_JUDGED = 100_000
@@ -44,8 +54,12 @@ QUOTAS = {
 FEATURE_AXES = ("density", "scratch", "ln", "soflan")
 
 
-class MenuBuildError(RuntimeError):
+class MenuBuildError(DomainError):
     """Raised when owned table coverage is insufficient to build a menu."""
+
+
+class RevisionConflictError(MenuBuildError):
+    """Raised when an immutable revision number is reused for other content."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +122,43 @@ class Session:
     model_status: str
     queue: tuple[MenuItem, ...]
     personal: tuple[Candidate, ...]
+    profile: ProfileContext = field(default_factory=ProfileContext)
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRevision:
+    """Immutable pair of table artifacts and its compare-and-set candidate."""
+
+    revision: int
+    content_hash: str
+    root: Path
+    published: bool
+
+
+def _as_local_datetime(moment: float | datetime, timezone_name: str) -> datetime:
+    zone = ZoneInfo(timezone_name)
+    if isinstance(moment, datetime):
+        aware = moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
+        return aware.astimezone(zone)
+    return datetime.fromtimestamp(float(moment), tz=zone)
+
+
+def training_day(moment: float | datetime, timezone_name: str) -> date:
+    """Return the profile's logical day, changing at local 04:00."""
+
+    local = _as_local_datetime(moment, timezone_name)
+    boundary = local.replace(hour=4, minute=0, second=0, microsecond=0)
+    return local.date() if local >= boundary else local.date() - timedelta(days=1)
+
+
+def next_training_date(moment: float | datetime, profile: ProfileContext) -> date:
+    """Return the next logical training date using the profile's IANA zone.
+
+    Calendar-day arithmetic is intentional: it stays correct across 23/25-hour
+    DST transitions instead of adding a fixed number of seconds.
+    """
+
+    return training_day(moment, profile.timezone) + timedelta(days=1)
 
 
 def _number(level: str) -> float:
@@ -174,48 +225,18 @@ def _frontier(rows: list[tuple[float, bool]]) -> float:
     return best
 
 
-def _load_candidates(conn: sqlite3.Connection) -> tuple[list[Candidate], tuple[str, str], int]:
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        WITH ranked_state AS (
-          SELECT score_state.*,
-                 row_number() OVER (
-                   PARTITION BY sha256 ORDER BY played_at DESC, mode ASC
-                 ) AS rn
-          FROM score_state WHERE mode IN (0, 1)
-        )
-        SELECT c.sha256, c.md5, c.title, c.artist, c.notes,
-               te.table_id, te.level,
-               COALESCE(s.clear, 0) clear,
-               COALESCE(s.playcount, 0) playcount,
-               COALESCE(s.played_at, 0) last_played,
-               COALESCE(f.density_p99, 0) density,
-               COALESCE(f.scratch_p90, 0) scratch,
-               COALESCE(f.scratch_rate, 0) model_scratch,
-               COALESCE(f.ln_rate, 0) ln,
-               COALESCE(f.soflan_changes, 0) soflan
-        FROM charts c
-        JOIN table_entries te ON te.sha256 = c.sha256
-        LEFT JOIN ranked_state s ON s.sha256 = c.sha256 AND s.rn = 1
-        LEFT JOIN chart_features f ON f.sha256 = c.sha256
-        WHERE c.song_mode = 7 AND c.notes > 0
-        ORDER BY c.sha256,
-          CASE te.table_id WHEN 'satellite' THEN 0 WHEN 'genocide' THEN 1 ELSE 2 END,
-          te.table_id
-        """
-    ).fetchall()
+def _load_candidates(
+    records: Sequence[Mapping[str, Any]],
+    model: ModelSnapshot | None,
+) -> tuple[list[Candidate], tuple[str, str], int]:
+    rows = list(records)
     if not rows:
         raise MenuBuildError(
             "no owned 7key table entries; refresh and match difficulty tables first"
         )
-    model_row = conn.execute(
-        "SELECT version FROM model_state WHERE target='observed_completion' "
-        "ORDER BY version DESC LIMIT 1"
-    ).fetchone()
-    model_version = 0 if model_row is None else int(model_row[0])
+    model_version = 0 if model is None else model.version
     # One chart is recommended once even when multiple independent scales contain it.
-    deduped: list[sqlite3.Row] = []
+    deduped: list[Mapping[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
         sha256 = str(row["sha256"])
@@ -266,8 +287,8 @@ def _load_candidates(conn: sqlite3.Connection) -> tuple[list[Candidate], tuple[s
         level = _number(str(row["level"]))
         frontier = frontiers.get(table_id, level)
         probability = _logistic((frontier - level) / 1.5)
-        model_probability = predict_latest(
-            conn, level, float(row["density"]), float(row["model_scratch"])
+        model_probability = predict_snapshot(
+            model, level, float(row["density"]), float(row["model_scratch"])
         )
         if model_probability is not None:
             probability = model_probability
@@ -466,95 +487,122 @@ def _order(core: dict[str, list[MenuItem]]) -> list[MenuItem]:
     return ordered
 
 
-def build_session(
-    conn: sqlite3.Connection,
+def build_session_from_input(
+    recommendation_input: RecommendationInput,
     *,
-    menu_date: str | date,
-    readiness: str = "normal",
-    target_judged: int = TARGET_JUDGED,
-    reserve_judged: int = RESERVE_JUDGED,
+    menu_date: str | date | None = None,
+    readiness: str | None = None,
+    target_judged: int | None = None,
+    reserve_judged: int | None = None,
     clock: Callable[[], float] = time.time,
 ) -> Session:
-    """Build a reproducible personal table and next-session queue."""
+    """Build a reproducible recommendation from storage-neutral input."""
 
-    if readiness not in {"normal", "tired"}:
-        raise ValueError("readiness must be 'normal' or 'tired'")
-    rendered_date = menu_date.isoformat() if isinstance(menu_date, date) else str(menu_date)
+    profile_settings = recommendation_input.profile.settings or ProfileSettings(
+        timezone=recommendation_input.profile.timezone,
+        target_judged=recommendation_input.profile.target_judged,
+        reserve_judged=recommendation_input.profile.reserve_judged,
+        readiness=recommendation_input.profile.readiness,
+    )
+    effective_settings = ProfileSettings(
+        timezone=profile_settings.timezone,
+        target_judged=(
+            profile_settings.target_judged if target_judged is None else target_judged
+        ),
+        reserve_judged=(
+            profile_settings.reserve_judged if reserve_judged is None else reserve_judged
+        ),
+        readiness=profile_settings.readiness if readiness is None else readiness,
+    )
+    effective_profile = ProfileContext(
+        profile_id=recommendation_input.profile.profile_id,
+        display_name=recommendation_input.profile.display_name,
+        timezone=effective_settings.timezone,
+        seed_namespace=recommendation_input.profile.seed_namespace,
+        settings=effective_settings,
+    )
+    now = int(clock())
+    rendered_date = (
+        next_training_date(now, effective_profile).isoformat()
+        if menu_date is None
+        else menu_date.isoformat() if isinstance(menu_date, date) else str(menu_date)
+    )
     datetime.strptime(rendered_date, "%Y-%m-%d")
-    latest = conn.execute(
-        "SELECT id, baseline_judged FROM daily_imports ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if latest is None:
+    if recommendation_input.import_id <= 0:
         raise MenuBuildError("ingest a daily score/scoredatalog snapshot first")
-    import_id, baseline_judged = int(latest[0]), int(latest[1])
-    candidates, axes, model_version = _load_candidates(conn)
+    import_id = recommendation_input.import_id
+    baseline_judged = recommendation_input.baseline_judged
+    candidates, axes, model_version = _load_candidates(
+        recommendation_input.candidates, recommendation_input.model
+    )
     seed = hashlib.sha256(
-        f"ryuhei:{rendered_date}:{import_id}:{model_version}:{readiness}".encode("utf-8")
+        f"{effective_profile.deterministic_namespace}:"
+        f"{rendered_date}:{import_id}:{model_version}:{effective_settings.readiness}:"
+        f"{effective_settings.target_judged}:{effective_settings.reserve_judged}".encode("utf-8")
     ).hexdigest()[:16]
     rng = random.Random(seed)
-    now = int(clock())
     used: set[str] = set()
-    tired_shift = 0.08 if readiness == "tired" else 0.0
+    tired_shift = 0.08 if effective_settings.readiness == "tired" else 0.0
     core: dict[str, list[MenuItem]] = {}
     core["01 WARMUP"] = _select(
         candidates, used, category="01 WARMUP", quota=QUOTAS["01 WARMUP"],
         target_p=0.96, predicate=lambda c: c.p_complete >= 0.90 and c.clear >= 4,
-        now=now, rng=rng, readiness=readiness,
+        now=now, rng=rng, readiness=effective_settings.readiness,
     )
     for category, axis in (("02 FOCUS-A", axes[0]), ("04 FOCUS-B", axes[1])):
         core[category] = _select(
             candidates, used, category=category, quota=QUOTAS[category],
             target_p=0.77 + tired_shift,
             predicate=lambda c, axis=axis: c.primary_axis == axis and 0.62 <= c.p_complete <= 0.92,
-            now=now, rng=rng, readiness=readiness, attempts=2,
+            now=now, rng=rng, readiness=effective_settings.readiness, attempts=2,
         )
     for category, axis in (("03 TRANSFER-A", axes[0]), ("05 TRANSFER-B", axes[1])):
         core[category] = _select(
             candidates, used, category=category, quota=QUOTAS[category],
             target_p=0.70 + tired_shift,
             predicate=lambda c, axis=axis: c.primary_axis == axis and c.playcount <= 1 and 0.50 <= c.p_complete <= 0.90,
-            now=now, rng=rng, readiness=readiness,
+            now=now, rng=rng, readiness=effective_settings.readiness,
         )
     core["06 LAMP"] = _select(
         candidates, used, category="06 LAMP", quota=round(QUOTAS["06 LAMP"] * 0.75),
         target_p=0.55 + tired_shift,
         predicate=lambda c: c.clear < 4 and 0.30 <= c.p_complete <= 0.78,
-        now=now, rng=rng, readiness=readiness, allow_fallback=False,
+        now=now, rng=rng, readiness=effective_settings.readiness, allow_fallback=False,
     )
     core["06 LAMP"].extend(
         _select(
             candidates, used, category="06 LAMP",
             quota=QUOTAS["06 LAMP"] - round(QUOTAS["06 LAMP"] * 0.75),
             target_p=0.97, predicate=lambda c: c.clear in {4, 5} and c.p_complete >= 0.95,
-            now=now, rng=rng, readiness=readiness, allow_fallback=False,
+            now=now, rng=rng, readiness=effective_settings.readiness, allow_fallback=False,
         )
     )
     core["07 REVIEW"] = _select(
         candidates, used, category="07 REVIEW", quota=QUOTAS["07 REVIEW"],
         target_p=0.85 + tired_shift,
         predicate=lambda c: c.last_played == 0 or now - c.last_played >= 3 * 86_400,
-        now=now, rng=rng, readiness=readiness,
+        now=now, rng=rng, readiness=effective_settings.readiness,
     )
     core["08 PROBE"] = _select(
         candidates, used, category="08 PROBE", quota=QUOTAS["08 PROBE"],
         target_p=0.82 + tired_shift,
         predicate=lambda c: 0.70 <= c.p_complete <= 0.95,
-        now=now, rng=rng, readiness=readiness,
+        now=now, rng=rng, readiness=effective_settings.readiness,
     )
     queue = _order(core)
     core_total = sum(item.expected_judged for item in queue)
-    if core_total < target_judged:
+    if core_total < effective_settings.target_judged:
         supplement = _select(
             candidates, used, category="05 TRANSFER-B",
-            quota=target_judged - core_total, target_p=0.75 + tired_shift,
-            predicate=lambda c: True, now=now, rng=rng, readiness=readiness,
+            quota=effective_settings.target_judged - core_total, target_p=0.75 + tired_shift,
+            predicate=lambda c: True, now=now, rng=rng, readiness=effective_settings.readiness,
         )
         queue.extend(supplement)
         core_total += sum(item.expected_judged for item in supplement)
     reserve = _select(
-        candidates, used, category="09 RESERVE", quota=reserve_judged,
+        candidates, used, category="09 RESERVE", quota=effective_settings.reserve_judged,
         target_p=0.88 + tired_shift, predicate=lambda c: c.p_complete >= 0.65,
-        now=now, rng=rng, readiness=readiness, optional=True,
+        now=now, rng=rng, readiness=effective_settings.readiness, optional=True,
     )
     queue.extend(reserve)
     queue = [replace(item, sequence=index) for index, item in enumerate(queue, 1)]
@@ -563,9 +611,9 @@ def build_session(
         rendered_date,
         now,
         seed,
-        readiness,
-        int(target_judged),
-        int(reserve_judged),
+        effective_settings.readiness,
+        effective_settings.target_judged,
+        effective_settings.reserve_judged,
         core_total,
         reserve_total,
         axes,
@@ -575,24 +623,127 @@ def build_session(
         "validated_model" if model_version else "cold_start",
         tuple(queue),
         tuple(sorted(candidates, key=lambda c: (-c.p_complete, c.title))),
+        effective_profile,
+    )
+
+
+def build_session(
+    source: RecommendationInput | object,
+    *,
+    menu_date: str | date | None = None,
+    readiness: str | None = None,
+    target_judged: int | None = None,
+    reserve_judged: int | None = None,
+    clock: Callable[[], float] = time.time,
+    profile: ProfileContext | None = None,
+) -> Session:
+    """Build from domain input or the legacy local SQLite adapter."""
+
+    if isinstance(source, RecommendationInput):
+        recommendation_input = source
+    else:
+        from oraja_training.db.recommendation_adapter import load_recommendation_input
+
+        recommendation_input = load_recommendation_input(
+            source, profile=profile or ProfileContext()
+        )
+    if profile is not None and recommendation_input.profile != profile:
+        recommendation_input = replace(recommendation_input, profile=profile)
+    return build_session_from_input(
+        recommendation_input,
+        menu_date=menu_date,
+        readiness=readiness,
+        target_judged=target_judged,
+        reserve_judged=reserve_judged,
+        clock=clock,
+    )
+
+
+def build_session_from_repository(
+    repository: RecommendationRepository,
+    *,
+    profile: ProfileContext,
+    menu_date: str | date | None = None,
+    readiness: str | None = None,
+    target_judged: int | None = None,
+    reserve_judged: int | None = None,
+    clock: Callable[[], float] = time.time,
+) -> Session:
+    """Load through a repository port and run the storage-free planner."""
+
+    return build_session_from_input(
+        repository.load_input(profile),
+        menu_date=menu_date,
+        readiness=readiness,
+        target_judged=target_judged,
+        reserve_judged=reserve_judged,
+        clock=clock,
+    )
+
+
+def recommendation_output(session: Session) -> RecommendationOutput:
+    """Convert a planned session to the public adapter output value."""
+
+    return RecommendationOutput(
+        profile=session.profile,
+        menu_date=session.menu_date,
+        seed=session.seed,
+        queue=tuple(asdict(item) for item in session.queue),
+        personal=tuple(asdict(candidate) for candidate in session.personal),
+        import_id=session.import_id,
+        baseline_judged=session.baseline_judged,
+        model_version=session.model_version,
+        readiness=session.readiness,
+        generated_at=session.generated_at,
+        target_judged=session.target_judged,
+        reserve_target=session.reserve_target,
+        core_expected_judged=session.core_expected_judged,
+        reserve_expected_judged=session.reserve_expected_judged,
+        weakness_axes=session.weakness_axes,
+        model_status=session.model_status,
     )
 
 
 def _atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    temporary.replace(path)
+    payload = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    with temporary.open("wb") as destination:
+        destination.write(payload)
+        destination.flush()
+        os.fsync(destination.fileno())
+    os.replace(temporary, path)
 
 
-def write_export(session: Session, output_dir: str | Path) -> None:
-    """Atomically write both bmstable surfaces and the cockpit manifest."""
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
 
-    root = Path(output_dir).expanduser().resolve()
+
+def _immutable_json(path: Path, value: Any) -> None:
+    """Create a content-addressed file without ever overwriting its bytes."""
+
+    payload = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    if path.exists():
+        if path.read_bytes() != payload:
+            raise RevisionConflictError(f"immutable artifact conflict: {path.name}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("xb") as destination:
+            destination.write(payload)
+            destination.flush()
+            os.fsync(destination.fileno())
+    except FileExistsError:
+        if path.read_bytes() != payload:
+            raise RevisionConflictError(f"immutable artifact conflict: {path.name}")
+
+
+def _table_payloads(session: Session) -> dict[str, Any]:
+    display_name = session.profile.display_name
     recommend_header = {
-        "name": "Ryuhei Personal Recommend",
+        "name": f"{display_name} Personal Recommend",
         "symbol": "R",
         "data_url": "score.json",
         "level_order": [
@@ -612,7 +763,7 @@ def write_export(session: Session, output_dir: str | Path) -> None:
         for candidate in session.personal
     ]
     today_header = {
-        "name": f"Ryuhei Daily {session.menu_date}",
+        "name": f"{display_name} Daily {session.menu_date}",
         "symbol": "D",
         "data_url": "score.json",
         "level_order": list(LEVEL_ORDER),
@@ -632,6 +783,98 @@ def write_export(session: Session, output_dir: str | Path) -> None:
         }
         for item in unique.values()
     ]
+    return {
+        "table/recommend/header.json": recommend_header,
+        "table/recommend/score.json": recommend_score,
+        "table/today/header.json": today_header,
+        "table/today/score.json": today_score,
+    }
+
+
+def _artifact_content_hash(payloads: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(payloads):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_canonical_json(payloads[name]))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _latest_pointer(root: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((root / "latest.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_revision_directory(
+    root: Path,
+    revision: int,
+    content_hash: str,
+    files: dict[str, Any],
+) -> Path:
+    revisions = root / "revisions"
+    revisions.mkdir(parents=True, exist_ok=True)
+    revision_root = revisions / f"{revision}-{content_hash}"
+    if revision_root.exists():
+        for relative, value in files.items():
+            _immutable_json(revision_root / relative, value)
+        return revision_root
+
+    temporary = revisions / f".{revision}-{content_hash}.{os.getpid()}.tmp"
+    temporary.mkdir(parents=True, exist_ok=False)
+    try:
+        for relative, value in files.items():
+            _immutable_json(temporary / relative, value)
+        try:
+            os.replace(temporary, revision_root)
+        except FileExistsError:
+            for relative, value in files.items():
+                _immutable_json(revision_root / relative, value)
+            for path in sorted(temporary.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            temporary.rmdir()
+    except Exception:
+        for path in sorted(temporary.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        if temporary.exists():
+            temporary.rmdir()
+        raise
+    return revision_root
+
+
+def write_export(
+    session: Session,
+    output_dir: str | Path,
+    *,
+    revision: int | None = None,
+) -> ArtifactRevision:
+    """Write both tables to an immutable revision and advance the local pointer.
+
+    The files directly below ``output_dir`` are a compatibility view for the
+    existing localhost server. The canonical artifact is kept below a
+    content-addressed revision directory and is never overwritten.
+    """
+
+    root = Path(output_dir).expanduser().resolve()
+    payloads = _table_payloads(session)
+    content_hash = _artifact_content_hash(payloads)
+    pointer = _latest_pointer(root)
+    current_revision = int(pointer.get("revision", 0) or 0)
+    candidate_revision = current_revision + 1 if revision is None else int(revision)
+    if candidate_revision <= 0:
+        raise RevisionConflictError("revision must be positive")
+    if candidate_revision == current_revision and pointer.get("content_hash") != content_hash:
+        raise RevisionConflictError("revision already points to different content")
+
     manifest = {
         "menu_date": session.menu_date,
         "generated_at": session.generated_at,
@@ -645,6 +888,9 @@ def write_export(session: Session, output_dir: str | Path) -> None:
         "import_id": session.import_id,
         "model_version": session.model_version,
         "model_status": session.model_status,
+        "revision": candidate_revision,
+        "content_hash": content_hash,
+        "timezone": session.profile.timezone,
     }
     session_json = {**manifest, "queue": [asdict(item) for item in session.queue]}
     review = {
@@ -657,10 +903,30 @@ def write_export(session: Session, output_dir: str | Path) -> None:
         ),
         "weakness_axes": session.weakness_axes,
     }
-    _atomic_json(root / "table" / "recommend" / "header.json", recommend_header)
-    _atomic_json(root / "table" / "recommend" / "score.json", recommend_score)
-    _atomic_json(root / "table" / "today" / "header.json", today_header)
-    _atomic_json(root / "table" / "today" / "score.json", today_score)
-    _atomic_json(root / "manifest.json", manifest)
-    _atomic_json(root / "session.json", session_json)
-    _atomic_json(root / "review" / "latest.json", review)
+    files = {
+        **payloads,
+        "manifest.json": manifest,
+        "session.json": session_json,
+        "review/latest.json": review,
+    }
+    revision_root = _write_revision_directory(
+        root, candidate_revision, content_hash, files
+    )
+
+    latest = _latest_pointer(root)
+    latest_revision = int(latest.get("revision", 0) or 0)
+    published = candidate_revision > latest_revision
+    if published:
+        # This is a filesystem compare-and-set: a later completion wins even
+        # when Queue/Workflow deliveries finish in reverse order.
+        for relative, value in files.items():
+            _atomic_json(root / relative, value)
+        _atomic_json(
+            root / "latest.json",
+            {
+                "revision": candidate_revision,
+                "content_hash": content_hash,
+                "object_prefix": str(revision_root.relative_to(root)),
+            },
+        )
+    return ArtifactRevision(candidate_revision, content_hash, revision_root, published)
