@@ -1,0 +1,102 @@
+name: Cloudflare deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        type: choice
+        options:
+          - preview
+          - staging
+          - production
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: inputs.environment == 'preview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: preview
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run deploy:preview
+
+  staging:
+    if: inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run deploy:staging
+
+  production:
+    if: inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Configure required reviewers on the production GitHub Environment.
+    # This job is reachable only through workflow_dispatch and this gate.
+    environment:
+      name: production
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+      ORAJA_PRODUCTION_DEPLOY_APPROVED: "true"
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run deploy:production
