@@ -1,0 +1,7 @@
+{
+  "contract": "ir-submission", "schema_version": "1",
+  "event_id": "018f0f0f-0f0f-7f0f-8f0f-0f0f0f0f0f0f", "played_at": "2026-07-01T12:00:00Z",
+  "course_id": "018f0f0f-0f0f-7f0f-8f0f-0f0f0f0f0f0d",
+  "chart": { "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ln_mode": 1 },
+  "play": { "clear": 5, "gauge": "NORMAL", "assist": "NONE", "notes": 1, "passnotes": 1, "minbp": 0, "ex_score": 2, "combo": 1, "option": "NORMAL", "seed": 0, "judgements": { "epg": 1, "lpg": 0, "egr": 0, "lgr": 0, "egd": 0, "lgd": 0, "ebd": 0, "lbd": 0, "epr": 0, "lpr": 0, "ems": 0, "lms": 0 } }
+}

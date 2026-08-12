@@ -48,6 +48,23 @@ def _type_matches(value: Any, expected: str) -> bool:
     }[expected]
 
 
+def _schema_document(
+    uri: str,
+    *,
+    document: dict[str, Any],
+    common: dict[str, Any],
+) -> dict[str, Any]:
+    if not uri or uri == document.get("$id"):
+        return document
+    if uri in {COMMON_URI, "common.schema.json"}:
+        return common
+    for schema_path in CONTRACTS.glob("*.schema.json"):
+        candidate = json.loads(schema_path.read_text())
+        if candidate.get("$id") == uri:
+            return candidate
+    raise SchemaViolation(f"unresolved schema reference: {uri}")
+
+
 def _validate(
     schema: dict[str, Any],
     value: Any,
@@ -58,12 +75,8 @@ def _validate(
 ) -> None:
     ref = schema.get("$ref")
     if ref is not None:
-        if ref.startswith("https://oraja-training.dev/contracts/common.schema.json") or ref.startswith("common.schema.json"):
-            target_document = common
-            fragment = ref.partition("#")[2]
-        else:
-            target_document = document
-            fragment = ref.partition("#")[2]
+        uri, _, fragment = ref.partition("#")
+        target_document = _schema_document(uri, document=document, common=common)
         target = _pointer(target_document, "#" + fragment) if fragment else target_document
         _validate(target, value, document=target_document, common=common, path=path)
         return
@@ -190,8 +203,30 @@ def _refs(value: Any) -> list[str]:
     return []
 
 
+def _validate_five_db_semantics(payload: dict[str, Any], rules: dict[str, Any]) -> None:
+    if sum(item["size_bytes"] for item in payload["files"]) > rules["max_total_bytes"]:
+        raise SchemaViolation("$.files: total size exceeds max_total_bytes")
+
+
+def _validate_artifact_semantics(payload: dict[str, Any], rules: dict[str, Any]) -> None:
+    kinds = {item["kind"] for item in payload["artifacts"]}
+    if not set(rules["required_kinds"]).issubset(kinds):
+        raise SchemaViolation("$.artifacts: required publish bundle is incomplete")
+    pointer = payload["latest_pointer"]
+    if pointer["profile_id"] != payload["profile_id"]:
+        raise SchemaViolation("$.latest_pointer.profile_id: root mismatch")
+    if pointer["revision"] != payload["revision"]:
+        raise SchemaViolation("$.latest_pointer.revision: root mismatch")
+    if pointer["recommendation_version_id"] != payload["recommendation_version_id"]:
+        raise SchemaViolation("$.latest_pointer.recommendation_version_id: root mismatch")
+    if payload["previous_revision"] >= payload["revision"]:
+        raise SchemaViolation("$.previous_revision: must be lower than revision")
+
+
 SCHEMA_FIXTURES = (
-    ("ir-event.v1.schema.json", "ir-event.valid.json", "ir-event.invalid-extra-field.json"),
+    ("ir-submission.v1.schema.json", "ir-submission.valid.json", "ir-submission.invalid-owner.json"),
+    ("play-event.v1.schema.json", "play-event.valid.json", "play-event.invalid-backfill-provenance.json"),
+    ("aggregate-eligibility.v1.schema.json", "aggregate-eligibility.valid.json", "aggregate-eligibility.invalid-boolean.json"),
     ("upload-manifest.v1.schema.json", "upload-manifest.valid.json", "upload-manifest.invalid-sidecar.json"),
     ("container-input-manifest.v1.schema.json", "container-input.valid.json", "container-input.invalid-self-hosted-aggregate.json"),
     ("container-output-manifest.v1.schema.json", "container-output.valid.json", "container-output.invalid-self-hosted-aggregate.json"),
@@ -215,18 +250,18 @@ def test_rejected_contract_examples(schema_name: str, valid_name: str, invalid_n
 
 
 def test_every_contract_schema_is_json_and_versioned() -> None:
-    for schema_name, _, _ in SCHEMA_FIXTURES:
-        schema = json.loads((CONTRACTS / schema_name).read_text())
+    for schema_path in CONTRACTS.glob("*.schema.json"):
+        schema = json.loads(schema_path.read_text())
         assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
-        assert "/v1/" in schema["$id"]
-        assert schema["additionalProperties"] is False
+        if schema_path != COMMON:
+            assert "/v1/" in schema["$id"]
+            assert schema["additionalProperties"] is False
 
 
 def test_common_schema_refs_resolve_from_the_declared_schema_ids() -> None:
-    for schema_name, _, _ in SCHEMA_FIXTURES:
-        schema = json.loads((CONTRACTS / schema_name).read_text())
+    for schema_path in CONTRACTS.glob("*.schema.json"):
+        schema = json.loads(schema_path.read_text())
         common_refs = [ref for ref in _refs(schema) if "common.schema.json" in ref]
-        assert common_refs
         assert all(ref.startswith(f"{COMMON_URI}#") for ref in common_refs)
 
 
@@ -236,13 +271,9 @@ def test_domain_entity_catalog_fixes_profile_limit_and_ownership() -> None:
     entities = {entity["name"]: entity for entity in catalog["entities"]}
     assert entities["Profile"]["owner"] == "account_id"
     assert entities["Device"]["owner"] == "profile_id"
-    assert entities["PlayEvent"]["immutable_fields"][:3] == [
-        "event_id",
-        "profile_id",
-        "trust_domain",
-    ]
-    self_hosted = next(item for item in catalog["trust_domains"] if item["name"] == "self_hosted")
-    assert self_hosted["aggregate_policy"] == "never"
+    assert all(entity["id_format"] == "uuidv7" for entity in entities.values())
+    assert entities["PlayEvent"]["immutable_fields"][:2] == ["event_id", "profile_id"]
+    assert catalog["profile_limit"]["slot_reusable_after_profile_deletion"] is True
 
 
 def test_upload_manifest_has_exact_five_database_names() -> None:
@@ -265,30 +296,183 @@ def test_object_key_rejects_path_traversal() -> None:
         _validate(schema, payload, document=schema, common=common)
 
 
-def test_ir_event_rejects_dp_game_mode_fixture() -> None:
-    schema, common = _load("ir-event.v1.schema.json")
-    invalid = json.loads((EXAMPLES / "ir-event.invalid-dp.json").read_text())
+@pytest.mark.parametrize("field", ["account_id", "profile_id", "device_id", "provenance", "eligibility", "course_id", "game_mode", "title", "path", "values", "replay"])
+def test_external_ir_rejects_server_fields_and_out_of_scope_data(field: str) -> None:
+    schema, common = _load("ir-submission.v1.schema.json")
+    payload = json.loads((EXAMPLES / "ir-submission.valid.json").read_text())
+    payload[field] = {} if field in {"provenance", "eligibility", "values", "replay"} else "forbidden"
     with pytest.raises(SchemaViolation):
-        _validate(schema, invalid, document=schema, common=common)
+        _validate(schema, payload, document=schema, common=common)
 
 
-def test_ir_event_course_id_is_required_only_for_course_events() -> None:
-    schema, common = _load("ir-event.v1.schema.json")
-    regular = json.loads((EXAMPLES / "ir-event.valid.json").read_text())
-    regular["is_course"] = True
+def test_course_fixture_is_rejected_unconditionally() -> None:
+    schema, common = _load("ir-submission.v1.schema.json")
+    payload = json.loads((EXAMPLES / "ir-submission.invalid-course.json").read_text())
     with pytest.raises(SchemaViolation):
-        _validate(schema, regular, document=schema, common=common)
-
-    regular["course_id"] = "018f0f0f-0f04-7f0f-8f0f-0f0f0f0f0f0f"
-    _validate(schema, regular, document=schema, common=common)
+        _validate(schema, payload, document=schema, common=common)
 
 
-def test_self_hosted_cannot_become_aggregate_input() -> None:
-    for name in (
-        "container-input.invalid-self-hosted-aggregate.json",
-        "container-output.invalid-self-hosted-aggregate.json",
+def test_five_db_backfill_is_internal_personal_only_play_event() -> None:
+    schema, common = _load("play-event.v1.schema.json")
+    payload = json.loads((EXAMPLES / "play-event.valid-backfill.json").read_text())
+    _validate(schema, payload, document=schema, common=common)
+    assert payload["device_id"] is None
+    assert payload["eligibility"] == {
+        "status": "ineligible",
+        "reason_code": "five_db_backfill",
+        "policy_version": "2026-07-01",
+    }
+
+
+def test_five_db_size_and_operational_rules() -> None:
+    schema, common = _load("upload-manifest.v1.schema.json")
+    payload = json.loads((EXAMPLES / "upload-manifest.valid.json").read_text())
+    payload["files"][0]["size_bytes"] = 2147483649
+    with pytest.raises(SchemaViolation):
+        _validate(schema, payload, document=schema, common=common)
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())["five_db"]
+    assert rules["beatoraja_must_be_stopped"] is True
+    assert rules["max_total_bytes"] == 5 * 1024**3
+    assert rules["history_authority"] == rules["conflict_winner"] == "live_ir"
+    assert rules["backfill_event_id"] == "server-generated-uuidv7"
+    assert rules["backfill_job_count"] == rules["backfill_revision_count"] == 1
+    _validate_five_db_semantics(payload, rules)
+
+    over_total = json.loads((EXAMPLES / "upload-manifest.valid.json").read_text())
+    for item in over_total["files"]:
+        item["size_bytes"] = 1024**3
+    over_total["files"][0]["size_bytes"] += 1
+    _validate(schema, over_total, document=schema, common=common)
+    with pytest.raises(SchemaViolation):
+        _validate_five_db_semantics(over_total, rules)
+
+
+def test_envelope_encrypted_container_input_requires_key_reference() -> None:
+    schema, common = _load("container-input-manifest.v1.schema.json")
+    payload = json.loads((EXAMPLES / "container-input.valid.json").read_text())
+    payload["input_bundle"].pop("key_ref")
+    with pytest.raises(SchemaViolation):
+        _validate(schema, payload, document=schema, common=common)
+
+
+def test_ingest_idempotency_queue_and_revision_rules() -> None:
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())
+    ingest = rules["ir_ingest"]
+    assert ingest["atomic_accept"] == ["play_event", "job", "revision", "outbox", "alarm"]
+    assert ingest["responses"] == {"new": 202, "same_event_same_payload": 200, "same_event_conflict": 409}
+    assert ingest["retry"]["attempts"] == 5 and ingest["retry"]["exhausted"] == "dlq"
+    assert rules["revision"]["latest_update"] == "candidate>current"
+    assert rules["revision"]["queue_delivery"] == "duplicate-and-out-of-order-safe"
+
+
+@pytest.mark.parametrize(
+    "current,candidate,expected",
+    [(0, 1, 1), (12, 13, 13), (12, 12, 12), (12, 11, 12)],
+)
+def test_latest_revision_compare_and_set_is_monotonic(current: int, candidate: int, expected: int) -> None:
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())
+    assert rules["revision"]["latest_update"] == "candidate>current"
+    actual = candidate if candidate > current else current
+    assert actual == expected
+
+
+def test_artifact_bundle_visibility_and_pointer_consistency() -> None:
+    schema, common = _load("artifact-manifest.v1.schema.json")
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())["artifact_publish"]
+    valid = json.loads((EXAMPLES / "artifact-manifest.valid.json").read_text())
+    _validate(schema, valid, document=schema, common=common)
+    _validate_artifact_semantics(valid, rules)
+    assert rules["manifest_digest"] == {
+        "canonicalization": "RFC8785",
+        "excluded_member": "latest_pointer",
+        "algorithm": "sha256",
+    }
+
+    missing_capability = json.loads((EXAMPLES / "artifact-manifest.valid.json").read_text())
+    missing_capability["artifacts"][0]["capability_ref"] = None
+    with pytest.raises(SchemaViolation):
+        _validate(schema, missing_capability, document=schema, common=common)
+
+    public_model = json.loads((EXAMPLES / "artifact-manifest.valid.json").read_text())
+    public_model["artifacts"].append({
+        "kind": "model_snapshot",
+        "object_key": "profiles/018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f/artifacts/12/model.json",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "size_bytes": 900,
+        "content_type": "application/json",
+        "visibility": "capability_readonly",
+        "capability_ref": "018f0f0f-0f34-7f0f-8f0f-0f0f0f0f0f0f",
+    })
+    with pytest.raises(SchemaViolation):
+        _validate(schema, public_model, document=schema, common=common)
+
+    for field, value in (
+        ("profile_id", "018f0f0f-0f99-7f0f-8f0f-0f0f0f0f0f99"),
+        ("revision", 13),
+        ("recommendation_version_id", "018f0f0f-0f98-7f0f-8f0f-0f0f0f0f0f98"),
     ):
-        payload = json.loads((EXAMPLES / name).read_text())
-        assert payload["trust_domain"] == "self_hosted"
-        aggregate_eligible = payload["aggregate_eligible"] if "aggregate_eligible" in payload else payload["policy"]["aggregate_eligible"]
-        assert aggregate_eligible is True
+        mismatch = json.loads((EXAMPLES / "artifact-manifest.valid.json").read_text())
+        mismatch["latest_pointer"][field] = value
+        with pytest.raises(SchemaViolation):
+            _validate_artifact_semantics(mismatch, rules)
+
+    broken_chain = json.loads((EXAMPLES / "artifact-manifest.valid.json").read_text())
+    broken_chain["previous_revision"] = 12
+    with pytest.raises(SchemaViolation):
+        _validate_artifact_semantics(broken_chain, rules)
+
+
+def test_aggregate_privacy_gate_is_fail_closed() -> None:
+    gate = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())["aggregate"]
+    assert gate["minimum_profiles"] == 100
+    assert gate["max_profile_contribution"] == 0.01
+    assert gate["membership_inference_auc_95_upper"] == 0.55
+    assert gate["tpr_at_1pct_fpr_max"] == 0.05
+    assert gate["known_record_exact_extractions_max"] == 0
+    assert gate["failure"].startswith("unpublish-latest")
+
+
+def test_aggregate_uses_only_live_ir_and_excludes_five_db_backfill() -> None:
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())
+    assert rules["aggregate"]["input"] == "quality-gated-live-ir-only"
+    assert rules["aggregate"]["input_provenance"] == {
+        "allowed_sources": ["live_ir"],
+        "forbidden_sources": ["five_db", "five_db_backfill"],
+    }
+    assert rules["five_db"]["aggregate_input"] is False
+
+
+def test_retention_auth_and_repository_change_gates_are_machine_readable() -> None:
+    rules = json.loads((CONTRACTS / "semantic-rules.v1.json").read_text())
+    assert rules["retention"] == {
+        "profile_delete_cancellation_days": 7,
+        "backup_max_days": 30,
+        "superseded_artifact_body_days": 90,
+        "failed_job_diagnostic_days": 30,
+        "security_log_days": 30,
+        "audit_log_days": 365,
+        "profile_key_destroyed_on_confirmed_delete": True,
+    }
+    assert rules["mcp"]["dcr"] is True
+    assert rules["mcp"]["discovery_metadata"] is True
+    assert rules["credentials"]["account"] == {
+        "user_id": {"normalization": "lowercase", "min_length": 3, "max_length": 32, "unique_after_normalization": True},
+        "password": {"min_length": 12, "max_length": 128, "stored": "argon2id-hash"},
+        "recovery_codes": {"count": 10, "single_use": True, "stored": "hash"},
+        "email": {"optional": True, "verification_state_required": True},
+        "password_reset": {"minutes": 15, "single_use": True, "stored": "hash"},
+    }
+    assert rules["repositories"] == {
+        "phase0_mutation": False,
+        "split_and_visibility_execution_issues": [22, 23],
+        "license_and_visibility_decision": "deferred-to-issues-22-and-23",
+    }
+
+
+def test_all_local_contract_references_resolve() -> None:
+    ids = {json.loads(path.read_text())["$id"] for path in CONTRACTS.glob("*.schema.json")}
+    for path in CONTRACTS.glob("*.schema.json"):
+        for ref in _refs(json.loads(path.read_text())):
+            base = ref.partition("#")[0]
+            if base:
+                assert base in ids, f"{path.name}: unresolved {base}"

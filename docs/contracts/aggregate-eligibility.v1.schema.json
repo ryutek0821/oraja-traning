@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/aggregate-eligibility/v1/schema.json",
+  "title": "oraja-training aggregate eligibility decision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schema_version", "profile_id", "status", "reason_code", "policy_version", "evaluated_at"],
+  "properties": {
+    "contract": { "const": "aggregate-eligibility" },
+    "schema_version": { "const": "1" },
+    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "status": { "enum": ["pending", "eligible", "ineligible", "revoked"] },
+    "reason_code": { "type": ["string", "null"], "maxLength": 64 },
+    "policy_version": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "evaluated_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" }
+  }
+}
