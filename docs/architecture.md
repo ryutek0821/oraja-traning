@@ -1,107 +1,47 @@
-# サービス境界と責務
+# 公式サービス境界と責務
 
-## 一枚で追跡できるデータフロー
-
-矢印のラベルは主な入力 → 出力、ノード内の `owner` はデータ所有者、`boundary` は信頼境界を示します。
+v1は日本・日本語・公式Cloudflare・SP7通常曲だけを対象とする。runtime実装はこの契約issueの対象外。
 
 ```mermaid
 flowchart LR
-  subgraph USER[ユーザー所有 / self-hosted boundary]
-    IR[IR JAR
-      owner: user
-      in: beatoraja result
-      out: ir-event.v1]
-    LOCAL[Python core + SQLite adapter
-      owner: user
-      in: static 5DB / live DB
-      out: assistant.db / local export]
-    SELF[(self-hosted profile
-      owner: user
-      trust_domain: self_hosted
-      aggregate: never)]
-  end
-
-  subgraph OFFICIAL[公式 Cloudflare boundary]
-    WEB[Web
-      owner: account
-      in: session / upload manifest
-      out: API request / capability URL]
-    WORKER[Worker Web/API
-      owner: service
-      in: authenticated event/upload
-      out: D1 record / DO command / Queue]
-    D1[(D1 control plane
-      owner: service
-      Account Profile Device Job Audit)]
-    DO[(Profile Durable Object
-      owner: profile / service
-      PlayEvent normalized state
-      RecommendationVersion)]
-    R2[(Private R2
-      owner: profile / service
-      envelope-encrypted raw/input/output)]
-    FLOW[Queue + Workflow
-      owner: service
-      in: idempotent job
-      out: ordered Container attempt]
-    CONT[Container
-      owner: service
-      in: input manifest + encrypted bundle
-      out: output manifest + derived objects]
-    PUB[Revision publisher
-      owner: service
-      in: artifact manifest
-      out: monotonic latest pointer]
-    MCP[MCP + OAuth
-      owner: account grant
-      in: scoped resource/tool request
-      out: redacted profile data]
-    AGG[(Official aggregate model
-      owner: service
-      trust_domain=official
-      consent + eligible only)]
-  end
-
-  IR -- TLS + device token / plays:write --> WORKER
-  WEB -- session / uploads:write --> WORKER
-  WORKER -- owner-bound control rows --> D1
-  WORKER -- profile command --> DO
-  WORKER -- encrypted object --> R2
-  WORKER -- job_id + idempotency_key --> FLOW
-  FLOW -- container-input-manifest.v1 --> CONT
-  R2 -- encrypted input bundle --> CONT
-  CONT -- container-output-manifest.v1 --> PUB
-  CONT -- normalized/profile-derived objects --> R2
-  PUB -- artifact-manifest.v1 --> R2
-  PUB -- revision if candidate > current --> DO
-  DO -- profile-scoped resources --> MCP
-  R2 -- capability-readonly artifact --> WEB
-  DO -- official eligible partition only --> AGG
-  LOCAL --> SELF
-  SELF -. no route to official aggregate .-> AGG
+  IR[public IR client] -- ir-submission.v1 + device token --> API[Worker API]
+  WEB[Web] -- session + five DB --> API
+  API -- owner resolved from credential --> DO[Profile Durable Object]
+  DO -- atomic PlayEvent/Job/revision/outbox/Alarm --> ALARM[DO Alarm]
+  ALARM --> Q[Queue / Workflow]
+  Q --> C[Container]
+  C --> R2[Private encrypted R2]
+  C --> PUB[Revision publisher]
+  PUB -- candidate > current CAS --> DO
+  DO --> MCP[MCP 2026-07-28]
+  DO --> AGG[quality-gated daily aggregate]
 ```
 
-## コンポーネント契約
-
-| コンポーネント | 入力 | 出力 | 所有者 | 境界・禁止事項 |
+| コンポーネント | 入力 | 出力 | データowner | 信頼境界・禁止事項 |
 |---|---|---|---|---|
-| beatoraja IR JAR | プレイ結果、allowlist 済み chart 情報 | `ir-event.v1` | ユーザー | BMS本体、replay `keyinput`、任意 `values` は送信しない |
-| Python core / local adapter | 5DB の read-only snapshot または live DB | `assistant.db`、ローカル export | ユーザー | beatoraja DBへ書かない。self-hosted データは公式集合へ入れない |
-| Web | 認証済み操作、manifest | API request、capability URL | Account | URLに account/profile ID や秘密値を再掲しない |
-| Worker / API | bearer credential、契約 JSON | D1/DO command、暗号化 object、job | Service | owner は credential から決定。request body の owner は信用しない |
-| D1 | Account/Profile/Device/Job/Audit の制御行 | owner・status・hash・pointer | Service | 生DB、平文 token、MCP用生イベント本文を置かない |
-| Profile DO | profile-scoped event/job/revision command | immutable PlayEvent、model/revision state | Profile owner | account/profile 越境 read/write を拒否 |
-| Private R2 | encrypted raw/input/output/artifact | hash付き object | Profile owner / Service | profile prefix と envelope key を強制。MCPから raw object を返さない |
-| Queue / Workflow | job envelope、idempotency key | retryable Container attempt | Service | duplicate delivery 前提。順序は保証せず latest pointer は revision 比較で保護 |
-| Container | container input manifest、encrypted bundle | output manifest、derived object | Service | raw DBをモデル入力へ直接渡さない。SP7 以外を reject |
-| Revision publisher | output/artifact manifest | immutable release、latest pointer candidate | Profile owner | `candidate_revision > current_revision` の時だけ pointer 更新 |
-| MCP + OAuth | PKCE token、scope付き resource/tool | redacted profile data | Account grant | `plays:read` なしに詳細履歴不可。生DB・pending提案・秘密を公開しない |
-| Official aggregate | official partition の eligible derived data | 匿名集合モデル | Service / consenting users | `trust_domain=official` かつ `aggregate_eligible=true` のみ。self-hosted UNION は禁止 |
+| public IR client | beatorajaの通常曲結果、device token | `ir-submission.v1` | 認証後に解決されるProfile | public client。owner/provenance/eligibility、course、BMS、replayを送らない |
+| Web | session、停止中に取得した5DB | API request、upload manifest/part | Account / Profile | public browser。bodyやpathのowner IDを認可根拠にしない |
+| Worker API | 認証済みIR/Web request | owner解決済みDO command、D1 control row | Service custody / credentialのAccount・Profile | official edge。tokenからowner鎖を解決し、未検証payloadを内部契約へ昇格しない |
+| D1 control plane | Account/Profile/Device、credential metadata、監査event | owner鎖、状態、hash、policy version | Account / Service | official D1。生5DB、平文token、PlayEvent本文を保存しない |
+| Profile Durable Object | owner解決済みcommand | immutable PlayEvent、Job、revision、outbox、Alarm | Profile | official profile partition。別Profileへのread/writeを拒否する |
+| DO Alarm / Queue / Workflow | outbox、Job ID、idempotency key | 冪等なContainer attempt | Profile / Service | official async boundary。重複・逆順を前提にする |
+| Container adapter | manifest、Profile単位で復号した入力bundle | normalized play、model/artifact manifest | Profile / Service | isolated official compute。入力digestとProfile境界を検証する |
+| Python domain core | 正規化済みplay/chart/Profile context | model、Player Recommend、Daily Menu | Profile | Container process内。storageやcredentialへ直接アクセスしない |
+| Private R2 | envelope-encrypted raw/input/output/artifact | hash検証済みProfile object | Profile / Service custody | official private object boundary。Profile prefixを越えず、rawをMCP/aggregateへ渡さない |
+| Revision publisher | Container output、artifact manifest | immutable release、latest pointer candidate | Profile | official publish boundary。`candidate > current`のCASだけを許可する |
+| MCP / OAuth | PKCE token、scope付きresource/tool request | redacted profile data | Account grant / Profile | official edge。生5DB、秘密、scope外履歴を返さない |
+| Official aggregate | quality gate済み`live_ir`由来の派生record | 集合model、評価指標 | Service / 対象Profile群 | official aggregate partition。5DB/backfillを入力にせず、privacy gateをfail closedにする |
 
-## 分離不変条件
+## 不変条件
 
-1. `trust_domain` は client payload ではなく、認証済み device/upload context から Worker が付与し、以後 immutable にする。
-2. `official` と `self_hosted` は R2 prefix、DO stream、job partition、aggregate input query のキーに含める。同じ profile ID の文字列だけで越境参照できない。
-3. 集合学習の入力は `trust_domain=official`、明示同意、`aggregate_eligible=true`、初期範囲 `SP7` をすべて満たす derived record に限る。raw 5DB は常に対象外。
-4. `is_course=true` の PlayEvent は個人の履歴・品質には保存するが、通常曲の個人モデル学習へは入れない。
-5. 初期範囲外の `DP14`、`DP7`、`PMS`、その他の rule/game mode は、入口・Container・aggregate query の3箇所で拒否する。
+1. 外部`ir-submission.v1`にowner、provenance、trust、eligibility、course、BMS、replay、任意values、title/pathを含めない。
+2. serverだけがtokenからAccount/Profile/Deviceを解決し、内部`play-event.v1`へ`received_at`、公式provenance、policy version付きeligibilityを付与する。
+3. 生5DBはProfile単位のenvelope encryption。beatoraja停止中の指定5ファイルだけを受理し、WAL/SHMを拒否する。
+4. IRを履歴の正本とし、5DBは厳密fingerprintで欠落だけbackfillする。競合はIRを採用し監査する。
+5. 集合入力は品質ゲート済みlive IRだけ。5DB backfillは個人モデル専用。
+6. 100 Profile未満またはprivacy gate不合格なら集合モデルを公開しない。不合格はlatestから即時外し、削除Profileを除いて再学習する。
+7. 重要な規約/privacy更新後は再同意までIR ingest、5DB、MCP writeを止め、read/export/deleteだけ許可する。
+
+## MCP
+
+2026-07-28 Streamable HTTPのみ。旧initialize/session互換なし。OAuth Authorization Code + PKCE、discovery metadata、CIMD、Dynamic Client Registration（DCR）と主要client事前登録を提供する。

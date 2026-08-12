@@ -33,8 +33,9 @@ for (const file of contractFiles) {
 for (const file of exampleFiles) await readJson(new URL(file, examplesDirectory));
 
 const fixturePairs = [
-  ["ir-event.valid.json", "ir-event.invalid-extra-field.json"],
-  ["aggregate-eligibility.valid.json", "aggregate-eligibility.invalid-self-hosted.json"],
+  ["ir-submission.valid.json", "ir-submission.invalid-course.json"],
+  ["play-event.valid.json", "play-event.invalid-backfill-provenance.json"],
+  ["aggregate-eligibility.valid.json", "aggregate-eligibility.invalid-boolean.json"],
   ["upload-manifest.valid.json", "upload-manifest.invalid-sidecar.json"],
   ["container-input.valid.json", "container-input.invalid-self-hosted-aggregate.json"],
   ["container-output.valid.json", "container-output.invalid-self-hosted-aggregate.json"],

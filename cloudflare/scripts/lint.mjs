@@ -3,8 +3,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const scriptsDirectory = new URL("./", import.meta.url);
+const workerSourceDirectory = new URL("../worker/src/", import.meta.url);
 const scriptFiles = (await readdir(scriptsDirectory))
   .filter((file) => file.endsWith(".mjs"))
+  .sort();
+const workerSourceFiles = (await readdir(workerSourceDirectory))
+  .filter((file) => file.endsWith(".ts"))
   .sort();
 
 for (const file of scriptFiles) {
@@ -18,16 +22,7 @@ for (const file of scriptFiles) {
 
 const sourceFiles = [
   ...scriptFiles.map((file) => new URL(file, scriptsDirectory)),
-  new URL("../worker/src/index.ts", import.meta.url),
-  new URL("../worker/src/auth.ts", import.meta.url),
-  new URL("../worker/src/control-plane.ts", import.meta.url),
-  new URL("../worker/src/email.ts", import.meta.url),
-  new URL("../worker/src/ir-api.ts", import.meta.url),
-  new URL("../worker/src/profile-do.ts", import.meta.url),
-  new URL("../worker/src/oauth.ts", import.meta.url),
-  new URL("../worker/src/mcp.ts", import.meta.url),
-  new URL("../worker/src/advisor.ts", import.meta.url),
-  new URL("../worker/src/privacy.ts", import.meta.url),
+  ...workerSourceFiles.map((file) => new URL(file, workerSourceDirectory)),
 ];
 
 for (const path of sourceFiles) {
