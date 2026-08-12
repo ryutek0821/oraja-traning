@@ -130,13 +130,12 @@ CREATE TABLE terms_versions (
 
 CREATE TABLE consents (
   id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
+  profile_id TEXT,
   scope TEXT NOT NULL CHECK (scope IN ('terms', 'privacy', 'personal_recommendation', 'aggregate_training')),
   terms_version TEXT NOT NULL REFERENCES terms_versions(version),
   granted_at INTEGER NOT NULL,
-  revoked_at INTEGER,
-  FOREIGN KEY(account_id, profile_id) REFERENCES profiles(account_id, id) ON DELETE CASCADE
+  revoked_at INTEGER
 );
 
 CREATE INDEX consents_by_owner ON consents(account_id, profile_id, scope, granted_at);
@@ -151,6 +150,16 @@ CREATE TRIGGER consents_append_only_delete
 BEFORE DELETE ON consents
 BEGIN
   SELECT RAISE(ABORT, 'consents_are_append_only');
+END;
+
+CREATE TRIGGER consents_owner_insert
+BEFORE INSERT ON consents
+WHEN NEW.profile_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM profiles
+  WHERE id = NEW.profile_id AND account_id = NEW.account_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'consent_owner_mismatch');
 END;
 
 CREATE TABLE devices (
@@ -225,8 +234,8 @@ CREATE TABLE job_attempts (
 
 CREATE TABLE audit_events (
   id TEXT PRIMARY KEY,
-  account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
-  profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL,
+  account_id TEXT,
+  profile_id TEXT,
   actor_kind TEXT NOT NULL CHECK (actor_kind IN ('account', 'device', 'service', 'oauth')),
   event_type TEXT NOT NULL,
   reason_code TEXT,
@@ -249,6 +258,16 @@ CREATE TRIGGER audit_append_only_delete
 BEFORE DELETE ON audit_events
 BEGIN
   SELECT RAISE(ABORT, 'audit_events_are_append_only');
+END;
+
+CREATE TRIGGER audit_owner_insert
+BEFORE INSERT ON audit_events
+WHEN NEW.profile_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM profiles
+  WHERE id = NEW.profile_id AND account_id = NEW.account_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'audit_owner_mismatch');
 END;
 
 CREATE TABLE deletion_requests (
