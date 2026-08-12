@@ -1,0 +1,17 @@
+{
+  "contract": "five-db-upload-manifest",
+  "schema_version": "1",
+  "manifest_id": "018f0f0f-0f10-7f0f-8f0f-0f0f0f0f0f0f",
+  "created_at": "2026-08-11T03:01:00Z",
+  "game_mode": "SP7",
+  "files": [
+    {"file_name": "score.db", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size_bytes": 100, "object_key": "profiles/p/uploads/score.db"},
+    {"file_name": "scoredatalog.db", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size_bytes": 200, "object_key": "profiles/p/uploads/scoredatalog.db"},
+    {"file_name": "scorelog.db", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size_bytes": 300, "object_key": "profiles/p/uploads/scorelog.db"},
+    {"file_name": "songdata.db", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "size_bytes": 400, "object_key": "profiles/p/uploads/songdata.db"},
+    {"file_name": "songinfo.db", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "size_bytes": 500, "object_key": "profiles/p/uploads/songinfo.db"},
+    {"file_name": "score.db-wal", "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "size_bytes": 1, "object_key": "profiles/p/uploads/score.db-wal"}
+  ],
+  "snapshot": {"static_snapshot": true, "wal_present": false, "shm_present": false, "source_generation": "018f0f0f-0f11-7f0f-8f0f-0f0f0f0f0f0f"},
+  "privacy": {"contains_bms": false, "contains_replay": false}
+}

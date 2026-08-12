@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/play-event/v1/schema.json",
+  "title": "oraja-training internal play event v1",
+  "description": "Owner-resolved internal event. Live IR preserves the external submission; five DB backfill uses the same closed play-fact shape with a server-generated UUIDv7 and is forced ineligible for aggregate learning.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schema_version", "submission", "account_id", "profile_id", "device_id", "received_at", "provenance", "eligibility"],
+  "properties": {
+    "contract": { "const": "play-event" },
+    "schema_version": { "const": "1" },
+    "submission": { "$ref": "https://oraja-training.dev/contracts/ir-submission/v1/schema.json" },
+    "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "device_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidOrNull" },
+    "received_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+    "provenance": {
+      "type": "object", "additionalProperties": false, "required": ["service", "source"],
+      "properties": { "service": { "const": "official" }, "source": { "enum": ["live_ir", "five_db_backfill"] } }
+    },
+    "eligibility": {
+      "type": "object", "additionalProperties": false, "required": ["status", "reason_code", "policy_version"],
+      "properties": {
+        "status": { "enum": ["pending", "eligible", "ineligible", "revoked"] },
+        "reason_code": { "type": ["string", "null"], "maxLength": 64 },
+        "policy_version": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "properties": { "source": { "const": "live_ir" } },
+            "required": ["source"]
+          }
+        },
+        "required": ["provenance"]
+      },
+      "then": {
+        "properties": {
+          "device_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "properties": { "source": { "const": "five_db_backfill" } },
+            "required": ["source"]
+          }
+        },
+        "required": ["provenance"]
+      },
+      "then": {
+        "properties": {
+          "device_id": { "type": "null" },
+          "eligibility": {
+            "properties": {
+              "status": { "const": "ineligible" },
+              "reason_code": { "const": "five_db_backfill" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

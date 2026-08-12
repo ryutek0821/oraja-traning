@@ -1,0 +1,27 @@
+{
+  "contract": "artifact-manifest",
+  "schema_version": "1",
+  "manifest_id": "018f0f0f-0f30-7f0f-8f0f-0f0f0f0f0f0f",
+  "recommendation_version_id": "018f0f0f-0f31-7f0f-8f0f-0f0f0f0f0f0f",
+  "job_id": "018f0f0f-0f20-7f0f-8f0f-0f0f0f0f0f0f",
+  "account_id": "018f0f0f-0f00-7f0f-8f0f-0f0f0f0f0f0f",
+  "profile_id": "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f",
+  "trust_domain": "official",
+  "eligibility_status": "eligible",
+  "revision": 12,
+  "previous_revision": 11,
+  "menu_date": "2026-08-12",
+  "generated_at": "2026-08-11T03:04:00Z",
+  "source_output_manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "artifacts": [
+    {"kind": "recommend_table", "object_key": "profiles/018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f/artifacts/12/recommend/header.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size_bytes": 800, "content_type": "application/json", "visibility": "capability_readonly", "capability_ref": "018f0f0f-0f32-7f0f-8f0f-0f0f0f0f0f0f"},
+    {"kind": "daily_menu", "object_key": "profiles/018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f/artifacts/12/today/header.json", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size_bytes": 700, "content_type": "application/json", "visibility": "capability_readonly", "capability_ref": "018f0f0f-0f33-7f0f-8f0f-0f0f0f0f0f0f"}
+  ],
+  "latest_pointer": {
+    "profile_id": "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f",
+    "revision": 12,
+    "recommendation_version_id": "018f0f0f-0f31-7f0f-8f0f-0f0f0f0f0f0f",
+    "manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "update_condition": "candidate_revision_gt_current"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/ir-submission/v1/schema.json",
+  "title": "oraja-training external IR submission v1",
+  "description": "SP7 normal-play wire payload. Identity, provenance, eligibility, course data, chart content, replay, title and path are forbidden by the closed shape.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schema_version", "event_id", "played_at", "chart", "play"],
+  "properties": {
+    "contract": { "const": "ir-submission" },
+    "schema_version": { "const": "1" },
+    "event_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "played_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+    "chart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "ln_mode"],
+      "properties": {
+        "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+        "ln_mode": { "type": "integer", "enum": [0, 1, 2] }
+      }
+    },
+    "play": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clear", "gauge", "assist", "notes", "passnotes", "minbp", "ex_score", "combo", "option", "seed", "judgements"],
+      "properties": {
+        "clear": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "gauge": { "enum": ["ASSIST_EASY", "EASY", "NORMAL", "HARD", "EXHARD", "HAZARD"] },
+        "assist": { "enum": ["NONE", "ASSIST_EASY", "LIGHT_ASSIST_EASY"] },
+        "notes": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "passnotes": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "minbp": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "ex_score": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "combo": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+        "option": { "enum": ["NORMAL", "MIRROR", "RANDOM", "R-RANDOM", "S-RANDOM", "H-RANDOM", "SPIRAL", "ALL-SCR", "EX-RANDOM", "EX-S-RANDOM"] },
+        "seed": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "judgements": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["epg", "lpg", "egr", "lgr", "egd", "lgd", "ebd", "lbd", "epr", "lpr", "ems", "lms"],
+          "properties": {
+            "epg": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lpg": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "egr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lgr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "egd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lgd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "ebd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lbd": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "epr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lpr": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "ems": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
+            "lms": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" }
+          }
+        }
+      }
+    }
+  }
+}
