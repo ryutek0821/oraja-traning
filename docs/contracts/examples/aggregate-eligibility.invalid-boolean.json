@@ -1,0 +1,5 @@
+{
+  "contract": "aggregate-eligibility", "schema_version": "1",
+  "profile_id": "018f0f0f-0f0f-7f0f-8f0f-0f0f0f0f0f02",
+  "status": true, "reason_code": null, "policy_version": "2026-07-01", "evaluated_at": "2026-07-01T12:00:00Z"
+}
