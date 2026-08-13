@@ -33,6 +33,8 @@ Issue #7 の Worker 認証契約を記録する。認証情報、回復コード
 
 本番では Cloudflare Worker secret として `EMAIL_ENCRYPTION_KEY`（16 bytes 相当以上の
 高 entropy 値）を設定する。これは Wrangler の `vars`、Git、監査ログへ置かない。
+IP・ユーザーID・メールアドレスの検索／レート制限キーには、別の16 bytes以上の
+`AUTH_HASH_PEPPER`を設定し、HMAC-SHA-256で不可逆化する。
 任意メールを利用する環境では `AUTH_EMAIL` binding と `AUTH_EMAIL_FROM` も設定する。
 `PUBLIC_ORIGIN` は HTTPS の固定 origin とし、メール本文には opaque link 以外の
 アカウント ID、パスワード、回復コード、プレイ情報を含めない。
