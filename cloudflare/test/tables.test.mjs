@@ -1,0 +1,23 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+const root = new URL("../", import.meta.url);
+const tables = await readFile(new URL("worker/src/tables.ts", root), "utf8");
+const migration = await readFile(new URL("migrations/0007_tables.sql", root), "utf8");
+
+test("capability table route hashes the secret and never returns object keys", () => {
+  assert.match(tables, /crypto\.subtle\.digest\("SHA-256"/);
+  assert.match(tables, /c\.revoked_at IS NULL/);
+  assert.match(tables, /ARTIFACT_BUCKET\.get\(row\.object_key\)/);
+  assert.doesNotMatch(tables, /JSON\.stringify\(row/);
+});
+
+test("menu dates use the documented 04:00 boundary", () => {
+  assert.match(tables, /now\.getTime\(\) - 4 \* 60 \* 60 \* 1000/);
+});
+
+test("latest table pointers reference an immutable artifact revision", () => {
+  assert.match(migration, /FOREIGN KEY\(account_id, profile_id, table_kind, revision, content_hash, object_key\)/);
+  assert.match(migration, /REFERENCES artifact_revisions/);
+});

@@ -47,6 +47,7 @@ import {
   type JobEnvelope,
 } from "./job-ledger";
 import { SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
+import { handleCapabilityTable } from "./tables";
 export { GenerateWorkflow } from "./workflow";
 
 export { ProfileDurableObject };
@@ -450,6 +451,8 @@ export default {
     if (playResponse) return playResponse;
     const uploadResponse = await handleUploadRoute(request, env);
     if (uploadResponse) return uploadResponse;
+    const tableResponse = await handleCapabilityTable(request, env);
+    if (tableResponse) return tableResponse;
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return json({ error: { code: "not_found" } }, 404);
   },
