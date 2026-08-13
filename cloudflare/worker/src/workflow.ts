@@ -143,7 +143,9 @@ function defaultActivities(env: WorkflowEnv, ledger: D1JobLedger): WorkflowActiv
     },
 
     async normalize(job, input) {
-      return { normalizedDigest: await sha256Hex(`${job.inputDigest}:normalize:${input.inputDigest}`) };
+      void env.PYTHON_PROCESSOR;
+      void input;
+      throw new WorkflowActivityError("processor_integration_unavailable", false);
     },
 
     async updateModel(job, input) {
@@ -158,26 +160,20 @@ function defaultActivities(env: WorkflowEnv, ledger: D1JobLedger): WorkflowActiv
     },
 
     async verifyArtifact(job, input) {
-      if (job.artifactKey) {
-        const object = await env.ARTIFACT_BUCKET.head(job.artifactKey);
-        if (!object) throw new WorkflowActivityError("artifact_not_found", true);
-        const recordedDigest = object.customMetadata?.manifest_sha256;
-        if (recordedDigest && recordedDigest !== job.inputDigest) {
-          throw new WorkflowActivityError("artifact_manifest_mismatch", false);
-        }
+      void input;
+      if (!job.artifactKey) throw new WorkflowActivityError("artifact_key_missing", false);
+      const object = await env.ARTIFACT_BUCKET.head(job.artifactKey);
+      if (!object) throw new WorkflowActivityError("artifact_not_found", true);
+      const recordedDigest = object.customMetadata?.manifest_sha256;
+      if (!recordedDigest || !/^[0-9a-f]{64}$/.test(recordedDigest)) {
+        throw new WorkflowActivityError("artifact_manifest_missing", false);
       }
-      const manifestSha256 = await sha256Hex(JSON.stringify({
-        artifact_key: job.artifactKey,
-        menu_digest: input.menuDigest,
-        profile_id: job.profileId,
-        recommendation_digest: input.recommendationDigest,
-        revision: job.revision,
-      }));
+      const manifestSha256 = recordedDigest;
       return { manifestSha256, artifactKey: job.artifactKey };
     },
 
     async publish(job, input) {
-      const result = await ledger.publishLatest(job, input.manifestSha256, input.artifactKey);
+      const result = await ledger.recordSuccessAndPublish(job, input.manifestSha256, input.artifactKey);
       return {
         published: result.published,
         currentRevision: result.pointer.revision,
@@ -218,7 +214,6 @@ export class GenerateWorkflow extends WorkflowEntrypoint<WorkflowEnv, WorkflowPa
     const job = event.payload;
     try {
       const output = await runWorkflowPipeline(step, ledger, job, defaultActivities(this.env, ledger));
-      await ledger.recordOutcome(job, "succeeded", output.manifestSha256, output.manifestSha256);
       return output;
     } catch (error) {
       const cancelled = error instanceof JobLedgerError && error.code === "job_cancelled";

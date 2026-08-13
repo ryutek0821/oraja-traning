@@ -18,6 +18,7 @@
     "preview": {
       "name": "oraja-training-preview",
       "workers_dev": false,
+      "triggers": { "crons": ["0 2 1 * *", "0 3 * * *", "0 4 * * *"] },
       "routes": [
         { "pattern": "preview.oraja-training.example.invalid", "custom_domain": true }
       ],
@@ -84,6 +85,7 @@
     "staging": {
       "name": "oraja-training-staging",
       "workers_dev": false,
+      "triggers": { "crons": ["0 2 1 * *", "0 3 * * *", "0 4 * * *"] },
       "routes": [
         { "pattern": "staging.oraja-training.example.invalid", "custom_domain": true }
       ],
@@ -150,6 +152,7 @@
     "production": {
       "name": "oraja-training-production",
       "workers_dev": false,
+      "triggers": { "crons": ["0 2 1 * *", "0 3 * * *", "0 4 * * *"] },
       "routes": [
         { "pattern": "oraja-training.example.invalid", "custom_domain": true }
       ],

@@ -1,5 +1,4 @@
 import { Container } from "@cloudflare/containers";
-import { WorkflowEntrypoint } from "cloudflare:workers";
 import { CloudflareAuthEmailSender } from "./email";
 import {
   AuthError,
@@ -40,6 +39,15 @@ import {
 import { ProfileDurableObject } from "./profile-do";
 import { D1UploadSessionStore } from "./upload-store";
 import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
+import {
+  D1JobLedger,
+  JobDispatcher,
+  consumeQueueMessage,
+  dispatchSchedule,
+  type JobEnvelope,
+} from "./job-ledger";
+import { SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
+export { GenerateWorkflow } from "./workflow";
 
 export { ProfileDurableObject };
 
@@ -408,18 +416,6 @@ export class PythonProcessor extends Container {
   enableInternet = false;
 }
 
-export class GenerateWorkflow extends WorkflowEntrypoint<Env, { job_id: string }> {
-  async run(
-    event: { payload: { job_id: string } },
-    step: { do<T>(name: string, callback: () => Promise<T>): Promise<T> },
-  ): Promise<{ status: string; job_id: string }> {
-    return step.do("foundation-health-check", async () => ({
-      status: "foundation-ready",
-      job_id: event.payload.job_id,
-    }));
-  }
-}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -456,5 +452,31 @@ export default {
     if (uploadResponse) return uploadResponse;
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return json({ error: { code: "not_found" } }, 404);
+  },
+  async queue(batch: MessageBatch<JobEnvelope>, env: Env): Promise<void> {
+    const ledger = new D1JobLedger(env.CONTROL_DB);
+    for (const message of batch.messages) {
+      await consumeQueueMessage(message, {
+        ledger,
+        startWorkflow: async (job) => {
+          await env.GENERATE_WORKFLOW.create({
+            id: `job:${job.jobId}:run:${job.workflowRun}`,
+            params: job,
+          });
+        },
+      });
+    }
+  },
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    const schedule = (Object.entries(SCHEDULE_CRONS).find(([, cron]) => cron === controller.cron)?.[0]
+      ?? null) as ScheduleName | null;
+    if (!schedule) return;
+    const ledger = new D1JobLedger(env.CONTROL_DB);
+    await dispatchSchedule(
+      ledger,
+      new JobDispatcher(ledger, env.JOB_QUEUE),
+      schedule,
+      Math.floor(controller.scheduledTime / 1000),
+    );
   },
 };
