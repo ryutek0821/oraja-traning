@@ -1,94 +1,92 @@
-# API・認証・エラー・監査契約
+# API・認証・エラー契約
 
-これはサービス層の wire contract であり、現行の `serve/app.py` の localhost API をこの issue で変更するものではない。
+JSON Schema 2020-12がwire正本。未公開draft v1との互換は維持せず置換する。
 
-## 認証方式
+## 入口・認証・retry
 
-| 入口 | 認証 | 必須 scope | owner の決定 |
+ownerは常に認証済みcredentialから完全なowner鎖を解決する。IRは`Device → Profile → Account`、Web/5DBはsessionまたはupload grantから`Profile → Account`を解決し、request body、path、R2 object key内のIDは認可根拠にしない。
+
+| 入口 | 認証・owner解決 | 成功 | client retry |
 |---|---|---|---|
-| IR `POST /v1/plays` | profile-scoped bearer device token（hashのみ保存） | `plays:write` | tokenの `device_id → profile_id → account_id` |
-| Web/API | Secure + HttpOnly session cookie、CSRF token | endpointごとの session permission | session subject |
-| 5DB upload | Web session または upload grant | `uploads:write` | grant発行時に固定した profile |
-| capability table URL | 長期 random secret URL、任意失効 | read-only、URL rotationで旧URL即404 | secret recordの profile |
-| Remote MCP `/mcp` | OAuth 2.1 Authorization Code + PKCE | `profile:read` 等の明示 scope | OAuth subject + grant |
+| `POST /v1/ir/events` | Profile/Device限定256-bit bearer token（server保存はhashのみ） | 新規`202`、同一再送`200` | `408`、`425`、`429`、`5xx`だけ同じ`event_id`とcanonical payloadで再送 |
+| 5DB upload | Web sessionまたはProfile固定のupload grant | manifest受理`202` | 一時失敗だけ同じmanifest digestで再開 |
+| Web/API | Secure、HttpOnly、SameSite、`__Host-` session cookie。状態変更はCSRF検証 | endpointごとの`2xx` | safe methodまたは明示的にretryableな応答だけ |
+| capability table URL | recommend/today別の256-bit secret。D1保存はhashのみ | immutable artifact`200` | `GET`は安全に再送可。失効・rotation後の旧URLは`404` |
+| MCP | OAuth Authorization Code + PKCE。scopeとAccount/Profile owner鎖を照合 | scope内resource/tool応答 | access token失効時は再認証。write toolはidempotency契約がある場合だけ再送 |
 
-request body、path segment、R2 object keyに含まれる `account_id/profile_id` は認可情報ではない。別ownerで存在するIDは、情報漏えいを避けるため原則404を返す。
+## IR ingest
 
-## 初期エンドポイント契約
+`POST /v1/ir/events` は`ir-submission.v1`を受ける。ownerは256-bit device token（hash保存）から解決し、body中のowner/provenance等はunknown fieldとして拒否する。
 
-| Method | Path | request | 成功応答 | retry |
-|---|---|---|---|---|
-| POST | `/v1/plays` | `ir-event.v1` | 新規 `202`、同一再送 `200`。ACK後に async job | 408/425/429/5xxのみ同じ event_id で |
-| POST | `/v1/uploads` | `upload-manifest.v1` + pre-signed part | 新規 `202` と `job_id` | 一時失敗のみ同じ manifest digest で |
-| GET | `/t/{secret}/recommend/header.json` | capability secret | immutable artifact `200` | GETは安全に再試行可 |
-| GET | `/t/{secret}/today/header.json` | capability secret | immutable artifact `200` | GETは安全に再試行可 |
-| GET | `/mcp` | OAuth access token | MCP discovery/stream | token失効時は再認証 |
+Profile DOがPlayEvent、Job、revision、outbox、Alarmを原子的に保存すると`202 Accepted`、同じevent ID・同じcanonical payload/owner/contract versionは既存Jobを`200`、同じIDの競合は`409`とする。成功時は`Location: /v1/jobs/{job_id}`と`Retry-After`を返す。Jobは`queued/running/succeeded/failed`をpollできる。
 
-### ACK の意味
+QueueはAlarmから冪等送信する。一時失敗は指数backoff+jitterで5回、その後DLQ。同じJob IDで運営再実行する。
 
-`202` は durable idempotency record と Queue/Workflow の投入までを意味する。生成版の ready、model update、latest pointer の切替は含まない。レスポンス例:
+## Problem Details
+
+全JSON errorはRFC 9457 `application/problem+json`を使い、標準memberに`code`、`trace_id`、`retryable`を追加する。payload、token、email、秘密URLは含めない。
 
 ```json
 {
-  "status": "accepted",
-  "event_id": "018f0f0f-0f0f-7f0f-8f0f-0f0f0f0f0f0f",
-  "idempotency_key": "018f0f0f-0f0f-7f0f-8f0f-0f0f0f0f0f0f",
-  "job_id": "018f0f0f-0f10-7f0f-8f0f-0f0f0f0f0f0f",
+  "type": "https://oraja-training.dev/problems/idempotency-conflict",
+  "title": "Idempotency conflict",
+  "status": 409,
+  "code": "idempotency_conflict",
+  "trace_id": "018f0f0f-0f11-7f0f-8f0f-0f0f0f0f0f0f",
   "retryable": false
 }
 ```
 
-同じ key と同じ canonical payload の再送は `200 {"status":"duplicate", ...}` とする。key が同じで payload、owner、scope、contract version のいずれかが違う場合は `409 idempotency_conflict` とし、新しい effect を作らない。
+公開後の破壊的変更は即時切替とし、旧clientへ`426`と`minimum_client_version`、`update_url`を返す。clientは再送を止める。
 
-## エラー形式
+| HTTP | `code`例 | retry |
+|---:|---|---|
+| 400 / 415 / 422 | `invalid_contract`、`unsupported_media`、`unsupported_game_mode` | no |
+| 401 / 403 / 404 | `unauthorized`、`insufficient_scope`、`not_found` | no。必要なら再認証 |
+| 409 | `idempotency_conflict`、`profile_limit_reached` | no |
+| 413 | `payload_too_large` | no |
+| 426 | `client_upgrade_required` | no。client更新後に新契約で送信 |
+| 408 / 425 / 429 | `request_timeout`、`too_early`、`rate_limited` | yes。`Retry-After`に従う |
+| 500 / 502 / 503 / 504 | `temporary_unavailable` | yes。同一idempotency keyで再送 |
 
-すべての JSON API error は次の shape を使う。`details` に raw DB 行、token、email、秘密 URLを入れない。
+## Client spool
 
-```json
-{
-  "error": {
-    "code": "unsupported_game_mode",
-    "message": "この契約は SP7 のみ受け付けます",
-    "request_id": "018f0f0f-0f11-7f0f-8f0f-0f0f0f0f0f0f",
-    "retryable": false,
-    "retry_after_seconds": null
-  }
-}
-```
+未送信は最大10,000件・90日。ACK済みは即削除する。上限到達時は新規spoolを止めて警告する。恒久拒否payloadは削除し、理由だけ30日保持する。course結果は通信・spoolせず成功扱いにし、機密情報を含まない診断だけ残す。
 
-| HTTP | code例 | retry | 用途 |
-|---:|---|---|---|
-| 400 | `invalid_json`, `invalid_contract` | no | JSON/schema不正 |
-| 401 | `unauthorized` | no（再認証） | token/session不正 |
-| 403 | `insufficient_scope`, `profile_suspended` | no | 認可不足 |
-| 404 | `not_found` | no | 所有者越境を隠す |
-| 409 | `idempotency_conflict`, `profile_limit_reached` | no | state/payload conflict |
-| 413 | `payload_too_large` | no | file/request size超過 |
-| 415/422 | `unsupported_media`, `unsupported_game_mode`, `disallowed_field` | no | 初期範囲外・allowlist外 |
-| 429 | `rate_limited` | yes | `Retry-After` 秒を付ける |
-| 500/502/503/504 | `temporary_unavailable` | yes | server/queue/container一時障害 |
+## 5DB
+
+提出中はbeatoraja停止を必須とする。`score.db`、`scoredatalog.db`、`scorelog.db`、`songdata.db`、`songinfo.db`だけを許可し、WAL/SHMを拒否する。各2GiB、合計5GiBが上限。IRを履歴正本とし、厳密fingerprintで欠落だけbackfill、競合はIR優先で監査する。一式は1 Job・1 recommendation revision。
+
+## Authentication
+
+- Account user ID: lowercase正規化、3〜32文字。一意性は正規化後の値で判定する。
+- Password: 12〜128文字。Argon2id hashだけを保存する。
+- Recovery: 10個の単回復旧コードを発行し、server保存はhashのみ。使用済みcodeは再利用不可。
+- Email/reset: emailは任意かつ確認済み状態を区別する。reset tokenはhash保存、単回使用、15分有効。
+- IR: 256-bit token、hash保存、個別失効、期限なし、90日未使用で失効。
+- Web: Secure/HttpOnly/SameSite/`__Host-` cookie、30日idle、重要操作は15分以内再認証。
+- MCP: access 1時間、rotating refresh 30日。
+- 表URL: recommend/today別256-bit secret、hash保存、失効後旧URLは即404。
+
+別ownerで存在するIDは404とする。重要な規約/privacy再同意待ちはread/export/deleteだけを許可する。
 
 ## 監査イベント
 
-監査行は payload 本文でなく hash、owner、request ID、reason、status のみを持つ。
+監査行はtimestamp、actor/owner、request ID、対象ID、input digest、reason code、statusだけを持つ。payload本文、token、email、秘密URLは保存しない。
 
 ```text
 account.created / account.login_failed / account.delete_requested / account.delete_cancelled
 profile.created / profile.suspended / profile.deleted
 device.created / device.revoked
+consent.accepted / consent.reconsent_required
 play.accepted / play.duplicate / play.rejected
 upload.accepted / upload.rejected
-job.queued / job.retry / job.succeeded / job.failed
-revision.ready / revision.published / revision.superseded
+job.queued / job.retry / job.succeeded / job.failed / job.replayed
+revision.ready / revision.published / revision.superseded / revision.rollback_published
 capability.created / capability.rotated / capability.revoked
-mcp.authorized / mcp.denied / advisor.proposed / advisor.approved
+oauth.authorized / oauth.denied / mcp.tool_called / mcp.denied
+advisor.proposed / advisor.approved / advisor.rejected
+deletion.started / deletion.completed / backup.expired
 ```
 
-`play.rejected` と `upload.rejected` には `reason_code` と input digest を残し、拒否した raw body を保存しない。削除処理の開始・完了・backup expiry も監査する。
-
-## 初期範囲外の拒否
-
-- `game_mode != SP7`、DP/PMS、未知の `rule` は入口と Container で拒否する。
-- BMS本体、replay `keyinput`、任意 `values`、rival情報、IR ranking、course ranking は IR event/MCP resource の入力・出力に含めない。
-- `is_course=true` は個人履歴へ受理できるが、通常曲モデル・公式集合モデルへの入力から除外する。
-- MCP は raw 5DB/R2 object を返さない。詳細履歴は `plays:read` を持つ明示 tool call と paging が必要。
+拒否イベントはreason codeとinput digestだけを残す。Jobの運営再実行、latest pointer更新、削除開始・完了、Profile鍵破棄、backup expiryは必ず監査する。
