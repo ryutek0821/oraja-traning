@@ -38,6 +38,8 @@ import {
   type PlayAck,
 } from "./ir-api";
 import { ProfileDurableObject } from "./profile-do";
+import { D1UploadSessionStore } from "./upload-store";
+import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
 
 export { ProfileDurableObject };
 
@@ -61,6 +63,7 @@ export interface Env {
   EMAIL_ENCRYPTION_KEY?: string;
   AUTH_HASH_PEPPER?: string;
   DEVICE_TOKEN_PEPPER?: string;
+  ENVELOPE_MASTER_KEY?: string;
 }
 
 const JSON_HEADERS = {
@@ -379,6 +382,26 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
   }
 }
 
+async function handleUploadRoute(request: Request, env: Env): Promise<Response | null> {
+  if (!new URL(request.url).pathname.startsWith("/v1/uploads")) return null;
+  if (!env.ENVELOPE_MASTER_KEY) return json({ error: { code: "upload_not_configured" } }, 503);
+  const service = new UploadService(
+    env.RAW_BUCKET,
+    new D1UploadSessionStore(env.CONTROL_DB),
+    EnvelopeCrypto.fromSecret(env.ENVELOPE_MASTER_KEY),
+  );
+  return handleUploadRequest(request, service, async (candidate) => {
+    const accountId = await requireWebAccount(candidate, env, candidate.method !== "GET");
+    const profile = await env.CONTROL_DB
+      .prepare(
+        "SELECT id FROM profiles WHERE account_id = ?1 AND status = 'active' ORDER BY created_at LIMIT 1",
+      )
+      .bind(accountId)
+      .first<{ id: string }>();
+    return profile ? { profileId: profile.id } : null;
+  });
+}
+
 export class PythonProcessor extends Container {
   defaultPort = 8080;
   sleepAfter = "10m";
@@ -429,6 +452,8 @@ export default {
     if (deviceResponse) return deviceResponse;
     const playResponse = await handlePlayRoute(request, env, origin);
     if (playResponse) return playResponse;
+    const uploadResponse = await handleUploadRoute(request, env);
+    if (uploadResponse) return uploadResponse;
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return json({ error: { code: "not_found" } }, 404);
   },
