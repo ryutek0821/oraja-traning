@@ -8,13 +8,18 @@ const migration = await readFile(new URL("migrations/0007_tables.sql", root), "u
 
 test("capability table route hashes the secret and never returns object keys", () => {
   assert.match(tables, /crypto\.subtle\.digest\("SHA-256"/);
+  assert.match(tables, /recommend\|today/);
+  assert.match(tables, /header\\\.json\|score\\\.json/);
+  assert.match(tables, /c\.capability_kind = \?2/);
   assert.match(tables, /c\.revoked_at IS NULL/);
-  assert.match(tables, /ARTIFACT_BUCKET\.get\(row\.object_key\)/);
+  assert.match(tables, /ARTIFACT_BUCKET\.get\(objectKey\)/);
+  assert.match(tables, /"cache-control": "private, no-store"/);
   assert.doesNotMatch(tables, /JSON\.stringify\(row/);
 });
 
 test("menu dates use the documented 04:00 boundary", () => {
-  assert.match(tables, /now\.getTime\(\) - 4 \* 60 \* 60 \* 1000/);
+  assert.match(tables, /Number\(value\.hour\) < 4/);
+  assert.match(tables, /localDate\.setUTCDate\(localDate\.getUTCDate\(\) - 1\)/);
 });
 
 test("latest table pointers reference an immutable artifact revision", () => {
