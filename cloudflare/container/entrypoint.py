@@ -33,6 +33,22 @@ MAX_MANIFEST_HEADER_BYTES = 64 * 1024
 SAFE_BUNDLE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 
 
+class _BoundedBody:
+    """Expose exactly Content-Length bytes and then EOF on keep-alive sockets."""
+
+    def __init__(self, source: Any, length: int) -> None:
+        self._source = source
+        self._remaining = length
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining == 0:
+            return b""
+        requested = self._remaining if size < 0 else min(size, self._remaining)
+        chunk = self._source.read(requested)
+        self._remaining -= len(chunk)
+        return chunk
+
+
 def _error_payload(error: ContainerError | ManifestError) -> dict[str, Any]:
     code = getattr(error, "code", "invalid_contract")
     messages = {
@@ -111,7 +127,19 @@ class ProcessorHandler(HealthHandler):
             header_manifest = self.headers.get("X-Container-Input-Manifest")
             if header_manifest:
                 manifest = _decode_manifest_header(header_manifest)
-                result = self.adapter.run(manifest, bundle=self.rfile)
+                input_bundle = manifest.get("input_bundle")
+                expected_size = input_bundle.get("size_bytes") if isinstance(input_bundle, Mapping) else None
+                raw_length = self.headers.get("Content-Length")
+                try:
+                    content_length = int(raw_length or "-1")
+                except ValueError as exc:
+                    raise ManifestError("content length is invalid", code="invalid_contract") from exc
+                if not isinstance(expected_size, int) or content_length != expected_size:
+                    raise ManifestError("content length does not match manifest", code="invalid_contract")
+                result = self.adapter.run(
+                    manifest,
+                    bundle=_BoundedBody(self.rfile, content_length),
+                )
             else:
                 request = self._read_json_request()
                 manifest = request.get("manifest")
