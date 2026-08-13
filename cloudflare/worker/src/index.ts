@@ -19,6 +19,27 @@ import {
   useRecoveryCode,
   verifyCsrf,
 } from "./auth";
+import {
+  ApiError,
+  authErrorResponse as irErrorResponse,
+  authenticateDeviceToken,
+  bearerToken,
+  enforceIrRateLimit,
+  eventDigest,
+  issueDeviceToken,
+  listDevices,
+  readJsonBody,
+  renameDevice,
+  revokeAllDevices,
+  revokeDevice,
+  sessionAccount,
+  validateIrEvent,
+  type DeviceIdentity,
+  type PlayAck,
+} from "./ir-api";
+import { ProfileDurableObject } from "./profile-do";
+
+export { ProfileDurableObject };
 
 export interface Env {
   ENVIRONMENT: string;
@@ -204,6 +225,160 @@ async function handleAuth(request: Request, env: Env, origin?: string): Promise<
   }
 }
 
+function requireDevicePepper(env: Env): string {
+  if (!env.DEVICE_TOKEN_PEPPER) throw new ApiError("temporary_unavailable", 503, true, 5);
+  return env.DEVICE_TOKEN_PEPPER;
+}
+
+async function requireWebAccount(request: Request, env: Env, mutate: boolean): Promise<string> {
+  const sessionToken = readCookie(request, "__Host-oraja_session");
+  if (!sessionToken) throw new ApiError("unauthorized", 401);
+  if (mutate) {
+    const csrf = request.headers.get("X-CSRF-Token");
+    if (!(await verifyCsrf(env.CONTROL_DB, sessionToken, csrf, Math.floor(Date.now() / 1000)))) {
+      throw new ApiError("csrf_required", 403);
+    }
+  }
+  return sessionAccount(env.CONTROL_DB, sessionToken);
+}
+
+async function handleDeviceRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
+  const url = new URL(request.url);
+  const listOrCreate = /^\/v1\/profiles\/([^/]+)\/devices$/.exec(url.pathname);
+  const revokeAll = /^\/v1\/profiles\/([^/]+)\/devices\/revoke-all$/.exec(url.pathname);
+  const mutation = /^\/v1\/devices\/([^/]+)(?:\/revoke)?$/.exec(url.pathname);
+  if (!listOrCreate && !revokeAll && !mutation) return null;
+  const requestIdValue = requestId(request);
+  try {
+    if (listOrCreate && request.method === "GET") {
+      const accountId = await requireWebAccount(request, env, false);
+      return json({
+        devices: await listDevices(env.CONTROL_DB, accountId, decodeURIComponent(listOrCreate[1])),
+      }, 200, origin);
+    }
+    if (listOrCreate && request.method === "POST") {
+      const accountId = await requireWebAccount(request, env, true);
+      const body = await readJsonBody(request, 16 * 1024);
+      return json(await issueDeviceToken(
+        env.CONTROL_DB,
+        accountId,
+        decodeURIComponent(listOrCreate[1]),
+        body.label,
+        requireDevicePepper(env),
+        { requestId: requestIdValue },
+      ), 201, origin);
+    }
+    if (revokeAll && request.method === "POST") {
+      const accountId = await requireWebAccount(request, env, true);
+      const count = await revokeAllDevices(
+        env.CONTROL_DB,
+        accountId,
+        decodeURIComponent(revokeAll[1]),
+        { requestId: requestIdValue },
+      );
+      return json({ revoked: count }, 200, origin);
+    }
+    if (mutation) {
+      const accountId = await requireWebAccount(request, env, true);
+      const deviceId = decodeURIComponent(mutation[1]);
+      if (request.method === "PATCH" && !url.pathname.endsWith("/revoke")) {
+        const body = await readJsonBody(request, 16 * 1024);
+        return json(await renameDevice(env.CONTROL_DB, accountId, deviceId, body.label, {
+          requestId: requestIdValue,
+        }), 200, origin);
+      }
+      if (request.method === "DELETE" || (request.method === "POST" && url.pathname.endsWith("/revoke"))) {
+        await revokeDevice(env.CONTROL_DB, accountId, deviceId, { requestId: requestIdValue });
+        return json({ revoked: true }, 200, origin);
+      }
+    }
+    throw new ApiError("method_not_allowed", 405);
+  } catch (error) {
+    return irErrorResponse(error, requestIdValue, origin);
+  }
+}
+
+function publicPlayAck(ack: PlayAck): Omit<PlayAck, "enqueue_required"> {
+  return {
+    status: ack.status,
+    event_id: ack.event_id,
+    idempotency_key: ack.idempotency_key,
+    job_id: ack.job_id,
+    revision: ack.revision,
+    retryable: false,
+  };
+}
+
+async function enqueuePlay(
+  env: Env,
+  identity: DeviceIdentity,
+  event: { event_id: string },
+  ack: PlayAck,
+  digest: string,
+): Promise<void> {
+  await env.JOB_QUEUE.send({
+    type: "play.accepted.v1",
+    job_id: ack.job_id,
+    event_id: event.event_id,
+    profile_id: identity.profileId,
+    revision: ack.revision,
+    input_digest: digest,
+  });
+}
+
+async function markPlayEnqueued(stub: DurableObjectStub, eventId: string): Promise<void> {
+  const result = await stub.fetch(
+    `https://profile.internal/internal/play-events/${encodeURIComponent(eventId)}/enqueued`,
+    { method: "POST" },
+  );
+  if (!result.ok) throw new ApiError("temporary_unavailable", 503, true, 5);
+}
+
+async function handlePlayRoute(request: Request, env: Env, origin?: string): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== "/v1/plays") return null;
+  const requestIdValue = requestId(request);
+  try {
+    if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
+    const pepper = requireDevicePepper(env);
+    const now = Math.floor(Date.now() / 1000);
+    await enforceIrRateLimit(env.CONTROL_DB, "ip", clientIp(request), pepper, now);
+    const identity = await authenticateDeviceToken(env.CONTROL_DB, bearerToken(request), pepper, { now });
+    await enforceIrRateLimit(env.CONTROL_DB, "token", identity.tokenHash, pepper, now);
+    const event = validateIrEvent(await readJsonBody(request), identity, now);
+    const digest = await eventDigest(event, identity);
+    const stub = env.PROFILE_DO.get(env.PROFILE_DO.idFromName(identity.profileId));
+    const durableResponse = await stub.fetch("https://profile.internal/internal/play-events", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-request-id": requestIdValue },
+      body: JSON.stringify({
+        profile_internal_id: identity.profileId,
+        device_internal_id: identity.deviceId,
+        payload_digest: digest,
+        request_id: requestIdValue,
+        event,
+      }),
+    });
+    if (durableResponse.status === 409) {
+      return json({ error: { code: "idempotency_conflict" } }, 409, origin);
+    }
+    if (!durableResponse.ok) throw new ApiError("temporary_unavailable", 503, true, 5);
+    const ack = await durableResponse.json() as PlayAck;
+    if (
+      (ack.status !== "accepted" && ack.status !== "duplicate") ||
+      ack.event_id !== event.event_id ||
+      ack.idempotency_key !== event.event_id
+    ) throw new ApiError("temporary_unavailable", 503, true, 5);
+    if (ack.enqueue_required) {
+      await enqueuePlay(env, identity, event, ack, digest);
+      await markPlayEnqueued(stub, event.event_id);
+    }
+    return json(publicPlayAck(ack), ack.status === "accepted" ? 202 : 200, origin);
+  } catch (error) {
+    return irErrorResponse(error, requestIdValue, origin);
+  }
+}
+
 export class PythonProcessor extends Container {
   defaultPort = 8080;
   sleepAfter = "10m";
@@ -235,7 +410,7 @@ export default {
         headers: {
           "access-control-allow-origin": origin,
           "access-control-allow-credentials": "true",
-          "access-control-allow-headers": "Content-Type,Authorization,X-CSRF-Token,X-Request-ID",
+          "access-control-allow-headers": "content-type,authorization,x-csrf-token,x-request-id",
           "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
           "access-control-max-age": "600",
           "vary": "Origin",
@@ -250,6 +425,10 @@ export default {
     }
     const authResponse = await handleAuth(request, env, origin);
     if (authResponse) return authResponse;
+    const deviceResponse = await handleDeviceRoutes(request, env, origin);
+    if (deviceResponse) return deviceResponse;
+    const playResponse = await handlePlayRoute(request, env, origin);
+    if (playResponse) return playResponse;
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return json({ error: { code: "not_found" } }, 404);
   },
