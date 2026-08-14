@@ -5,6 +5,13 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
+test("browser MCP transport permits and exposes only the protocol session headers", async () => {
+  const source = await readFile(new URL("worker/src/index.ts", root), "utf8");
+  assert.match(source, /access-control-allow-headers[^\n]+mcp-protocol-version,mcp-session-id/);
+  assert.match(source, /access-control-expose-headers", "mcp-session-id"/);
+  assert.match(source, /access-control-allow-origin", origin/);
+});
+
 async function loadMcp() {
   const source = await readFile(new URL("worker/src/mcp.ts", root), "utf8");
   let code = stripTypeScriptTypes(source, { mode: "strip" });

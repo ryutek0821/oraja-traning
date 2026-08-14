@@ -816,8 +816,9 @@ export default {
         headers: {
           "access-control-allow-origin": origin,
           "access-control-allow-credentials": "true",
-          "access-control-allow-headers": "content-type,authorization,x-csrf-token,x-request-id",
+          "access-control-allow-headers": "content-type,authorization,x-csrf-token,x-request-id,mcp-protocol-version,mcp-session-id",
           "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
+          "access-control-expose-headers": "mcp-session-id",
           "access-control-max-age": "600",
           "vary": "Origin",
         },
@@ -831,7 +832,16 @@ export default {
     }
     const oauthResponse = await handleOAuthRoutes(request, env, origin);
     if (oauthResponse) return oauthResponse;
-    if (url.pathname === "/mcp") return handleMcp(request, env);
+    if (url.pathname === "/mcp") {
+      const response = await handleMcp(request, env);
+      if (!origin) return response;
+      const headers = new Headers(response.headers);
+      headers.set("access-control-allow-origin", origin);
+      headers.set("access-control-allow-credentials", "true");
+      headers.set("access-control-expose-headers", "mcp-session-id");
+      headers.append("vary", "Origin");
+      return new Response(response.body, { status: response.status, headers });
+    }
     const authResponse = await handleAuth(request, env, origin);
     if (authResponse) return authResponse;
     if (url.pathname === "/v1/dashboard") {
