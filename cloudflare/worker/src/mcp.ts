@@ -1,10 +1,13 @@
 import { createAdvisorProposal } from "./advisor";
 import { ApiError } from "./ir-api";
-import { authenticateOAuthToken, hasOAuthScope, type OAuthPrincipal, type OAuthScope } from "./oauth";
+import { authenticateOAuthToken, hasOAuthScope, mcpOAuthResource, type OAuthPrincipal, type OAuthScope } from "./oauth";
 import type { Env } from "./index";
 
 const MCP_PROTOCOL_VERSION = "2026-07-28";
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const MAX_SESSION_ID_BYTES = 1024;
+const MCP_SESSION_TTL_SECONDS = 8 * 60 * 60;
+const SSE_BODY = "retry: 30000\n: stream-ready\n\n";
 
 type JsonRpcRequest = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
 type RpcTool = { name: string; description: string; inputSchema: Record<string, unknown> };
@@ -13,6 +16,10 @@ function rpc(id: unknown, result: unknown): Response {
   const body = JSON.stringify({ jsonrpc: "2.0", id: id ?? null, result }) + "\n";
   if (body.length > MAX_RESPONSE_BYTES) return rpcError(id, -32002, "response_too_large", 413);
   return new Response(body, { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+}
+
+function empty(status: number, headers?: HeadersInit): Response {
+  return new Response(null, { status, headers: { "cache-control": "no-store", ...headers } });
 }
 
 function rpcError(id: unknown, code: number, message: string, status = 400): Response {
@@ -76,10 +83,138 @@ async function cursorSignature(secret: string, payload: string): Promise<string>
   return base64url(new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload))));
 }
 
+async function hmac(secret: string, payload: string): Promise<string> {
+  return cursorSignature(secret, payload);
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  return difference === 0;
+}
+
 function cursorSecret(env: Env): string {
   const secret = env.AUTH_HASH_PEPPER ?? env.DEVICE_TOKEN_PEPPER;
   if (!secret) throw new ApiError("cursor_signing_unavailable", 503);
   return secret;
+}
+
+function acceptedMediaTypes(request: Request): Set<string> {
+  const accepted = new Set<string>();
+  for (const entry of (request.headers.get("accept") ?? "").split(",")) {
+    const [mediaType, ...parameters] = entry.trim().toLowerCase().split(";").map((part) => part.trim());
+    if (!mediaType || parameters.some((parameter) => /^q=0(?:\.0*)?$/.test(parameter))) continue;
+    accepted.add(mediaType);
+  }
+  return accepted;
+}
+
+export function validateMcpAccept(request: Request): void {
+  const accepted = acceptedMediaTypes(request);
+  const accepts = (mediaType: string): boolean => accepted.has(mediaType) || accepted.has("*/*");
+  if (request.method === "POST" && (!accepts("application/json") || !accepts("text/event-stream"))) {
+    throw new ApiError("not_acceptable", 406);
+  }
+  if (request.method === "GET" && !accepts("text/event-stream")) throw new ApiError("not_acceptable", 406);
+}
+
+export function validateMcpProtocolVersion(request: Request, initialize: boolean): void {
+  const version = request.headers.get("mcp-protocol-version");
+  if ((!initialize && version !== MCP_PROTOCOL_VERSION) || (initialize && version !== null && version !== MCP_PROTOCOL_VERSION)) {
+    throw new ApiError("unsupported_protocol_version", 400);
+  }
+}
+
+type McpSessionPayload = { v: 1; sid: string; exp: number; bind: string };
+
+async function sessionBinding(env: Env, principal: OAuthPrincipal): Promise<string> {
+  return hmac(cursorSecret(env), `mcp-principal:${JSON.stringify([
+    principal.grantId,
+    principal.clientId,
+    principal.accountId,
+    principal.profileId,
+  ])}`);
+}
+
+async function sessionHash(env: Env, sessionId: string): Promise<string> {
+  return `mcp:${await hmac(cursorSecret(env), `mcp-session:${sessionId}`)}`;
+}
+
+export async function issueMcpSession(
+  env: Env,
+  principal: OAuthPrincipal,
+  now = Math.floor(Date.now() / 1000),
+): Promise<string> {
+  const expiresAt = Math.min(principal.expiresAt, now + MCP_SESSION_TTL_SECONDS);
+  if (expiresAt <= now) throw new ApiError("invalid_token", 401);
+  const payload: McpSessionPayload = {
+    v: 1,
+    sid: crypto.randomUUID(),
+    exp: expiresAt,
+    bind: await sessionBinding(env, principal),
+  };
+  const encoded = base64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const token = `${encoded}.${await hmac(cursorSecret(env), encoded)}`;
+  await env.CONTROL_DB.prepare(
+    "INSERT INTO sessions(id, account_id, session_hash, created_at, expires_at, revoked_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+  ).bind(crypto.randomUUID(), principal.accountId, await sessionHash(env, token), now, expiresAt).run();
+  return token;
+}
+
+async function parseMcpSession(env: Env, principal: OAuthPrincipal, token: string, now: number): Promise<McpSessionPayload> {
+  if (token.length > MAX_SESSION_ID_BYTES) throw new ApiError("invalid_session", 404);
+  const [encoded, signature, extra] = token.split(".");
+  if (!encoded || !signature || extra !== undefined || !constantTimeEqual(await hmac(cursorSecret(env), encoded), signature)) {
+    throw new ApiError("invalid_session", 404);
+  }
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(decodeBase64url(encoded))) as Partial<McpSessionPayload>;
+    const expectedBinding = await sessionBinding(env, principal);
+    if (payload.v !== 1 || typeof payload.sid !== "string" || payload.sid.length > 64 || !Number.isInteger(payload.exp)
+      || Number(payload.exp) <= now || typeof payload.bind !== "string" || !constantTimeEqual(payload.bind, expectedBinding)) {
+      throw new Error("invalid session payload");
+    }
+    return payload as McpSessionPayload;
+  } catch {
+    throw new ApiError("invalid_session", 404);
+  }
+}
+
+export async function validateMcpSession(
+  request: Request,
+  env: Env,
+  principal: OAuthPrincipal,
+  now = Math.floor(Date.now() / 1000),
+): Promise<{ token: string; hash: string; payload: McpSessionPayload }> {
+  const token = request.headers.get("mcp-session-id");
+  if (!token) throw new ApiError("missing_session", 400);
+  const payload = await parseMcpSession(env, principal, token, now);
+  const hash = await sessionHash(env, token);
+  const stored = await env.CONTROL_DB.prepare(
+    "SELECT expires_at FROM sessions WHERE account_id = ?1 AND session_hash = ?2 AND revoked_at IS NULL",
+  ).bind(principal.accountId, hash).first<{ expires_at: number }>();
+  if (!stored || stored.expires_at <= now || stored.expires_at !== payload.exp) throw new ApiError("invalid_session", 404);
+  return { token, hash, payload };
+}
+
+async function terminateMcpSession(env: Env, principal: OAuthPrincipal, hash: string, now = Math.floor(Date.now() / 1000)): Promise<void> {
+  await env.CONTROL_DB.prepare(
+    "UPDATE sessions SET revoked_at = ?1 WHERE account_id = ?2 AND session_hash = ?3 AND revoked_at IS NULL",
+  ).bind(now, principal.accountId, hash).run();
+}
+
+function sse(): Response {
+  if (new TextEncoder().encode(SSE_BODY).byteLength > MAX_RESPONSE_BYTES) throw new ApiError("response_too_large", 413);
+  return new Response(SSE_BODY, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store, no-transform",
+      connection: "keep-alive",
+      "x-content-type-options": "nosniff",
+    },
+  });
 }
 
 async function signCursor(env: Env, principal: OAuthPrincipal, cursor: string): Promise<string> {
@@ -138,23 +273,46 @@ function toolsFor(principal: OAuthPrincipal): RpcTool[] {
 
 export async function handleMcp(request: Request, env: Env): Promise<Response> {
   let rpcId: unknown = null;
-  if (request.method !== "POST" && request.method !== "GET") return rpcError(null, -32600, "method_not_allowed", 405);
+  if (request.method !== "POST" && request.method !== "GET" && request.method !== "DELETE") return rpcError(null, -32600, "method_not_allowed", 405);
   const origin = request.headers.get("Origin");
   if (origin && !env.CORS_ORIGINS.split(",").map((item) => item.trim()).includes(origin)) return rpcError(null, -32001, "origin_not_allowed", 403);
   try {
-    const principal = await authenticateOAuthToken(env.CONTROL_DB, bearer(request));
+    validateMcpAccept(request);
+    const principal = await authenticateOAuthToken(env.CONTROL_DB, bearer(request), undefined, undefined, mcpOAuthResource(env.PUBLIC_ORIGIN));
     if (request.method === "GET") {
+      validateMcpProtocolVersion(request, false);
+      await validateMcpSession(request, env, principal);
       requestScope(principal, "profile:read");
-      return rpc(null, { protocolVersion: MCP_PROTOCOL_VERSION, serverInfo: { name: "oraja-training", version: env.BUILD_VERSION } });
+      return sse();
+    }
+    if (request.method === "DELETE") {
+      validateMcpProtocolVersion(request, false);
+      const session = await validateMcpSession(request, env, principal);
+      requestScope(principal, "profile:read");
+      await terminateMcpSession(env, principal, session.hash);
+      return empty(204);
     }
     const body = await readRequest(request);
     rpcId = body.id;
     const method = typeof body.method === "string" ? body.method : "";
-    if (body.jsonrpc !== "2.0" || rpcId === undefined) return rpcError(rpcId, -32600, "invalid_request");
+    if (body.jsonrpc !== "2.0" || !method) return rpcError(rpcId, -32600, "invalid_request");
     if (method === "initialize") {
+      validateMcpProtocolVersion(request, true);
+      if (request.headers.has("mcp-session-id")) return rpcError(rpcId, -32600, "unexpected_session");
+      if (rpcId === undefined) return empty(202);
+      if (params(body.params).protocolVersion !== MCP_PROTOCOL_VERSION) {
+        return rpcError(rpcId, -32602, "unsupported_protocol_version");
+      }
       requestScope(principal, "profile:read");
-      return rpc(rpcId, { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: { resources: { subscribe: false }, tools: { listChanged: false } }, serverInfo: { name: "oraja-training", version: env.BUILD_VERSION } });
+      const sessionId = await issueMcpSession(env, principal);
+      const response = rpc(rpcId, { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: { resources: { subscribe: false }, tools: { listChanged: false } }, serverInfo: { name: "oraja-training", version: env.BUILD_VERSION } });
+      response.headers.set("mcp-session-id", sessionId);
+      response.headers.set("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+      return response;
     }
+    validateMcpProtocolVersion(request, false);
+    await validateMcpSession(request, env, principal);
+    if (rpcId === undefined) return empty(202);
     if (method === "resources/list") {
       const resources: Record<string, unknown>[] = [];
       if (hasOAuthScope(principal, "profile:read")) resources.push({ uri: "oraja://profile", name: "Profile", mimeType: "application/json" });
