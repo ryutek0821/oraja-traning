@@ -14,7 +14,7 @@
     "account_id",
     "profile_id",
     "trust_domain",
-    "aggregate_eligible",
+    "eligibility_status",
     "revision",
     "previous_revision",
     "menu_date",
@@ -32,17 +32,17 @@
     "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
-    "aggregate_eligible": { "type": "boolean" },
+    "eligibility_status": { "enum": ["pending", "eligible", "ineligible", "revoked"] },
     "revision": {
       "type": "integer",
       "minimum": 1,
       "maximum": 9223372036854775807
     },
     "previous_revision": {
-      "anyOf": [
-        { "type": "integer", "minimum": 0 },
-        { "type": "null" }
-      ]
+      "description": "The latest published revision observed before this publish attempt; it may skip failed or unpublished revisions and must be lower than revision.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775806
     },
     "menu_date": {
       "type": "string",
@@ -52,7 +52,7 @@
     "source_output_manifest_sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
     "artifacts": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 2,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -75,7 +75,33 @@
           "content_type": { "enum": ["application/json", "application/zstd"] },
           "visibility": { "enum": ["profile_private", "capability_readonly"] },
           "capability_ref": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidOrNull" }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "kind": { "enum": ["recommend_table", "daily_menu"] } },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "visibility": { "const": "capability_readonly" },
+                "capability_ref": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "kind": { "enum": ["web_export", "model_snapshot"] } },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "visibility": { "const": "profile_private" },
+                "capability_ref": { "type": "null" }
+              }
+            }
+          }
+        ]
       }
     },
     "latest_pointer": {
@@ -96,15 +122,36 @@
           "maximum": 9223372036854775807
         },
         "recommendation_version_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
-        "manifest_sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+        "manifest_sha256": {
+          "description": "SHA-256 of the RFC 8785 canonical manifest after removing the complete latest_pointer member, preventing a self-referential digest.",
+          "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256"
+        },
         "update_condition": { "const": "candidate_revision_gt_current" }
       }
     }
   },
   "allOf": [
     {
-      "if": { "properties": { "trust_domain": { "const": "self_hosted" } } },
-      "then": { "properties": { "aggregate_eligible": { "const": false } } }
+      "properties": {
+        "artifacts": {
+          "contains": {
+            "type": "object",
+            "properties": { "kind": { "const": "recommend_table" } },
+            "required": ["kind"]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "artifacts": {
+          "contains": {
+            "type": "object",
+            "properties": { "kind": { "const": "daily_menu" } },
+            "required": ["kind"]
+          }
+        }
+      }
     }
   ]
 }

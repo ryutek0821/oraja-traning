@@ -1,9 +1,15 @@
 # oraja-training beatoraja IR
 
-This directory contains the `IRConnection` plugin for the official
-`exch-bms2/beatoraja` API.  It is intentionally independent from the
-Cloudflare Worker: the Worker receives the versioned `ir-event` envelope and
-returns an idempotent ACK; this JAR owns only the client-side boundary.
+> **Implementation status:** this draft currently contains only the event
+> DTO/mapper, identity/configuration, JSON codec, and build design.  It does
+> not yet contain an `IRConnection`, durable spool, HTTP client, compatibility
+> stubs, tests, or a complete Gradle wrapper, and therefore must not be
+> published as a working plugin.
+
+This directory is the foundation for an `IRConnection` plugin targeting the
+official `exch-bms2/beatoraja` API.  The Worker receives the versioned play
+event and returns an idempotent ACK; the eventual JAR will own only the
+client-side boundary.
 
 ## Compatibility and dependency
 
@@ -13,8 +19,9 @@ The compatibility target is the current `master` source of
 README requires a 64-bit Java 17 runtime.  Upstream does not publish a Maven
 or Gradle API artifact; its `build.xml` compiles from source and `lib/*.jar`.
 
-The real build therefore takes the user-provided beatoraja runtime JAR as a
-compile-only dependency:
+The planned release build takes the user-provided beatoraja runtime JAR as a
+compile-only dependency.  The command below is not available until the
+missing wrapper and plugin implementation above are added:
 
 ```sh
 ./gradlew clean releaseArtifacts \
@@ -90,15 +97,16 @@ The token is not persisted.  A token/profile change clears the in-memory
 session and only drains files whose `profile_id` matches the newly logged-in
 profile, preventing an old profile's events from crossing the boundary.
 
-The client API used by this module is:
+The Worker API contract for the eventual client is:
 
-* `POST /v1/ir/devices/session` — validates the device token in the Bearer
-  header; body contains only `profile_id` and `device_id`.
-* `POST /v1/ir/events` — accepts an event and returns
+* Device tokens are provisioned by the authenticated Web endpoint
+  `POST /v1/profiles/{profile_id}/devices`; they are not created by the JAR.
+* `POST /v1/plays` — validates the Bearer device token, accepts an event, and returns
   `{"event_id":"...","status":"accepted|duplicate"}`.
-* `GET /v1/ir/scores?profile_id=...&sha256=...` — returns the authenticated
-  profile's aggregate scores only.  The response is an allowlisted score
-  array; no rival, table, or course-ranking data is requested.
+
+No profile score-read endpoint is currently implemented.  Rivals, tables,
+and course rankings must remain disabled until an allowlisted endpoint and
+its authorization tests exist.
 
 ## Offline and existing IR coexistence
 

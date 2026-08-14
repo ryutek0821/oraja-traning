@@ -717,6 +717,93 @@ export class D1JobLedger {
     };
   }
 
+  async recordSuccessAndPublish(
+    job: JobEnvelope,
+    manifestSha256: string,
+    artifactKey?: string | null,
+  ): Promise<{ published: boolean; pointer: LatestPointerView }> {
+    if (!isSha256(manifestSha256)) {
+      throw new JobLedgerError("invalid_manifest_digest", 400, false);
+    }
+    const revisionId = `revision:${job.jobId}`;
+    const revision = await this.db.prepare(
+      `SELECT id FROM job_revisions
+        WHERE id = ?1 AND job_id = ?2 AND account_id = ?3 AND profile_id = ?4
+          AND trust_domain = ?5 AND revision = ?6`,
+    ).bind(
+      revisionId,
+      job.jobId,
+      job.accountId,
+      job.profileId,
+      job.trustDomain,
+      job.revision,
+    ).first<{ id: string }>();
+    if (!revision) throw new JobLedgerError("revision_not_found", 409, false);
+
+    const now = this.clock();
+    const results = await this.db.batch([
+      this.db.prepare(
+        `INSERT INTO revision_outcomes(
+           id, revision_id, job_id, workflow_run, status, output_digest,
+           manifest_sha256, error_code, error_hash, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?5, NULL, NULL, ?6)`,
+      ).bind(this.idFactory(), revisionId, job.jobId, job.workflowRun, manifestSha256, now),
+      this.db.prepare(
+        `UPDATE jobs SET status = 'succeeded', finished_at = ?2,
+                         terminal_reason = NULL, next_attempt_at = NULL, updated_at = ?2
+          WHERE id = ?1 AND status IN ('queued', 'running')`,
+      ).bind(job.jobId, now),
+      this.db.prepare(
+        `INSERT INTO latest_pointers(
+           account_id, profile_id, trust_domain, revision, revision_id,
+           manifest_sha256, artifact_key, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(account_id, profile_id, trust_domain) DO UPDATE SET
+           revision = excluded.revision,
+           revision_id = excluded.revision_id,
+           manifest_sha256 = excluded.manifest_sha256,
+           artifact_key = excluded.artifact_key,
+           updated_at = excluded.updated_at
+         WHERE excluded.revision > latest_pointers.revision`,
+      ).bind(
+        job.accountId,
+        job.profileId,
+        job.trustDomain,
+        job.revision,
+        revisionId,
+        manifestSha256,
+        artifactKey ?? job.artifactKey,
+        now,
+      ),
+      auditStatement(
+        this.db,
+        this.idFactory(),
+        job.accountId,
+        job.profileId,
+        "job.succeeded",
+        "succeeded",
+        now,
+        manifestSha256,
+      ),
+    ]);
+    const pointer = await this.db.prepare(
+      `SELECT revision, revision_id, manifest_sha256, artifact_key, updated_at
+         FROM latest_pointers
+        WHERE account_id = ?1 AND profile_id = ?2 AND trust_domain = ?3`,
+    ).bind(job.accountId, job.profileId, job.trustDomain).first<PointerRow>();
+    if (!pointer) throw new JobLedgerError("latest_pointer_missing", 503, true);
+    return {
+      published: changes(results[2] as ChangeResult) === 1,
+      pointer: {
+        revision: numberValue(pointer.revision),
+        revisionId: pointer.revision_id,
+        manifestSha256: pointer.manifest_sha256,
+        artifactKey: pointer.artifact_key ?? null,
+        updatedAt: numberValue(pointer.updated_at),
+      },
+    };
+  }
+
   async cancel(accountId: string, jobId: string, reasonCode = "operator_cancelled"): Promise<JobStatus> {
     const job = await this.getJobRow(jobId);
     if (job.account_id !== accountId) throw new JobLedgerError("job_not_found", 404, false);
@@ -773,11 +860,11 @@ export class D1JobLedger {
     const result = await this.db.prepare(
       `UPDATE job_dispatches
           SET status = 'sending', attempts = attempts + 1,
-              lease_until = ?2, updated_at = ?2
+              lease_until = ?2, updated_at = ?3
         WHERE job_id = ?1 AND status <> 'sent'
-          AND (lease_until IS NULL OR lease_until <= ?2)
-          AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)`,
-    ).bind(jobId, now + 90).run();
+          AND (lease_until IS NULL OR lease_until <= ?3)
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ?3)`,
+    ).bind(jobId, now + 90, now).run();
     return changes(result) === 1;
   }
 
