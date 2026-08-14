@@ -62,7 +62,7 @@
             <p data-i18n="importHelp">静止スナップショット5ファイルだけを選択してください。BMS本体、Replay、-wal、-shmは送信しません。</p>
             <input id="db-files" type="file" multiple accept=".db" aria-describedby="db-hint" />
             <p id="db-hint" class="muted">songdata.db / songinfo.db / score.db / scorelog.db / scoredatalog.db</p>
-            <button id="prepare-upload" type="button" data-i18n="prepare">内容を確認</button>
+            <button id="prepare-upload" type="button" data-i18n="prepare">hash確認して提出</button>
             <progress id="upload-progress" value="0" max="100" hidden>0%</progress>
           </section>
 
@@ -81,6 +81,6 @@
       <code id="device-token"></code>
       <div class="actions"><button id="copy-token" type="button" data-i18n="copy">コピー</button><button id="close-token" class="secondary" type="button" data-i18n="saved">保存しました</button></div>
     </dialog>
-    <script src="/app.js" defer></script>
+    <script src="/app.js" type="module"></script>
   </body>
 </html>
