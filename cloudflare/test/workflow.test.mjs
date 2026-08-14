@@ -25,3 +25,13 @@ test("unwired processor cannot fabricate and publish digests", () => {
   assert.match(worker, /async queue\(/);
   assert.match(worker, /async scheduled\(/);
 });
+
+test("job status, cancellation, and manual retry are owner-scoped routes", () => {
+  assert.match(worker, /handleJobRoutes/);
+  assert.match(worker, /\/v1\\\/jobs\\\/\(\[\^\/\]\+\)/);
+  assert.match(worker, /requireWebAccount\(request, env, mutate\)/);
+  assert.match(worker, /ledger\.getStatus\(accountId, jobId\)/);
+  assert.match(worker, /ledger\.cancel\(accountId, jobId\)/);
+  assert.match(worker, /ledger\.manualRetry\(accountId, jobId, accountId\)/);
+  assert.match(worker, /new JobDispatcher\(ledger, env\.JOB_QUEUE\)\.dispatch\(job\)/);
+});

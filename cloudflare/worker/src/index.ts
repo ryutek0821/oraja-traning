@@ -52,6 +52,7 @@ import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-pro
 import {
   D1JobLedger,
   JobDispatcher,
+  JobLedgerError,
   consumeQueueMessage,
   dispatchSchedule,
   type JobEnvelope,
@@ -525,6 +526,37 @@ async function handleUploadRoute(request: Request, env: Env): Promise<Response |
   });
 }
 
+async function handleJobRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
+  const match = /^\/v1\/jobs\/([^/]+)(?:\/(cancel|retry))?$/.exec(new URL(request.url).pathname);
+  if (!match) return null;
+  try {
+    const mutate = Boolean(match[2]);
+    const accountId = await requireWebAccount(request, env, mutate);
+    const jobId = decodeURIComponent(match[1]);
+    const ledger = new D1JobLedger(env.CONTROL_DB);
+    if (!match[2] && request.method === "GET") {
+      const status = await ledger.getStatus(accountId, jobId);
+      if (!status) throw new JobLedgerError("job_not_found", 404, false);
+      return json(status, 200, origin);
+    }
+    if (match[2] === "cancel" && request.method === "POST") {
+      return json({ status: await ledger.cancel(accountId, jobId) }, 202, origin);
+    }
+    if (match[2] === "retry" && request.method === "POST") {
+      const job = await ledger.manualRetry(accountId, jobId, accountId);
+      await new JobDispatcher(ledger, env.JOB_QUEUE).dispatch(job);
+      return json({ status: "queued", job_id: job.jobId, workflow_run: job.workflowRun }, 202, origin);
+    }
+    throw new JobLedgerError("method_not_allowed", 405, false);
+  } catch (error) {
+    if (error instanceof JobLedgerError) {
+      const headers = error.retryable ? { "retry-after": "5" } : undefined;
+      return json({ error: { code: error.code } }, error.status, origin, headers);
+    }
+    return apiFailure(error, origin);
+  }
+}
+
 export class PythonProcessor extends Container {
   defaultPort = 8080;
   sleepAfter = "10m";
@@ -568,6 +600,8 @@ export default {
     if (playResponse) return playResponse;
     const uploadResponse = await handleUploadRoute(request, env);
     if (uploadResponse) return uploadResponse;
+    const jobResponse = await handleJobRoutes(request, env, origin);
+    if (jobResponse) return jobResponse;
     const tableResponse = await handleCapabilityTable(request, env);
     if (tableResponse) return tableResponse;
     const advisorResponse = await handleAdvisorRoutes(request, env, origin);

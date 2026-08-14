@@ -54,6 +54,7 @@ test("Worker routes every implemented service boundary", async () => {
     "handleDeviceRoutes",
     "handlePlayRoute",
     "handleUploadRoute",
+    "handleJobRoutes",
     "handleCapabilityTable",
     "handleAdvisorRoutes",
     "handlePrivacyRoutes",
