@@ -1,0 +1,22 @@
+{
+  "contract": "play-event",
+  "schema_version": "1",
+  "submission": {
+    "contract": "ir-submission",
+    "schema_version": "1",
+    "event_id": "018f0f0f-0f0f-7f0f-8f0f-0f0f0f0f0f0f",
+    "played_at": "2026-07-01T12:00:00Z",
+    "chart": { "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ln_mode": 1 },
+    "play": {
+      "clear": 5, "gauge": "NORMAL", "assist": "NONE", "notes": 1000, "passnotes": 1000,
+      "minbp": 12, "ex_score": 1600, "combo": 700, "option": "RANDOM", "seed": 42,
+      "judgements": { "epg": 400, "lpg": 350, "egr": 80, "lgr": 70, "egd": 30, "lgd": 20, "ebd": 10, "lbd": 8, "epr": 5, "lpr": 4, "ems": 2, "lms": 1 }
+    }
+  },
+  "account_id": "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f01",
+  "profile_id": "018f0f0f-0f02-7f0f-8f0f-0f0f0f0f0f02",
+  "device_id": "018f0f0f-0f03-7f0f-8f0f-0f0f0f0f0f03",
+  "received_at": "2026-07-01T12:00:01Z",
+  "provenance": { "service": "official", "source": "five_db_backfill" },
+  "eligibility": { "status": "eligible", "reason_code": null, "policy_version": "2026-07-01" }
+}
