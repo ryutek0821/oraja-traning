@@ -505,6 +505,10 @@ export async function finalizeDeletion(
     db.prepare("DELETE FROM upload_dedup WHERE profile_scope = ?1").bind(scope),
     db.prepare("DELETE FROM upload_profile_envelopes WHERE profile_scope = ?1").bind(scope),
     db.prepare("DELETE FROM upload_sessions WHERE profile_scope = ?1").bind(scope),
+    // Advisor records are append-only during normal operation. Migration 0012
+    // permits deletion only while this owner has a confirmed privacy request.
+    db.prepare("DELETE FROM advisor_decision_audits WHERE account_id = ?1 AND profile_id = ?2").bind(deletion.account_id, deletion.profile_id),
+    db.prepare("DELETE FROM advisor_journal WHERE account_id = ?1 AND profile_id = ?2").bind(deletion.account_id, deletion.profile_id),
     db.prepare("DELETE FROM advisor_proposals WHERE account_id = ?1 AND profile_id = ?2").bind(deletion.account_id, deletion.profile_id),
     db.prepare("DELETE FROM oauth_authorization_codes WHERE account_id = ?1 AND profile_id = ?2").bind(deletion.account_id, deletion.profile_id),
     db.prepare("DELETE FROM oauth_tokens WHERE account_id = ?1 AND profile_id = ?2").bind(deletion.account_id, deletion.profile_id),

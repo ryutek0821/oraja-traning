@@ -74,4 +74,8 @@ test("export snapshot is owner scoped, bounded, digest verified, and connected t
     assert.match(exporter, new RegExp(secret));
   }
   assert.match(worker, /schedule === "daily-backup".*processExportSnapshots/s);
+  assert.match(exporter, /advisor_journal/);
+  assert.match(exporter, /advisor_decision_audits/);
+  assert.match(privacy, /DELETE FROM advisor_journal/);
+  assert.match(privacy, /DELETE FROM advisor_decision_audits/);
 });

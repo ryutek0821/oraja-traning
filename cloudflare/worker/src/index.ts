@@ -39,7 +39,7 @@ import {
 } from "./ir-api";
 import { ProfileDurableObject } from "./profile-do";
 import { dashboardData } from "./dashboard";
-import { createAdvisorProposal, decideAdvisorProposal, listAdvisorProposals } from "./advisor";
+import { createAdvisorProposal, decideAdvisorProposal, listAdvisorProposals, type AdvisorOwner } from "./advisor";
 import { handleMcp } from "./mcp";
 import {
   appendOAuthAudit,
@@ -482,17 +482,26 @@ async function handleAdvisorRoutes(request: Request, env: Env, origin?: string):
   const match = /^\/v1\/advisor\/proposals(?:\/([^/]+)\/(approve|reject))?$/.exec(url.pathname);
   if (!match) return null;
   try {
-    const principal = await authenticateOAuthToken(env.CONTROL_DB, bearerTokenForOAuth(request));
-    if (match[1] && match[2]) {
-      if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
-      const body = await readJsonBody(request, 8 * 1024);
-      return json(await decideAdvisorProposal(env.CONTROL_DB, principal, decodeURIComponent(match[1]), match[2] === "approve" ? "approved" : "rejected", body.reason), 200, origin);
-    }
-    if (request.method === "GET") return json({ proposals: await listAdvisorProposals(env.CONTROL_DB, principal, url.searchParams.get("status") ?? undefined) }, 200, origin);
-    if (request.method === "POST") {
+    // Third-party OAuth clients may propose, but only the signed-in profile
+    // owner may inspect or decide proposals. Mutating owner calls require CSRF.
+    if (!match[1] && request.method === "POST") {
+      const principal = await authenticateOAuthToken(env.CONTROL_DB, bearerTokenForOAuth(request));
       const body = await readJsonBody(request, 40 * 1024);
       return json(await createAdvisorProposal(env.CONTROL_DB, principal, { providerName: body.provider_name, title: body.title, payload: body.payload }), 201, origin);
     }
+    const accountId = await requireWebAccount(request, env, Boolean(match[1]));
+    const body = match[1] && request.method === "POST" ? await readJsonBody(request, 8 * 1024) : undefined;
+    const profileSelector = typeof body?.profile_id === "string" ? body.profile_id : url.searchParams.get("profile_id") ?? "";
+    const profile = await env.CONTROL_DB.prepare(
+      "SELECT id FROM profiles WHERE account_id = ?1 AND (?2 = '' OR id = ?2 OR public_id = ?2) AND status <> 'deleted' ORDER BY created_at LIMIT 1",
+    ).bind(accountId, profileSelector).first<{ id: string }>();
+    if (!profile) throw new ApiError("profile_not_found", 404);
+    const owner: AdvisorOwner = { accountId, profileId: profile.id, actorId: `web-owner:${accountId}` };
+    if (match[1] && match[2]) {
+      if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
+      return json(await decideAdvisorProposal(env.CONTROL_DB, owner, decodeURIComponent(match[1]), match[2] === "approve" ? "approved" : "rejected", body?.reason), 200, origin);
+    }
+    if (request.method === "GET") return json({ proposals: await listAdvisorProposals(env.CONTROL_DB, owner, url.searchParams.get("status") ?? undefined) }, 200, origin);
     throw new ApiError("method_not_allowed", 405);
   } catch (error) {
     return apiFailure(error, origin);

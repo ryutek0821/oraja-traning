@@ -113,7 +113,26 @@ function toolsFor(principal: OAuthPrincipal): RpcTool[] {
   if (hasOAuthScope(principal, "plays:read")) tools.push({ name: "play_history", description: "Read profile-owned play history with signed cursor paging", inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 100 }, cursor: { type: "string", maxLength: 1024 } }, additionalProperties: false } });
   if (hasOAuthScope(principal, "recommendations:read")) tools.push({ name: "recommendation_reason", description: "Read recommendation metadata without storage keys", inputSchema: { type: "object", properties: {}, additionalProperties: false } });
   if (hasOAuthScope(principal, "advisor:read")) tools.push({ name: "advisor_context_export", description: "Export bounded summaries for advisor context", inputSchema: { type: "object", properties: { days: { enum: [7, 30, 90] } }, additionalProperties: false } });
-  if (hasOAuthScope(principal, "advisor:propose")) tools.push({ name: "advisor_propose", description: "Create a pending advisor proposal", inputSchema: { type: "object", required: ["provider_name", "title", "payload"], properties: { provider_name: { type: "string", maxLength: 120 }, title: { type: "string", maxLength: 240 }, payload: { type: "object" } }, additionalProperties: false } });
+  if (hasOAuthScope(principal, "advisor:propose")) tools.push({
+    name: "advisor_propose",
+    description: "Create a bounded, self-reported pending advisor proposal",
+    inputSchema: {
+      type: "object", required: ["provider_name", "title", "payload"], additionalProperties: false,
+      properties: {
+        provider_name: { type: "string", minLength: 1, maxLength: 120 },
+        title: { type: "string", minLength: 1, maxLength: 240 },
+        payload: {
+          type: "object", required: ["body", "evidence_period", "model", "provider_self_reported"], additionalProperties: false,
+          properties: {
+            body: { type: "string", minLength: 1, maxLength: 8000 },
+            evidence_period: { type: "object", required: ["from", "to"], properties: { from: { type: "integer", minimum: 0 }, to: { type: "integer", minimum: 0 } }, additionalProperties: false },
+            model: { type: "string", minLength: 1, maxLength: 120 },
+            provider_self_reported: { const: true },
+          },
+        },
+      },
+    },
+  });
   return tools;
 }
 
@@ -178,7 +197,10 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
       }
       if (uri === "oraja://advisor/approved") {
         requestScope(principal, "advisor:read");
-        const rows = await env.CONTROL_DB.prepare("SELECT id, provider_name, title, proposal_hash, status, created_at, decided_at FROM advisor_proposals WHERE account_id = ?1 AND profile_id = ?2 AND status = 'approved' ORDER BY created_at DESC LIMIT 100").bind(principal.accountId, principal.profileId).all<Record<string, unknown>>();
+        const rows = await env.CONTROL_DB.prepare(`SELECT id, provider_name, model_name AS model, title, body_text AS body,
+          evidence_from, evidence_to, proposal_hash, proposal_created_at, approved_at
+          FROM advisor_journal WHERE account_id = ?1 AND profile_id = ?2 ORDER BY approved_at DESC LIMIT 100`)
+          .bind(principal.accountId, principal.profileId).all<Record<string, unknown>>();
         return rpc(rpcId, { contents: [{ uri, mimeType: "application/json", text: JSON.stringify(rows.results) }] });
       }
       throw new ApiError("resource_not_found", 404);
