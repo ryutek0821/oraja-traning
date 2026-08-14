@@ -43,6 +43,7 @@ export type AuthOptions = {
   publicOrigin?: string;
   emailSender?: AuthEmailSender;
   emailEncryptionSecret?: string;
+  hashingSecret?: string;
 };
 
 export type RegisterInput = {
@@ -174,6 +175,19 @@ function hex(value: Uint8Array): string {
 export async function sha256Hex(value: string | Uint8Array): Promise<string> {
   const input = typeof value === "string" ? utf8(value) : value;
   return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", arrayBuffer(input))));
+}
+
+async function keyedHashHex(secret: string | undefined, value: string): Promise<string> {
+  if (!secret || secret.length < 16) throw new AuthError("auth_hash_secret_missing", 500);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    arrayBuffer(utf8(secret)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, arrayBuffer(utf8(value)));
+  return hex(new Uint8Array(signature));
 }
 
 async function saltedHashHex(secret: string, salt: Uint8Array): Promise<string> {
@@ -323,8 +337,8 @@ function publicError(code: string, status = 400, retryAfterSeconds?: number): Au
   return new AuthError(code, status, retryAfterSeconds);
 }
 
-async function rateKey(scope: string, value: string): Promise<string> {
-  return sha256Hex(`${scope}:${value}`);
+async function rateKey(scope: string, value: string, secret?: string): Promise<string> {
+  return keyedHashHex(secret, `rate:${scope}:${value}`);
 }
 
 async function enforceRateLimit(
@@ -332,8 +346,9 @@ async function enforceRateLimit(
   scope: "ip" | "account" | "recovery" | "email",
   value: string,
   now: number,
+  hashingSecret?: string,
 ): Promise<void> {
-  const keyHash = await rateKey(scope, value);
+  const keyHash = await rateKey(scope, value, hashingSecret);
   const row = await db
     .prepare("SELECT blocked_until, last_failed_at FROM auth_rate_limits WHERE scope = ?1 AND key_hash = ?2")
     .bind(scope, keyHash)
@@ -356,8 +371,9 @@ async function recordFailure(
   scope: "ip" | "account" | "recovery" | "email",
   value: string,
   now: number,
+  hashingSecret?: string,
 ): Promise<void> {
-  const keyHash = await rateKey(scope, value);
+  const keyHash = await rateKey(scope, value, hashingSecret);
   const row = await db
     .prepare("SELECT failure_count, first_failed_at, last_failed_at FROM auth_rate_limits WHERE scope = ?1 AND key_hash = ?2")
     .bind(scope, keyHash)
@@ -385,15 +401,16 @@ async function clearFailure(
   db: D1Database,
   scope: "ip" | "account" | "recovery" | "email",
   value: string,
+  hashingSecret?: string,
 ): Promise<void> {
   await db
     .prepare("DELETE FROM auth_rate_limits WHERE scope = ?1 AND key_hash = ?2")
-    .bind(scope, await rateKey(scope, value))
+    .bind(scope, await rateKey(scope, value, hashingSecret))
     .run();
 }
 
-function idHash(value: string): Promise<string> {
-  return sha256Hex(value);
+function idHash(scope: string, value: string, secret?: string): Promise<string> {
+  return keyedHashHex(secret, `identifier:${scope}:${value}`);
 }
 
 function changes(result: { meta?: { changes?: number } }): number {
@@ -486,7 +503,7 @@ export async function registerAccount(
   options: AuthOptions = {},
 ): Promise<RegisterResult> {
   const now = nowSeconds(options);
-  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now);
+  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now, options.hashingSecret);
   try {
     const userId = normalizeUserId(input.userId);
     const password = validatePassword(input.password);
@@ -506,6 +523,9 @@ export async function registerAccount(
     if (!terms || !privacy) throw publicError("terms_required", 400);
 
     const email = input.email === undefined ? null : normalizeEmail(input.email);
+    if (email && !options.emailEncryptionSecret) {
+      throw publicError("email_not_configured", 503);
+    }
     const displayName = safeDisplayName(input.displayName, userId);
     const timezone = safeTimezone(input.timezone);
     const passwordHash = await hashPassword(password);
@@ -516,8 +536,8 @@ export async function registerAccount(
     const profilePublicId = randomId();
     const emailId = email ? randomId() : null;
     const emailToken = email ? randomToken() : null;
-    const encryptedEmail = email && options.emailEncryptionSecret
-      ? await encryptEmail(email, options.emailEncryptionSecret)
+    const encryptedEmail = email
+      ? await encryptEmail(email, options.emailEncryptionSecret as string)
       : null;
 
     const statements: D1PreparedStatement[] = [
@@ -552,7 +572,7 @@ export async function registerAccount(
            id, account_id, profile_id, actor_kind, event_type, reason_code,
            request_id, resource_hash, input_hash, status, occurred_at
          ) VALUES (?1, ?2, ?3, 'account', 'register', 'registration', ?4, ?5, NULL, 'success', ?6)`,
-      ).bind(randomId(), accountId, profileId, options.requestId ?? null, await idHash(userId), now),
+      ).bind(randomId(), accountId, profileId, options.requestId ?? null, await idHash("user", userId, options.hashingSecret), now),
     ];
 
     for (const [index, record] of recoveryRecords.entries()) {
@@ -571,7 +591,7 @@ export async function registerAccount(
           `INSERT INTO emails(
              id, account_id, email_hash, encrypted_email, verified_at, created_at, revoked_at
            ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)`,
-        ).bind(emailId, accountId, await idHash(email), encryptedEmail, now),
+        ).bind(emailId, accountId, await idHash("email", email, options.hashingSecret), encryptedEmail, now),
         db.prepare(
           `INSERT INTO email_tokens(
              id, email_id, token_hash, purpose, created_at, expires_at, used_at
@@ -582,7 +602,7 @@ export async function registerAccount(
              id, account_id, profile_id, actor_kind, event_type, reason_code,
              request_id, resource_hash, input_hash, status, occurred_at
            ) VALUES (?1, ?2, ?3, 'account', 'email_confirmation_requested', 'registration', ?4, ?5, NULL, 'success', ?6)`,
-        ).bind(randomId(), accountId, profileId, options.requestId ?? null, await idHash(email), now),
+        ).bind(randomId(), accountId, profileId, options.requestId ?? null, await idHash("email", email, options.hashingSecret), now),
       );
     }
 
@@ -611,7 +631,7 @@ export async function registerAccount(
     return { accountPublicId, profilePublicId, recoveryCodes, emailConfirmationSent };
   } catch (error) {
     if (options.ipAddress && error instanceof AuthError && error.status < 500) {
-      await recordFailure(db, "ip", options.ipAddress, now);
+      await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
     }
     throw error;
   }
@@ -624,7 +644,7 @@ export async function loginAccount(
   options: AuthOptions = {},
 ): Promise<LoginResult> {
   const now = nowSeconds(options);
-  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now);
+  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now, options.hashingSecret);
   let userId: string;
   let password: string;
   try {
@@ -632,7 +652,7 @@ export async function loginAccount(
     password = validatePassword(passwordInput);
   } catch (error) {
     if (options.ipAddress && error instanceof AuthError) {
-      await recordFailure(db, "ip", options.ipAddress, now);
+      await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
     }
     throw error;
   }
@@ -646,13 +666,13 @@ export async function loginAccount(
     )
     .bind(userId)
     .first<AccountRow>();
-  if (row) await enforceRateLimit(db, "account", row.id, now);
+  if (row) await enforceRateLimit(db, "account", row.id, now, options.hashingSecret);
   let valid = false;
   if (row && row.status === "active") valid = await verifyPassword(password, row.password_hash);
   else await hashPassword(password);
   if (!valid || !row) {
-    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
-    if (row) await recordFailure(db, "account", row.id, now);
+    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
+    if (row) await recordFailure(db, "account", row.id, now, options.hashingSecret);
     throw publicError("invalid_credentials", 401);
   }
 
@@ -680,8 +700,8 @@ export async function loginAccount(
     );
   }
   await db.batch(statements);
-  if (options.ipAddress) await clearFailure(db, "ip", options.ipAddress);
-  await clearFailure(db, "account", row.id);
+  if (options.ipAddress) await clearFailure(db, "ip", options.ipAddress, options.hashingSecret);
+  await clearFailure(db, "account", row.id, options.hashingSecret);
   return {
     accountPublicId: row.public_id,
     sessionToken: session.sessionToken,
@@ -763,18 +783,18 @@ export async function useRecoveryCode(
   options: AuthOptions = {},
 ): Promise<LoginResult> {
   const now = nowSeconds(options);
-  if (options.ipAddress) await enforceRateLimit(db, "recovery", options.ipAddress, now);
+  if (options.ipAddress) await enforceRateLimit(db, "recovery", options.ipAddress, now, options.hashingSecret);
   let userId: string;
   try {
     userId = normalizeUserId(userIdInput);
   } catch (error) {
     if (options.ipAddress && error instanceof AuthError) {
-      await recordFailure(db, "recovery", options.ipAddress, now);
+      await recordFailure(db, "recovery", options.ipAddress, now, options.hashingSecret);
     }
     throw error;
   }
   if (typeof code !== "string" || code.length < 32 || code.length > 128) {
-    if (options.ipAddress) await recordFailure(db, "recovery", options.ipAddress, now);
+    if (options.ipAddress) await recordFailure(db, "recovery", options.ipAddress, now, options.hashingSecret);
     throw publicError("invalid_recovery_code", 401);
   }
   const account = await db
@@ -782,10 +802,10 @@ export async function useRecoveryCode(
     .bind(userId)
     .first<{ id: string; public_id: string }>();
   if (!account) {
-    if (options.ipAddress) await recordFailure(db, "recovery", options.ipAddress, now);
+    if (options.ipAddress) await recordFailure(db, "recovery", options.ipAddress, now, options.hashingSecret);
     throw publicError("invalid_recovery_code", 401);
   }
-  await enforceRateLimit(db, "account", account.id, now);
+  await enforceRateLimit(db, "account", account.id, now, options.hashingSecret);
   const rows = await db
     .prepare("SELECT id, salt, code_hash FROM recovery_codes WHERE account_id = ?1 AND used_at IS NULL")
     .bind(account.id)
@@ -801,8 +821,8 @@ export async function useRecoveryCode(
     if (constantTimeEqual(candidate, row.code_hash)) match = row;
   }
   if (!match) {
-    if (options.ipAddress) await recordFailure(db, "recovery", options.ipAddress, now);
-    await recordFailure(db, "account", account.id, now);
+    if (options.ipAddress) await recordFailure(db, "recovery", options.ipAddress, now, options.hashingSecret);
+    await recordFailure(db, "account", account.id, now, options.hashingSecret);
     throw publicError("invalid_recovery_code", 401);
   }
   const consumed = await db
@@ -821,8 +841,8 @@ export async function useRecoveryCode(
     )
     .bind(randomId(), account.id, options.requestId ?? null, now)
     .run();
-  if (options.ipAddress) await clearFailure(db, "recovery", options.ipAddress);
-  await clearFailure(db, "account", account.id);
+  if (options.ipAddress) await clearFailure(db, "recovery", options.ipAddress, options.hashingSecret);
+  await clearFailure(db, "account", account.id, options.hashingSecret);
   return {
     accountPublicId: account.public_id,
     sessionToken: session.sessionToken,
@@ -844,33 +864,32 @@ export async function requestEmailChange(
 ): Promise<EmailChangeResult> {
   const now = nowSeconds(options);
   const session = await requireActiveSession(db, sessionToken, now);
-  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now);
-  await enforceRateLimit(db, "account", session.account_id, now);
+  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now, options.hashingSecret);
+  await enforceRateLimit(db, "account", session.account_id, now, options.hashingSecret);
 
   let email: string;
   try {
     email = normalizeEmail(emailInput);
   } catch (error) {
-    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
+    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
     throw error;
   }
-  await enforceRateLimit(db, "email", email, now);
+  if (!options.emailEncryptionSecret) throw publicError("email_not_configured", 503);
+  await enforceRateLimit(db, "email", email, now, options.hashingSecret);
 
   const existing = await db
     .prepare("SELECT id, account_id FROM emails WHERE email_hash = ?1")
-    .bind(await idHash(email))
+    .bind(await idHash("email", email, options.hashingSecret))
     .first<{ id: string; account_id: string }>();
   if (existing && existing.account_id !== session.account_id) {
-    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
-    await recordFailure(db, "email", email, now);
+    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
+    await recordFailure(db, "email", email, now, options.hashingSecret);
     throw publicError("email_unavailable", 409);
   }
 
   const emailId = existing?.id ?? randomId();
   const token = randomToken();
-  const encryptedEmail = options.emailEncryptionSecret
-    ? await encryptEmail(email, options.emailEncryptionSecret)
-    : null;
+  const encryptedEmail = await encryptEmail(email, options.emailEncryptionSecret);
   const statements: D1PreparedStatement[] = [
     existing
       ? db.prepare(
@@ -882,7 +901,7 @@ export async function requestEmailChange(
           `INSERT INTO emails(
              id, account_id, email_hash, encrypted_email, verified_at, created_at, revoked_at
            ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)`,
-        ).bind(emailId, session.account_id, await idHash(email), encryptedEmail, now),
+        ).bind(emailId, session.account_id, await idHash("email", email, options.hashingSecret), encryptedEmail, now),
     db.prepare(
       `UPDATE email_tokens SET used_at = ?1
         WHERE email_id = ?2 AND purpose = 'verify' AND used_at IS NULL`,
@@ -897,14 +916,14 @@ export async function requestEmailChange(
          id, account_id, profile_id, actor_kind, event_type, reason_code,
          request_id, resource_hash, input_hash, status, occurred_at
        ) VALUES (?1, ?2, NULL, 'account', 'email_change_requested', 'email', ?3, ?4, NULL, 'success', ?5)`,
-    ).bind(randomId(), session.account_id, options.requestId ?? null, await idHash(email), now),
+    ).bind(randomId(), session.account_id, options.requestId ?? null, await idHash("email", email, options.hashingSecret), now),
   ];
 
   try {
     await db.batch(statements);
   } catch {
-    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
-    await recordFailure(db, "email", email, now);
+    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
+    await recordFailure(db, "email", email, now, options.hashingSecret);
     throw publicError("email_change_failed", 409);
   }
 
@@ -922,9 +941,9 @@ export async function requestEmailChange(
       emailConfirmationSent = false;
     }
   }
-  if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
-  await recordFailure(db, "email", email, now);
-  await recordFailure(db, "account", session.account_id, now);
+  if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
+  await recordFailure(db, "email", email, now, options.hashingSecret);
+  await recordFailure(db, "account", session.account_id, now, options.hashingSecret);
   return { emailConfirmationSent };
 }
 
@@ -934,17 +953,17 @@ export async function requestPasswordReset(
   options: AuthOptions = {},
 ): Promise<void> {
   const now = nowSeconds(options);
-  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now);
+  if (options.ipAddress) await enforceRateLimit(db, "ip", options.ipAddress, now, options.hashingSecret);
   let email: string;
   try {
     email = normalizeEmail(emailInput);
   } catch {
     // The endpoint intentionally returns the same result for unknown and
     // malformed addresses, avoiding an account-existence oracle.
-    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
+    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
     return;
   }
-  await enforceRateLimit(db, "email", email, now);
+  await enforceRateLimit(db, "email", email, now, options.hashingSecret);
   const row = await db
     .prepare(
       `SELECT e.id, e.account_id, e.encrypted_email
@@ -952,12 +971,12 @@ export async function requestPasswordReset(
         WHERE e.email_hash = ?1 AND e.revoked_at IS NULL
           AND e.verified_at IS NOT NULL AND a.status = 'active'`,
     )
-    .bind(await idHash(email))
+    .bind(await idHash("email", email, options.hashingSecret))
     .first<{ id: string; account_id: string; encrypted_email: string | null }>();
-  if (row) await enforceRateLimit(db, "account", row.account_id, now);
+  if (row) await enforceRateLimit(db, "account", row.account_id, now, options.hashingSecret);
   if (!row) {
-    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
-    await recordFailure(db, "email", email, now);
+    if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
+    await recordFailure(db, "email", email, now, options.hashingSecret);
     return;
   }
   const token = randomToken();
@@ -976,7 +995,7 @@ export async function requestPasswordReset(
          id, account_id, profile_id, actor_kind, event_type, reason_code,
          request_id, resource_hash, input_hash, status, occurred_at
        ) VALUES (?1, ?2, NULL, 'account', 'password_reset_requested', 'email', ?3, ?4, NULL, 'success', ?5)`,
-    ).bind(randomId(), row.account_id, options.requestId ?? null, await idHash(email), now),
+    ).bind(randomId(), row.account_id, options.requestId ?? null, await idHash("email", email, options.hashingSecret), now),
   ]);
   if (options.emailSender && options.publicOrigin && options.emailEncryptionSecret && row.encrypted_email) {
     try {
@@ -986,9 +1005,9 @@ export async function requestPasswordReset(
       // Keep the request indistinguishable from an unknown address.
     }
   }
-  if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now);
-  await recordFailure(db, "email", email, now);
-  await recordFailure(db, "account", row.account_id, now);
+  if (options.ipAddress) await recordFailure(db, "ip", options.ipAddress, now, options.hashingSecret);
+  await recordFailure(db, "email", email, now, options.hashingSecret);
+  await recordFailure(db, "account", row.account_id, now, options.hashingSecret);
 }
 
 async function findEmailToken(

@@ -31,7 +31,7 @@
     "input_bundle": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["object_key", "sha256", "size_bytes", "encryption"],
+      "required": ["object_key", "sha256", "size_bytes", "encryption", "key_ref"],
       "properties": {
         "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" },
         "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
@@ -54,21 +54,13 @@
     "policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["aggregate_eligible", "include_raw_db_in_model"],
+      "required": ["eligibility_status", "eligibility_reason_code", "eligibility_policy_version", "include_raw_db_in_model"],
       "properties": {
-        "aggregate_eligible": { "type": "boolean" },
+        "eligibility_status": { "enum": ["pending", "eligible", "ineligible", "revoked"] },
+        "eligibility_reason_code": { "type": ["string", "null"], "maxLength": 64 },
+        "eligibility_policy_version": { "type": "string", "minLength": 1, "maxLength": 32 },
         "include_raw_db_in_model": { "const": false }
       }
     }
-  },
-  "allOf": [
-    {
-      "if": { "properties": { "trust_domain": { "const": "self_hosted" } } },
-      "then": {
-        "properties": {
-          "policy": { "properties": { "aggregate_eligible": { "const": false } } }
-        }
-      }
-    }
-  ]
+  }
 }

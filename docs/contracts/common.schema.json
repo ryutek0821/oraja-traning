@@ -32,10 +32,7 @@
       "maxLength": 512,
       "pattern": "^(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$"
     },
-    "trustDomain": {
-      "type": "string",
-      "enum": ["official", "self_hosted"]
-    },
+    "trustDomain": { "const": "official" },
     "gameMode": {
       "const": "SP7"
     },

@@ -18,6 +18,8 @@ test("Container entrypoint keeps the streamed manifest boundary and health route
   assert.match(entrypoint, /X-Container-Input-Manifest/);
   assert.match(entrypoint, /self\.path != "\/v1\/jobs"/);
   assert.match(entrypoint, /ORAJA_ALLOW_PLAINTEXT_FIXTURE/);
+  assert.match(entrypoint, /class _BoundedBody/);
+  assert.match(entrypoint, /content_length != expected_size/);
   assert.match(health, /"\/healthz"/);
   assert.match(health, /"\/readyz"/);
   assert.match(health, /"\/version"/);
