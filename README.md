@@ -127,6 +127,16 @@ oraja-training collect --daemon \
 起動していない間の複数プレイは復元できず、最新行だけを保存して不足分を
 `lost_events` として記録します。
 
+Windowsでは、ユーザーPowerShellから次を実行するとログオン時のScheduled Taskとして登録できます。所有DBとログは `%LOCALAPPDATA%\oraja-training` に保存します。
+
+```powershell
+.\scripts\install-collector-task.ps1 `
+  -DbDir "D:\path\to\beatoraja\player\PLAYER_NAME" `
+  -StartNow
+```
+
+解除は同じコマンドへ `-Uninstall` を付けます。登録・解除は `OrajaTrainingCollector` だけを対象にします。
+
 beatoraja側では、**自動リプレイ保存の1枠を `ALWAYS` に変更してください**。
 次の実装段階で、失敗プレイを含む開始時の選択ゲージを `.brd` リプレイから回収するために必要です。
 

@@ -292,7 +292,7 @@ course生成とプレイ中の動的再推定はv1の非目標。
 | **P0a: DB実機調査** | 5DBのスキーマ・件数・意味を実測 | **完了** |
 | **P0b: Replay実機調査** | Windowsで `.brd` の生成条件・上書き条件・保存率を確認 | **未完了**。Step 3の前提 |
 | **P1a: Collector基盤** | read-only backfill、差分収集、schema v3、入力整合性検証 | **完了**。静的2DBの日次取込と重複・巻戻し検出を実装 |
-| **P1b: 実運用開始** | 実用 `assistant.db` を作りcollectorを常駐 | **一部完了**。同梱スナップショットからDB作成済み、ライブ常駐は未設定 |
+| **P1b: 実運用開始** | 実用 `assistant.db` を作りcollectorを常駐 | **実装完了・実機登録待ち**。`%LOCALAPPDATA%\oraja-training` とログオン時Scheduled Taskを採用。Windows接続回復後に登録・連続稼働を確認する |
 | **P2: 難易度表・特徴量** | 表取得/突合と `songinfo` 特徴を構築 | **完了**。ETag/last-good対応、実データ65,712/65,998譜面（99.57%） |
 | **P3: Replayメタデータ** | 開始ゲージ・seed・実配置を収集 | **未着手**。`selected_gauge_kind` の突合率を報告できること |
 | **P4: モデル** | 段階モデルを時間順holdoutで評価 | **実装済み**。十分な履歴とゲート通過までは決定的cold-startを使用 |
@@ -320,7 +320,7 @@ course生成とプレイ中の動的再推定はv1の非目標。
 
 ## 10. 次のアクション
 
-1. ライブplayer DBの場所と起動方式を決め、collectorを常駐化する
+1. Windowsで `install-collector-task.ps1` を実行し、再ログオン後の自動復旧とsource DB不変性を確認する
 2. モデル開発と並行して2〜4週間のデータ蓄積を始める
 3. beatorajaの自動リプレイ保存1枠を `ALWAYS` にし、Windowsで `.brd` の生成・上書き条件を確認する
 4. 難易度表の取得・キャッシュ・sha256/md5突合を実装する
@@ -462,7 +462,7 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 - `.brd` と `plays` の突合率を測り、`selected_gauge_kind` がどの程度回収できるか確認する
 - 直近プレイに BP が総ノーツ数に近い記録（例: 3414ノーツ中BP 3182）がある —— 放置・中断の可能性。**外れ値フィルタの基準を決める必要がある**
 - `player` テーブルの26行が何単位か（日次スナップショットに見えるが `date` が日境界に揃っている）
-- 実運用する `assistant.db` の保存先とcollectorの常駐方式を決める
+- Windows実機でScheduled Task登録、再ログオン後の自動復旧、source DB不変性を確認する
 
 解決済み: `scoredatalog.clear=0` の12行はコースプレイ、`score.clear=0` はNoPlay。
 `scorelog` のカラム差は `PRAGMA table_info` による実行時検出で対応済み。
