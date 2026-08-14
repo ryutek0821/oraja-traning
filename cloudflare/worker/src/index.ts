@@ -67,6 +67,7 @@ import {
   requestDeletion,
   runPurgeTask,
 } from "./privacy";
+import { processExportSnapshots } from "./privacy-export";
 import { D1UploadSessionStore } from "./upload-store";
 import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
 import {
@@ -826,6 +827,7 @@ export default {
       for (const deletionId of due.deletionIds) await finalizeDeletion(env.CONTROL_DB, deletionId, scheduledAt);
       return;
     }
+    if (schedule === "daily-backup") await processExportSnapshots(env, scheduledAt);
     const ledger = new D1JobLedger(env.CONTROL_DB);
     await dispatchSchedule(
       ledger,

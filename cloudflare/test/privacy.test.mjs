@@ -6,6 +6,7 @@ const root = new URL("../", import.meta.url);
 const privacy = await readFile(new URL("worker/src/privacy.ts", root), "utf8");
 const profileDo = await readFile(new URL("worker/src/profile-do.ts", root), "utf8");
 const worker = await readFile(new URL("worker/src/index.ts", root), "utf8");
+const exporter = await readFile(new URL("worker/src/privacy-export.ts", root), "utf8");
 const migration = await readFile(new URL("migrations/0010_privacy_lifecycle.sql", root), "utf8");
 
 test("export uses a versioned job and owner-scoped durable outbox", () => {
@@ -49,6 +50,7 @@ test("completion is fail-closed on all purge tasks and writes immutable audit", 
 
 test("scheduled deletion sweep executes only purge tasks and finalizes verified owners", () => {
   assert.match(privacy, /task_kind <> 'export_snapshot'/);
+  assert.match(privacy, /task_kind = 'export_snapshot'/);
   for (const operation of ["purgeDueProfiles", "claimPrivacyTasks", "runPurgeTask", "recordPrivacyTaskResult", "finalizeDeletion"]) {
     assert.match(worker, new RegExp(operation));
   }
@@ -60,4 +62,16 @@ test("export download is same-origin authenticated, one-time, and never exposes 
   assert.match(worker, /BACKUP_BUCKET\.get\(claimed\.targetKey\)/);
   assert.match(worker, /content-disposition/);
   assert.doesNotMatch(worker, /json\(\{[^}]*targetKey/);
+});
+
+test("export snapshot is owner scoped, bounded, digest verified, and connected to backup schedule", () => {
+  assert.match(exporter, /MAX_EXPORT_BYTES/);
+  assert.match(exporter, /MAX_EXPORT_PLAYS/);
+  assert.match(exporter, /account_id = \?1 AND (?:id|profile_id) = \?2/);
+  assert.match(exporter, /BACKUP_BUCKET\.head/);
+  assert.match(exporter, /completeExportTask/);
+  for (const secret of ["credential_hashes", "oauth_tokens", "device_tokens", "storage_object_keys", "raw_replay", "conversation_text"]) {
+    assert.match(exporter, new RegExp(secret));
+  }
+  assert.match(worker, /schedule === "daily-backup".*processExportSnapshots/s);
 });

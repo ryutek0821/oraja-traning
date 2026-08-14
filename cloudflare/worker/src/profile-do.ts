@@ -91,6 +91,14 @@ function publicPlay(record: StoredPlayEvent): Record<string, unknown> {
   };
 }
 
+function exportPlay(record: StoredPlayEvent): Record<string, unknown> {
+  return {
+    event: record.event,
+    revision: record.revision,
+    accepted_at: record.accepted_at,
+  };
+}
+
 function ackFor(record: StoredPlayEvent, status: PlayAck["status"], enqueueRequired: boolean): PlayAck {
   return {
     status,
@@ -136,6 +144,9 @@ export class ProfileDurableObject extends DurableObject {
     }
     if (request.method === "GET" && url.pathname === "/internal/plays") {
       return this.listPlays(url);
+    }
+    if (request.method === "GET" && url.pathname === "/internal/privacy/export") {
+      return this.exportPlays(url);
     }
     if (request.method === "POST" && url.pathname === "/internal/privacy/purge") {
       return this.purge(request);
@@ -322,6 +333,28 @@ export class ProfileDurableObject extends DurableObject {
       const page = entries.slice(0, limit);
       return response({
         plays: page.map(([, record]) => publicPlay(record)),
+        next_cursor: entries.length > limit ? page.at(-1)?.[0] ?? null : null,
+      });
+    } catch {
+      return response({ error: { code: "temporary_unavailable" } }, 503);
+    }
+  }
+
+  private async exportPlays(url: URL): Promise<Response> {
+    const limit = Number(url.searchParams.get("limit") ?? "500");
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500 || (cursor !== undefined && !cursor.startsWith("play:"))) {
+      return response({ error: { code: "invalid_pagination" } }, 400);
+    }
+    try {
+      if (await this.storage().get<unknown>("privacy:tombstone") !== undefined) {
+        return response({ error: { code: "profile_deleted" } }, 410);
+      }
+      const values = await this.storage().list<unknown>({ prefix: "play:", start: cursor ? `${cursor}\0` : undefined, limit: limit + 1 });
+      const entries = [...values.entries()].filter((entry): entry is [string, StoredPlayEvent] => isStoredPlayEvent(entry[1]));
+      const page = entries.slice(0, limit);
+      return response({
+        plays: page.map(([, record]) => exportPlay(record)),
         next_cursor: entries.length > limit ? page.at(-1)?.[0] ?? null : null,
       });
     } catch {

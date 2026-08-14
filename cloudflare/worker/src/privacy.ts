@@ -282,16 +282,18 @@ export async function claimPrivacyTasks(
   db: D1Database,
   now = Math.floor(Date.now() / 1000),
   limit = 25,
-  includeExportSnapshots = false,
+  mode: "purge" | "export" | "all" = "purge",
 ): Promise<PrivacyTask[]> {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new ApiError("invalid_task_limit", 400);
   const candidates = await db.prepare(
     `SELECT id FROM privacy_tasks
       WHERE (status IN ('pending', 'failed') OR (status = 'running' AND lease_until <= ?1))
         AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
-        AND (?3 = 1 OR task_kind <> 'export_snapshot')
+        AND (?3 = 'all'
+          OR (?3 = 'export' AND task_kind = 'export_snapshot')
+          OR (?3 = 'purge' AND task_kind <> 'export_snapshot'))
       ORDER BY created_at LIMIT ?2`,
-  ).bind(now, limit, includeExportSnapshots ? 1 : 0).all<{ id: string }>();
+  ).bind(now, limit, mode).all<{ id: string }>();
   const claimed: PrivacyTask[] = [];
   for (const candidate of candidates.results) {
     const result = await db.prepare(
