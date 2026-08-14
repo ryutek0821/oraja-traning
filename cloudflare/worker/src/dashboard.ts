@@ -1,6 +1,7 @@
 import { readCookie } from "./auth";
 import { ApiError, listDevices, sessionAccount } from "./ir-api";
 import type { Env } from "./index";
+import { listTableCapabilities, readProfileSettings } from "./profile-settings";
 
 type ProfileRow = { id: string; public_id: string; display_name: string; timezone: string; status: string };
 
@@ -20,7 +21,7 @@ export async function dashboardData(request: Request, env: Env): Promise<Record<
     "SELECT id, public_id, display_name, timezone, status FROM profiles WHERE account_id = ?1 AND status <> 'deleted' ORDER BY created_at LIMIT 1",
   ).bind(accountId).first<ProfileRow>();
   if (!profile) throw new ApiError("profile_not_found", 404);
-  const [devices, jobs, artifacts, deletion, summary7, summary30, summary90] = await Promise.all([
+  const [devices, jobs, artifacts, deletion, settings, capabilities, summary7, summary30, summary90] = await Promise.all([
     listDevices(env.CONTROL_DB, accountId, profile.public_id),
     env.CONTROL_DB.prepare(
       "SELECT id AS job_id, kind, status, revision, updated_at, terminal_reason FROM jobs WHERE account_id = ?1 AND profile_id = ?2 ORDER BY updated_at DESC LIMIT 20",
@@ -31,6 +32,8 @@ export async function dashboardData(request: Request, env: Env): Promise<Record<
     env.CONTROL_DB.prepare(
       "SELECT status, requested_at, cancel_until, cancelled_at, confirmed_at FROM deletion_requests WHERE account_id = ?1 AND profile_id = ?2 ORDER BY requested_at DESC LIMIT 1",
     ).bind(accountId, profile.id).first<Record<string, unknown>>(),
+    readProfileSettings(env.CONTROL_DB, accountId),
+    listTableCapabilities(env.CONTROL_DB, accountId),
     doSummary(env, profile.id, 7),
     doSummary(env, profile.id, 30),
     doSummary(env, profile.id, 90),
@@ -40,6 +43,8 @@ export async function dashboardData(request: Request, env: Env): Promise<Record<
     devices,
     jobs: jobs.results,
     artifacts: artifacts.results,
+    settings,
+    capabilities,
     summaries: { "7": summary7, "30": summary30, "90": summary90 },
     privacy: { deletion: deletion ?? null },
   };

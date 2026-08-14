@@ -80,6 +80,13 @@ import {
 } from "./job-ledger";
 import { SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
 import { handleCapabilityTable } from "./tables";
+import {
+  listTableCapabilities,
+  readProfileSettings,
+  revokeTableCapability,
+  rotateTableCapability,
+  updateProfileSettings,
+} from "./profile-settings";
 export { GenerateWorkflow } from "./workflow";
 
 export { ProfileDurableObject };
@@ -759,6 +766,37 @@ async function handleJobRoutes(request: Request, env: Env, origin?: string): Pro
   }
 }
 
+async function handleProfileSettingsRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
+  const url = new URL(request.url);
+  const capabilityMatch = /^\/v1\/profile\/capabilities\/(recommend|today)\/(rotate|revoke)$/.exec(url.pathname);
+  const settingsRoute = url.pathname === "/v1/profile/settings";
+  const capabilitiesRoute = url.pathname === "/v1/profile/capabilities";
+  if (!settingsRoute && !capabilitiesRoute && !capabilityMatch) return null;
+  try {
+    const mutation = request.method !== "GET";
+    const accountId = await requireWebAccount(request, env, mutation);
+    if (settingsRoute && request.method === "GET") {
+      return json({ settings: await readProfileSettings(env.CONTROL_DB, accountId) }, 200, origin);
+    }
+    if (settingsRoute && request.method === "PATCH") {
+      const body = await readJsonBody(request, 8 * 1024);
+      return json({ settings: await updateProfileSettings(env.CONTROL_DB, accountId, body) }, 200, origin);
+    }
+    if (capabilitiesRoute && request.method === "GET") {
+      return json({ capabilities: await listTableCapabilities(env.CONTROL_DB, accountId) }, 200, origin);
+    }
+    if (capabilityMatch && request.method === "POST") {
+      const result = capabilityMatch[2] === "rotate"
+        ? await rotateTableCapability(env.CONTROL_DB, accountId, capabilityMatch[1], env.PUBLIC_ORIGIN)
+        : await revokeTableCapability(env.CONTROL_DB, accountId, capabilityMatch[1]);
+      return json(result, capabilityMatch[2] === "rotate" ? 201 : 200, origin);
+    }
+    throw new ApiError("method_not_allowed", 405);
+  } catch (error) {
+    return apiFailure(error, origin);
+  }
+}
+
 export class PythonProcessor extends Container {
   defaultPort = 8080;
   sleepAfter = "10m";
@@ -809,6 +847,8 @@ export default {
     if (playResponse) return playResponse;
     const uploadResponse = await handleUploadRoute(request, env);
     if (uploadResponse) return uploadResponse;
+    const settingsResponse = await handleProfileSettingsRoutes(request, env, origin);
+    if (settingsResponse) return settingsResponse;
     const jobResponse = await handleJobRoutes(request, env, origin);
     if (jobResponse) return jobResponse;
     const tableResponse = await handleCapabilityTable(request, env);

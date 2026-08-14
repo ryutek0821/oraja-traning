@@ -113,3 +113,36 @@ def test_audit_and_consent_records_are_append_only_and_hash_only() -> None:
         assert {"token", "email", "raw_payload", "body"}.isdisjoint(columns)
     finally:
         conn.close()
+
+
+def test_profile_settings_and_live_table_capabilities_are_owner_scoped() -> None:
+    conn = _database()
+    try:
+        _seed_account(conn, "account-a", "profile-a")
+        _seed_account(conn, "account-b", "profile-b")
+        conn.execute(
+            "INSERT INTO profile_settings(account_id, profile_id, target_judged, reserve_judged, readiness, settings_revision, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1)",
+            ("account-a", "profile-a", 100_000, 10_000, "normal"),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO profile_settings(account_id, profile_id, target_judged, reserve_judged, readiness, settings_revision, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1)",
+                ("account-a", "profile-b", 100_000, 10_000, "normal"),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE profile_settings SET readiness='unsafe'")
+
+        conn.execute(
+            "INSERT INTO capability_hashes(id, account_id, profile_id, capability_kind, secret_hash, created_at, expires_at, revoked_at, last_used_at) VALUES (?, ?, ?, ?, ?, 1, NULL, NULL, NULL)",
+            ("cap-a", "account-a", "profile-a", "recommend", "a" * 64),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO capability_hashes(id, account_id, profile_id, capability_kind, secret_hash, created_at, expires_at, revoked_at, last_used_at) VALUES (?, ?, ?, ?, ?, 2, NULL, NULL, NULL)",
+                ("cap-b", "account-a", "profile-a", "recommend", "b" * 64),
+            )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(capability_hashes)")}
+        assert "secret" not in columns
+        assert "secret_hash" in columns
+    finally:
+        conn.close()
