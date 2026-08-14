@@ -35,6 +35,8 @@ test("Worker validates output ownership and digest before immutable R2 publicati
   assert.match(bridge, /artifact\.object_key\.startsWith\(prefix\)/);
   assert.match(bridge, /artifact_immutable_conflict/);
   assert.match(bridge, /await immutablePut\(env\.ARTIFACT_BUCKET, artifactKey/);
+  assert.match(bridge, /MAX_CONTAINER_RESPONSE_BYTES/);
+  assert.match(bridge, /boundedContainerResponse/);
 });
 
 test("completed uploads enqueue one immutable owner-scoped workflow input", () => {

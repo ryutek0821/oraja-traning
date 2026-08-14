@@ -42,6 +42,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_BRIDGE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_INLINE_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const MAX_CONTAINER_RESPONSE_BYTES = 96 * 1024 * 1024;
 const MAGIC = new TextEncoder().encode("ORAJA5DB1\n");
 const encoder = new TextEncoder();
 
@@ -80,6 +81,38 @@ function decodeBase64(value: string): Uint8Array {
 async function sha256Bytes(value: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", value.slice().buffer);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function boundedContainerResponse(response: Response): Promise<ContainerResponse> {
+  if (!response.body) throw new ContainerBridgeError("container_response_invalid", true);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const item = await reader.read();
+      if (item.done) break;
+      total += item.value.byteLength;
+      if (total > MAX_CONTAINER_RESPONSE_BYTES) {
+        await reader.cancel("bounded response exceeded");
+        throw new ContainerBridgeError("container_response_too_large", false);
+      }
+      chunks.push(item.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as ContainerResponse;
+  } catch {
+    throw new ContainerBridgeError("container_response_invalid", false);
+  }
 }
 
 function fileHeader(file: UploadFileSession): Uint8Array {
@@ -246,8 +279,8 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
     throw new ContainerBridgeError("container_processing_failed", retryable);
   }
   const declared = Number(response.headers.get("content-length") ?? "0");
-  if (declared > MAX_INLINE_ARTIFACT_BYTES * 2) throw new ContainerBridgeError("container_response_too_large", false);
-  const payload = await response.json() as ContainerResponse;
+  if (declared > MAX_CONTAINER_RESPONSE_BYTES) throw new ContainerBridgeError("container_response_too_large", false);
+  const payload = await boundedContainerResponse(response);
   validateOutputIdentity(job, payload);
   const calculatedManifest = await sha256Hex(canonicalJson(payload.output_manifest));
   if (calculatedManifest !== payload.output_manifest_sha256) {
