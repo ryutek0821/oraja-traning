@@ -23,8 +23,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from oraja_training.collect.backfill import run as backfill
-from oraja_training.domain.types import ModelSnapshot, ProfileContext, RecommendationInput
-from oraja_training.plan.menu import build_session_from_input
+from oraja_training.plan.menu import build_session
 from tests.fixtures.synthetic_beatoraja import build_synthetic_fixture, load_catalog
 
 
@@ -38,22 +37,6 @@ NORMALIZED_COLUMNS = (
     "option", "seed", "random", "trophy", "is_course",
     "exceeded_aggregate_score", "lost_events", "payload_hash", "ingested_at",
 )
-
-
-def _model(catalog: dict) -> ModelSnapshot:
-    value = catalog["model"]
-    return ModelSnapshot(
-        target=value["target"],
-        version=int(value["version"]),
-        trained_at=int(value["trained_at"]),
-        n_train=int(value["n_train"]),
-        weights=tuple(float(item) for item in value["weights"]),
-        means=tuple(float(item) for item in value["means"]),
-        scales=tuple(float(item) for item in value["scales"]),
-        feature_names=tuple(value["feature_names"]),
-        metrics={key: float(item) for key, item in value["metrics"].items()},
-        description=value["description"],
-    )
 
 
 def _normalized_plays(fixture: Path, root: Path) -> dict:
@@ -83,26 +66,77 @@ def _normalized_plays(fixture: Path, root: Path) -> dict:
     }
 
 
-def _recommendation(fixture: Path) -> dict:
+def _recommendation(fixture: Path, root: Path) -> dict:
     catalog = load_catalog(fixture)
-    profile = ProfileContext(
-        profile_id="synthetic-profile",
-        display_name="Synthetic",
-        timezone="UTC",
-        seed_namespace="synthetic-golden",
-    )
-    source = RecommendationInput(
-        profile=profile,
-        import_id=1,
-        baseline_judged=140,
-        candidates=tuple(catalog["owned"]),
-        model=_model(catalog),
-    )
-    session = build_session_from_input(
-        source,
-        menu_date=FIXED_MENU_DATE,
-        clock=lambda: FIXED_CLOCK,
-    )
+    conn = sqlite3.connect(root / "assistant.db")
+    model = catalog["model"]
+    try:
+        with conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO daily_imports(
+                  imported_at, effective_date, score_sha256,
+                  scoredatalog_sha256, baseline_judged, cumulative_playcount
+                ) VALUES (?, ?, 'synthetic-score', 'synthetic-log', 140, 4)
+                """,
+                (FIXED_CLOCK, FIXED_MENU_DATE),
+            )
+            import_id = int(cursor.lastrowid)
+            for row in catalog["owned"]:
+                conn.execute(
+                    "INSERT OR REPLACE INTO charts VALUES (?, ?, ?, ?, ?, 7, ?, ?)",
+                    (
+                        row["sha256"], row["md5"], row["title"], row["artist"],
+                        row["notes"], f"synthetic/{row['sha256']}.bms", FIXED_CLOCK,
+                    ),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO table_entries VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        row["table_id"], row["level"], row["sha256"],
+                        row["md5"], row["title"], FIXED_CLOCK,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO chart_features VALUES (
+                      ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        row["sha256"], row["density"], row["density"],
+                        row["density"], row["density"], row["density"],
+                        row["model_scratch"], row["scratch"], row["scratch"],
+                        row["ln"], 0.0, row["soflan"], 0, 120.0, row["notes"],
+                    ),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO score_state VALUES (?, 0, ?, 0, 0, 0, ?, ?, ?, ?, ?)",
+                    (
+                        row["sha256"], row["clear"], row["notes"],
+                        row["playcount"], row["last_played"], import_id,
+                        f"synthetic-{row['sha256']}",
+                    ),
+                )
+            params = {
+                "weights": model["weights"],
+                "means": model["means"],
+                "scales": model["scales"],
+            }
+            conn.execute(
+                "INSERT INTO model_state VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    model["target"], model["version"], model["trained_at"],
+                    json.dumps(params, sort_keys=True), model["n_train"],
+                    model["metrics"]["logloss"], model["metrics"]["brier"],
+                    model["metrics"]["baseline_logloss"],
+                ),
+            )
+        session = build_session(
+            conn, menu_date=FIXED_MENU_DATE, clock=lambda: FIXED_CLOCK
+        )
+    finally:
+        conn.close()
     category_counts: dict[str, int] = {}
     category_expected: dict[str, int] = {}
     for item in session.queue:
@@ -112,10 +146,10 @@ def _recommendation(fixture: Path) -> dict:
         )
     return {
         "model_state": {
-            "target": source.model.target,
-            "version": source.model.version,
+            "target": model["target"],
+            "version": model["version"],
             "status": session.model_status,
-            "n_train": source.model.n_train,
+            "n_train": model["n_train"],
         },
         "recommend_candidates": {
             "count": len(session.personal),
@@ -157,7 +191,7 @@ def build_golden_payload(root: Path) -> dict:
         "fixture_version": 2,
         "normalized_plays": _normalized_plays(fixture, root),
     }
-    payload.update(_recommendation(fixture))
+    payload.update(_recommendation(fixture, root))
     return payload
 
 

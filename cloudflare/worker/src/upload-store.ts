@@ -318,6 +318,17 @@ export class D1UploadSessionStore implements UploadSessionStore {
     return (await this.findDedup(ref.profileScope, ref.sha256, ref.sizeBytes)) ?? protocolError("internal_error");
   }
 
+  async removeDedup(ref: StoredFileRef): Promise<void> {
+    await this.db
+      .prepare(
+        `DELETE FROM upload_dedup
+          WHERE profile_scope = ?1 AND sha256 = ?2 AND size_bytes = ?3
+            AND object_key = ?4`,
+      )
+      .bind(ref.profileScope, ref.sha256, ref.sizeBytes, ref.objectKey)
+      .run();
+  }
+
   async listExpired(now: number): Promise<UploadSessionRecord[]> {
     const result = await this.db
       .prepare(

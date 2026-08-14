@@ -1,27 +1,16 @@
-# データ分類と保持
+# データ分類・保持
 
-分類は機密性と許可された処理の両方を表す。保存場所の prefix と `trust_domain` は分類の一部であり、同じ JSON shape でも境界をまたいで再利用しない。
+| 分類 | 例 | owner | 保存・許可用途 | 禁止・保持 / 削除 |
+|---|---|---|---|---|
+| C0 資格情報・秘密 | password/recovery/device token hash、OAuth token、Profile鍵、capability secret hash | Account / Service | D1のhash、暗号化secret store。認証・失効・鍵管理だけに使用 | 平文保存、ログ、MCP返却を禁止。削除確定時に失効・鍵破棄 |
+| P1 アカウント・プロフィール | user ID、任意email、timezone、同意、readiness | Account | D1 / Profile DO。本人のWeb操作と許可scope内MCP | 別Account参照と集合入力を禁止。Account/Profile削除まで |
+| P2 生DB・提出物 | 5つのbeatoraja DB、upload manifest | Profile | Profile単位envelope encryptionのprivate R2。検証・欠落backfill・本人の再解析 | MCP、capability URL、集合学習への入力を禁止。Profile削除まで |
+| P3 個人プレイ・派生 | PlayEvent、特徴量、個人model、推薦・AIジャーナル | Profile | Profile DO / private R2。個人推薦、期間要約、明示scopeの履歴 | Account越境とscope外返却を禁止。Profile削除まで |
+| A1 匿名集合モデル | aggregate parameter、集計済み品質・privacy評価 | Service / 対象Profile群 | official aggregate store。privacy gate済み`live_ir`由来の派生recordだけで生成 | 生DB、5DB backfill、個人再識別可能なrowを禁止。既生成parameterは個人削除後も保持可 |
+| O1 運用・監査 | request/event/job digest、reason、status、latency、IP/User-Agent | Service | D1 / security log。abuse調査、retry、削除証跡 | payload、token、email、秘密URLを禁止。IP/User-Agent 30日、監査行1年 |
+| B1 Backup | D1/DO/R2の暗号化backup | Service custody / 元owner | 別private R2。復元訓練と障害復旧 | 最大30日。削除確定時にProfile鍵を破棄して即時読不能化 |
+| E1 Export | 正規化履歴、設定、推薦・model履歴、AIジャーナル、同意、manifest/digest | Account / Profile | 本人が明示要求したauthenticated download | 元5DB、資格情報、他ownerデータを含めず、元データの保持期間を延長しない |
 
-| 分類 | 例 | owner | 保存 | 許可 | 禁止 / 保持 |
-|---|---|---|---|---|---|
-| C0 資格情報・秘密 | password hash、recovery hash、device token hash、OAuth token | Account / service | D1（hash）または暗号化 secret store | 認証、失効、監査 | 平文保存・ログ・MCP返却。削除確定で即時失効 |
-| P1 アカウント・プロフィール | user ID、任意 email、timezone、同意、readiness | Account | D1、profile DO | 本人のWeb/MCP scope内 read、設定 | 別account read、aggregate input。削除確定で削除 |
-| P2 生DB・提出物 | 5つの beatoraja DB、path/titleを含み得る snapshot | Profile | profile専用 key の envelope-encrypted private R2 | Containerの検証・正規化、本人の再解析 | MCP、公開URL、集合モデル、self-hosted→official移送。profile削除で削除、backup最大30日 |
-| P3 個人プレイ・派生 | `PlayEvent`、normalized play、features、model state、推薦理由 | Profile | profile DO / private R2 | 本人の推薦・期間要約、明示 scope の履歴 | account越境、raw exportの代用、同意なし集合利用。削除 policyに従う |
-| A1 匿名集合モデル | aggregate parameter、集計済み評価指標 | service / no individual owner | official aggregate store | `official`、同意、eligible、SP7 の derived inputのみ | self-hosted混入、個人再識別可能な row、raw event保存。既生成 parameter は個人削除後も保持可 |
-| O1 運用・監査 | request ID、event/job hash、reason、status、latency | service | D1/ログ | abuse調査、retry、削除証跡 | payload本文、token、秘密。最小限の保持期間を設定 |
+superseded成果物本体は90日、manifest/digestはProfile削除まで保持する。失敗Jobはpayloadを持たない診断だけ30日保持する。
 
-## 公式集合学習のゲート
-
-集合学習に入る record は次の条件をすべて満たす必要がある。条件は query の暗黙の前提にせず、normalization output と aggregate input の両方で検証する。
-
-```text
-trust_domain == "official"
-AND aggregate_eligible == true
-AND account_consent.aggregate_training == true
-AND game_mode == "SP7"
-AND is_course == false
-AND source_kind in ("official_ir", "official_normalized")
-```
-
-`self_hosted` は `aggregate_eligible=false` を schema で強制するため、official aggregate partition の入力型に変換できない。既存のローカル `assistant.db` も self-hosted として扱い、#1 の「公式 Cloudflare 環境で受理したデータだけ」を満たさない限り集合へ送らない。
+集合入力は品質ゲート済みlive IRだけ。eligibilityは`pending/eligible/ineligible/revoked`、reason code、policy versionで管理し、client booleanを信用しない。公開gateは100 Profile以上、1 Profile寄与1%以下、membership inference AUCの95%上限0.55以下、TPR@1%FPR 5%以下、既知record完全抽出0件の全条件を満たす必要がある。
