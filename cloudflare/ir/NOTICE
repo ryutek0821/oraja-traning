@@ -1,0 +1,15 @@
+oraja-training beatoraja IR
+
+SPDX-License-Identifier: GPL-3.0-only
+This public client is distributed under GNU GPL version 3 only.
+License text: https://www.gnu.org/licenses/gpl-3.0.txt
+Corresponding source: the source archive attached to the same release.
+
+Compatibility boundary:
+  exch-bms2/beatoraja, GPL-3.0, commit 721856fbb431
+  https://github.com/exch-bms2/beatoraja
+
+The beatoraja API/runtime is a compile-only compatibility target. Its classes,
+JAR, resources, and third-party dependencies are not bundled in this client.
+The source-only compatibility DTOs under src/compat are test/build inputs and
+are not packaged in the runtime JAR.

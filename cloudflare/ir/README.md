@@ -1,5 +1,9 @@
 # oraja-training beatoraja IR
 
+This public client is licensed **GPL-3.0-only**. The private service and other
+repository components remain AGPL-3.0-only; see [PUBLICATION.md](PUBLICATION.md)
+for the deny-by-default release boundary.
+
 > **Implementation status:** the source includes the write-only
 > `IRConnection`, durable profile-partitioned spool, bounded HTTPS transport,
 > compatibility stubs, composite adapter, and dependency-free contract smoke
@@ -20,8 +24,9 @@ README requires a 64-bit Java 17 runtime.  Upstream does not publish a Maven
 or Gradle API artifact; its `build.xml` compiles from source and `lib/*.jar`.
 
 The release build takes the user-provided beatoraja runtime JAR as a
-compile-only dependency. Use Gradle 8.10.2 directly until the repository's
-wrapper JAR is added:
+compile-only dependency. Use Gradle 8.10.2 directly. The binary wrapper JAR
+is deliberately not committed; CI bootstraps exactly Gradle 8.10.2 and the
+checked-in wrapper properties document the same version:
 
 ```sh
 gradle clean releaseArtifacts \
@@ -36,9 +41,11 @@ are not a substitute for the official compatibility build; CI/release must
 run once with the actual JAR.  The Java toolchain and Gradle wrapper are
 fixed to Java 17 / Gradle 8.10.2.
 
-The generated `build/release/` directory contains the plugin JAR, source JAR,
-SHA-256 checksums, a CycloneDX-style SBOM, and a license notice.  No release
-artifact is committed or published by these tasks.
+The generated `build/release/` directory contains the plugin JAR, Maven source
+JAR, a reproducible build-complete source ZIP,
+SHA-256 checksums, a CycloneDX SBOM, the GPL license/notice, and an unsigned
+`release-manifest.json`. CI additionally creates the platform provenance
+attestation. No release artifact is committed or published by these tasks.
 
 ## Configuration
 
@@ -134,6 +141,14 @@ gradle contractTest
 gradle check
 gradle clean releaseArtifacts -PbeatorajaJar=/path/to/beatoraja.jar
 ```
+
+The first two commands use compatibility stubs and are development checks.
+A publishable result requires the third command with the pinned real
+beatoraja JAR; CI first runs behavior tests with the source-only fixtures,
+then builds the real JAR from upstream commit `721856fbb431` using a Java 17
+distribution with JavaFX, runs `realBeatorajaCompatibility` to compile the
+main client ABI against it, and compares two clean-build checksums. Fixture
+constructors are intentionally not mistaken for a real-JAR runtime test.
 
 These commands build/test locally only.  They do not deploy the Worker, start
 or restart a service, create a GitHub release, or upload a JAR.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 package bms.player.beatoraja.ir;
 
 final class SimpleIRResponse<T> implements IRResponse<T> {

@@ -64,3 +64,68 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npm --prefix cloudflare run container:build
+
+  ir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the pinned beatoraja compatibility target
+        uses: actions/checkout@v4
+        with:
+          repository: exch-bms2/beatoraja
+          ref: 721856fbb431
+          path: .upstream/beatoraja
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: "17"
+          java-package: jdk+fx
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Build the pinned real beatoraja JAR
+        run: ant -f .upstream/beatoraja/build.xml create_run_jar
+      - name: Run behavior contracts against source-only compatibility fixtures
+        run: gradle --project-dir cloudflare/ir clean check
+      - name: Compile and assemble main sources against the real JAR
+        run: >-
+          gradle --project-dir cloudflare/ir clean realBeatorajaCompatibility releaseArtifacts
+          -PbeatorajaJar=${{ github.workspace }}/.upstream/beatoraja/build/beatoraja.jar
+          -PbeatorajaApiVersion=master@721856fbb431
+      - name: Verify public JAR boundary
+        run: |
+          jar tf cloudflare/ir/build/libs/oraja-training-ir-0.1.0.jar > /tmp/oraja-ir-entries.txt
+          grep -qx 'META-INF/LICENSE' /tmp/oraja-ir-entries.txt
+          grep -qx 'META-INF/NOTICE' /tmp/oraja-ir-entries.txt
+          if grep -Eq 'bms/player/beatoraja/ir/(IRAccount|IRConnection|IRScoreData|IRChartData)\.class' /tmp/oraja-ir-entries.txt; then
+            echo 'compile-only beatoraja compatibility class was bundled' >&2
+            exit 1
+          fi
+      - name: Preserve first-build checksums
+        run: |
+          mkdir -p /tmp/oraja-ir-first
+          cp cloudflare/ir/build/release/*.sha256 /tmp/oraja-ir-first/
+      - name: Rebuild and compare reproducible artifacts
+        run: |
+          gradle --project-dir cloudflare/ir clean releaseArtifacts \
+            -PbeatorajaJar=${{ github.workspace }}/.upstream/beatoraja/build/beatoraja.jar \
+            -PbeatorajaApiVersion=master@721856fbb431
+          diff -u /tmp/oraja-ir-first/oraja-training-ir-0.1.0.jar.sha256 cloudflare/ir/build/release/oraja-training-ir-0.1.0.jar.sha256
+          diff -u /tmp/oraja-ir-first/oraja-training-ir-0.1.0-sources.jar.sha256 cloudflare/ir/build/release/oraja-training-ir-0.1.0-sources.jar.sha256
+          diff -u /tmp/oraja-ir-first/oraja-training-ir-0.1.0-source.zip.sha256 cloudflare/ir/build/release/oraja-training-ir-0.1.0-source.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oraja-training-ir-release-candidate
+          path: cloudflare/ir/build/release/
+          if-no-files-found: error
+      - name: Attest IR artifact provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: cloudflare/ir/build/release/oraja-training-ir-*

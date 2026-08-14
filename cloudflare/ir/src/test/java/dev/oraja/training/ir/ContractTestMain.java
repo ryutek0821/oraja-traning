@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: AGPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-only */
 package dev.oraja.training.ir;
 
 import bms.player.beatoraja.ir.*;

@@ -14,6 +14,8 @@ assistant.db-wal
 export/
 data/
 cloudflare/node_modules/
+cloudflare/ir/.gradle/
+cloudflare/ir/build/
 cloudflare/.wrangler/
 cloudflare/.dev.vars*
 cloudflare/.env*
