@@ -1,14 +1,19 @@
 import { readFile, readdir } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 
-const files = (await readdir(new URL("../migrations/", import.meta.url)))
+const migrationsDirectory = new URL("../migrations/", import.meta.url);
+const directoryEntries = await readdir(migrationsDirectory).catch((error) => {
+  if (error?.code === "ENOENT") return [];
+  throw error;
+});
+const files = directoryEntries
   .filter((file) => file.endsWith(".sql"))
   .sort();
 const names = files.map((file) => file.split("_", 1)[0]);
 if (new Set(names).size !== names.length || names.some((name) => !/^\d{4}$/.test(name))) {
   throw new Error("migration files must have unique four-digit prefixes");
 }
-if (files.length === 0 || names.some((name, index) => Number(name) !== index)) {
+if (files.length > 0 && names.some((name, index) => Number(name) !== index)) {
   throw new Error("migration files must start at 0000 and have no gaps");
 }
 for (const file of files) {

@@ -57,7 +57,8 @@ def test_rate_limit_is_ip_and_account_scoped_without_raw_key_columns() -> None:
     assert "scope IN ('ip', 'account', 'recovery', 'email')" in MIGRATION
     assert "key_hash TEXT NOT NULL" in MIGRATION
     assert "rateKey" in AUTH and "recordFailure" in AUTH
-    assert "await enforceRateLimit(db, \"account\", row.account_id, now)" in AUTH
+    assert "await enforceRateLimit(db, \"account\", row.account_id, now, options.hashingSecret)" in AUTH
+    assert "HMAC" in AUTH and "AUTH_HASH_PEPPER" in (ROOT / "cloudflare/worker/src/index.ts").read_text()
     assert "export async function requestEmailChange" in AUTH
 
 
