@@ -13,7 +13,7 @@ from oraja_training.domain.types import ModelSnapshot, Observation
 
 
 TARGET = "observed_completion"
-FEATURE_NAMES = ("level", "density_p99", "scratch_rate")
+FEATURE_NAMES = ("table_completion_margin", "density_p99", "scratch_rate")
 MIN_RESULTS = 200
 MIN_SESSIONS = 10
 HOLDOUT_FRACTION = 0.20
@@ -54,6 +54,29 @@ def numeric_level(value: object) -> float | None:
         except ValueError:
             return None
     return result if math.isfinite(result) else None
+
+
+def fit_difficulty_frontier(rows: Sequence[tuple[float, bool]]) -> float:
+    """Fit one monotonic completion frontier within a single table scale."""
+
+    if not rows:
+        return 0.0
+    low = min(level for level, _ in rows) - 3.0
+    high = max(level for level, _ in rows) + 3.0
+    best = low
+    best_loss = float("inf")
+    for step in range(241):
+        ability = low + (high - low) * step / 240
+        loss = 0.0
+        for level, cleared in rows:
+            probability = min(
+                0.999,
+                max(0.001, _sigmoid((ability - level) / 1.5)),
+            )
+            loss -= math.log(probability if cleared else 1.0 - probability)
+        if loss < best_loss:
+            best, best_loss = ability, loss
+    return best
 
 
 def _standardize(
@@ -238,7 +261,11 @@ def fit_observations(
         )
 
     version = 1 if previous is None else previous.version + 1
-    if previous is not None and previous.n_train == len(train):
+    if (
+        previous is not None
+        and previous.n_train == len(train)
+        and previous.feature_names == FEATURE_NAMES
+    ):
         return FitResult(
             "unchanged", len(rows), sessions, len(train), len(holdout), gate_fraction,
             version=previous.version, metrics=metrics, model=previous,
@@ -297,15 +324,15 @@ fit_from_repository = fit_repository
 
 def predict_snapshot(
     snapshot: ModelSnapshot | None,
-    level: float,
+    table_completion_margin: float,
     density: float,
     scratch: float,
 ) -> float | None:
     """Predict from an immutable snapshot, or return ``None`` at cold start."""
 
-    if snapshot is None:
+    if snapshot is None or snapshot.feature_names != FEATURE_NAMES:
         return None
-    values = [float(level), float(density), float(scratch)]
+    values = [float(table_completion_margin), float(density), float(scratch)]
     standardized = [
         (value - mean) / scale
         for value, mean, scale in zip(values, snapshot.means, snapshot.scales)

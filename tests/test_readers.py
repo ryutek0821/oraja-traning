@@ -51,6 +51,9 @@ def test_score_and_song_readers(synthetic_db_dir) -> None:
         assert len(matching) == 2
         assert {row["sha256"] for row in matching} == {sample_hash}
         assert readers.read_songs(conn, []) == []
+        patterns = readers.read_chart_patterns(conn)
+        assert len(patterns) == 2
+        assert patterns[0]["analysis_version"] == 3
 
     with closing(readers.open_snapshot(synthetic_db_dir / "songinfo.db")) as conn:
         assert len(readers.read_songinfo(conn)) == 4

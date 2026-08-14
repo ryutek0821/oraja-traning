@@ -122,6 +122,7 @@ def test_backfill_follows_primary_key_and_noplay_rules(backfilled) -> None:
     # SPEC 3.1 says these are not plays and must not enter plays.
     assert result.ir_imports == 2
     assert result.skipped_ir_noplay == 2
+    assert result.pattern_features == 1
 
     conn = sqlite3.connect(assistant_db)
     try:
@@ -132,6 +133,13 @@ def test_backfill_follows_primary_key_and_noplay_rules(backfilled) -> None:
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'ir_import' AND clear = 0"
         ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM chart_pattern_features"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT practice_low FROM chart_pattern_features WHERE sha256 = ?",
+            ("1" * 64,),
+        ).fetchone()[0] == 1
     finally:
         conn.close()
 
