@@ -11,6 +11,7 @@ type ProfileStorage = {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
   list<T>(options?: { prefix?: string; start?: string; limit?: number }): Promise<Map<string, T>>;
+  deleteAll(): Promise<void>;
   transaction?<T>(callback: (storage: ProfileStorage) => Promise<T>): Promise<T>;
 };
 
@@ -136,6 +137,9 @@ export class ProfileDurableObject extends DurableObject {
     if (request.method === "GET" && url.pathname === "/internal/plays") {
       return this.listPlays(url);
     }
+    if (request.method === "POST" && url.pathname === "/internal/privacy/purge") {
+      return this.purge(request);
+    }
     const enqueueMatch = /^\/internal\/play-events\/([^/]+)\/enqueued$/.exec(url.pathname);
     if (request.method === "POST" && enqueueMatch) {
       return this.markEnqueued(decodeURIComponent(enqueueMatch[1]));
@@ -166,6 +170,8 @@ export class ProfileDurableObject extends DurableObject {
     const input = body;
     try {
       const result = await this.inTransaction(async (storage) => {
+        const tombstone = await storage.get<unknown>("privacy:tombstone");
+        if (tombstone !== undefined) throw new Error("profile_deleted");
         const identity = await storage.get<string>("profile:internal_id");
         if (identity !== undefined && identity !== input.profile_internal_id) {
           throw new Error("profile_identity_conflict");
@@ -214,6 +220,9 @@ export class ProfileDurableObject extends DurableObject {
       if (error instanceof Error && error.message === "profile_identity_conflict") {
         return response({ error: { code: "profile_conflict" } }, 409);
       }
+      if (error instanceof Error && error.message === "profile_deleted") {
+        return response({ error: { code: "profile_deleted" } }, 410);
+      }
       return response({ error: { code: "temporary_unavailable" } }, 503);
     }
   }
@@ -232,6 +241,42 @@ export class ProfileDurableObject extends DurableObject {
         return true;
       });
       return marked ? response({ marked: true }) : response({ error: { code: "not_found" } }, 404);
+    } catch {
+      return response({ error: { code: "temporary_unavailable" } }, 503);
+    }
+  }
+
+  private async purge(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ error: { code: "invalid_json" } }, 400);
+    }
+    if (!isRecord(body) || typeof body.profile_internal_id !== "string" || typeof body.deletion_id !== "string") {
+      return response({ error: { code: "invalid_internal_request" } }, 400);
+    }
+    try {
+      const storage = this.storage();
+      const tombstone = await storage.get<{ profile_internal_id: string; deletion_id: string }>("privacy:tombstone");
+      if (tombstone) {
+        return tombstone.profile_internal_id === body.profile_internal_id && tombstone.deletion_id === body.deletion_id
+          ? response({ purged: true, duplicate: true })
+          : response({ error: { code: "privacy_tombstone_conflict" } }, 409);
+      }
+      const identity = await storage.get<string>("profile:internal_id");
+      if (identity !== undefined && identity !== body.profile_internal_id) {
+        return response({ error: { code: "profile_conflict" } }, 409);
+      }
+      await storage.deleteAll();
+      // deleteAll removes every prior value, so persist the tombstone last.
+      // accept() checks it before profile identity can be recreated.
+      await storage.put("privacy:tombstone", {
+        profile_internal_id: body.profile_internal_id,
+        deletion_id: body.deletion_id,
+        deleted_at: Math.floor(Date.now() / 1000),
+      });
+      return response({ purged: true, duplicate: false });
     } catch {
       return response({ error: { code: "temporary_unavailable" } }, 503);
     }

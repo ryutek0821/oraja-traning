@@ -50,7 +50,18 @@ import {
   revokeOAuthToken,
   rotateRefreshToken,
 } from "./oauth";
-import { cancelDeletion, requestDataExport, requestDeletion } from "./privacy";
+import {
+  cancelDeletion,
+  claimExportDownload,
+  claimPrivacyTasks,
+  expireDataExports,
+  finalizeDeletion,
+  purgeDueProfiles,
+  recordPrivacyTaskResult,
+  requestDataExport,
+  requestDeletion,
+  runPurgeTask,
+} from "./privacy";
 import { D1UploadSessionStore } from "./upload-store";
 import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
 import {
@@ -381,10 +392,34 @@ async function handleAdvisorRoutes(request: Request, env: Env, origin?: string):
 
 async function handlePrivacyRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
-  if (!["/v1/privacy/export", "/v1/privacy/delete", "/v1/privacy/delete/cancel"].includes(url.pathname)) return null;
+  const downloadMatch = /^\/v1\/privacy\/exports\/([0-9a-f-]{36})\/download$/.exec(url.pathname);
+  if (!["/v1/privacy/export", "/v1/privacy/delete", "/v1/privacy/delete/cancel"].includes(url.pathname) && !downloadMatch) return null;
   try {
     const accountId = await requireWebAccount(request, env, true);
     if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
+    if (downloadMatch) {
+      const profile = await env.CONTROL_DB.prepare(
+        "SELECT id FROM profiles WHERE account_id = ?1 AND status <> 'deleted' ORDER BY created_at LIMIT 1",
+      ).bind(accountId).first<{ id: string }>();
+      if (!profile) throw new ApiError("profile_not_found", 404);
+      const now = Math.floor(Date.now() / 1000);
+      const claimed = await claimExportDownload(env.CONTROL_DB, accountId, profile.id, downloadMatch[1], now);
+      const object = await env.BACKUP_BUCKET.get(claimed.targetKey);
+      if (!object) {
+        await env.CONTROL_DB.prepare(
+          "UPDATE exports SET downloaded_at = NULL WHERE id = ?1 AND account_id = ?2 AND profile_id = ?3 AND downloaded_at = ?4",
+        ).bind(downloadMatch[1], accountId, profile.id, now).run();
+        throw new ApiError("export_temporarily_unavailable", 503);
+      }
+      return new Response(object.body, {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "content-disposition": `attachment; filename="oraja-profile-export-${downloadMatch[1]}.json"`,
+          "cache-control": "no-store",
+        },
+      });
+    }
     const body = await readJsonBody(request, 8 * 1024);
     const profilePublicId = typeof body.profile_id === "string" ? body.profile_id : "";
     const profile = await env.CONTROL_DB.prepare(
@@ -666,12 +701,29 @@ export default {
     const schedule = (Object.entries(SCHEDULE_CRONS).find(([, cron]) => cron === controller.cron)?.[0]
       ?? null) as ScheduleName | null;
     if (!schedule) return;
+    const scheduledAt = Math.floor(controller.scheduledTime / 1000);
+    if (schedule === "deletion-sweep") {
+      const due = await purgeDueProfiles(env.CONTROL_DB, scheduledAt);
+      await expireDataExports(env.CONTROL_DB, scheduledAt);
+      const tasks = await claimPrivacyTasks(env.CONTROL_DB, scheduledAt, 100);
+      for (const task of tasks) {
+        try {
+          await runPurgeTask(task, env);
+          await recordPrivacyTaskResult(env.CONTROL_DB, task.id, true, null, scheduledAt);
+        } catch (error) {
+          const code = error instanceof ApiError ? error.code : "privacy_task_failed";
+          await recordPrivacyTaskResult(env.CONTROL_DB, task.id, false, code, scheduledAt);
+        }
+      }
+      for (const deletionId of due.deletionIds) await finalizeDeletion(env.CONTROL_DB, deletionId, scheduledAt);
+      return;
+    }
     const ledger = new D1JobLedger(env.CONTROL_DB);
     await dispatchSchedule(
       ledger,
       new JobDispatcher(ledger, env.JOB_QUEUE),
       schedule,
-      Math.floor(controller.scheduledTime / 1000),
+      scheduledAt,
     );
   },
 };
