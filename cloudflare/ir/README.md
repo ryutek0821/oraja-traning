@@ -1,10 +1,10 @@
 # oraja-training beatoraja IR
 
-> **Implementation status:** this draft currently contains only the event
-> DTO/mapper, identity/configuration, JSON codec, and build design.  It does
-> not yet contain an `IRConnection`, durable spool, HTTP client, compatibility
-> stubs, tests, or a complete Gradle wrapper, and therefore must not be
-> published as a working plugin.
+> **Implementation status:** the source includes the write-only
+> `IRConnection`, durable profile-partitioned spool, bounded HTTPS transport,
+> compatibility stubs, composite adapter, and dependency-free contract smoke
+> tests. Release compatibility must still be verified with the pinned real
+> beatoraja JAR before publishing.
 
 This directory is the foundation for an `IRConnection` plugin targeting the
 official `exch-bms2/beatoraja` API.  The Worker receives the versioned play
@@ -19,12 +19,12 @@ The compatibility target is the current `master` source of
 README requires a 64-bit Java 17 runtime.  Upstream does not publish a Maven
 or Gradle API artifact; its `build.xml` compiles from source and `lib/*.jar`.
 
-The planned release build takes the user-provided beatoraja runtime JAR as a
-compile-only dependency.  The command below is not available until the
-missing wrapper and plugin implementation above are added:
+The release build takes the user-provided beatoraja runtime JAR as a
+compile-only dependency. Use Gradle 8.10.2 directly until the repository's
+wrapper JAR is added:
 
 ```sh
-./gradlew clean releaseArtifacts \
+gradle clean releaseArtifacts \
   -PbeatorajaJar=/path/to/beatoraja.jar \
   -PbeatorajaApiVersion=master@721856fbb431
 ```
@@ -130,9 +130,9 @@ intentional.
 ## Local verification
 
 ```sh
-./gradlew contractTest
-./gradlew check
-./gradlew clean releaseArtifacts -PbeatorajaJar=/path/to/beatoraja.jar
+gradle contractTest
+gradle check
+gradle clean releaseArtifacts -PbeatorajaJar=/path/to/beatoraja.jar
 ```
 
 These commands build/test locally only.  They do not deploy the Worker, start

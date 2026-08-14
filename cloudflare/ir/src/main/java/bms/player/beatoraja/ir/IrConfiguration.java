@@ -70,7 +70,9 @@ public final class IrConfiguration {
     }
 
     private static URI normalizeBaseUrl(URI value) {
-        if (value == null || value.getScheme() == null || value.getHost() == null) {
+        if (value == null || value.getScheme() == null || value.getHost() == null
+                || value.getUserInfo() != null || value.getQuery() != null
+                || value.getFragment() != null) {
             throw new IllegalArgumentException("IR base URL must have scheme and host");
         }
         String text = value.toString();

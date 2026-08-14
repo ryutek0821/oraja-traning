@@ -9,7 +9,7 @@ IR module boundaries separate:
 | `worker/` | Worker/API, Durable Objects, Queue/Workflow entry points |
 | `web/` | static asset boundary; product UI is added by issue #15 |
 | `container/` | pinned Python processor image and health endpoint |
-| `ir/` | reserved Java/Gradle `IRConnection` module boundary |
+| `ir/` | Java 17 `IRConnection`, durable spool, HTTPS transport, and compatibility tests |
 | `migrations/` | ordered D1 migrations |
 | `runbooks/` | operator procedures; no credentials or resource IDs |
 

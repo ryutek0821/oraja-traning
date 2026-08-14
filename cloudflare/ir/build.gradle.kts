@@ -49,6 +49,15 @@ tasks.named<JavaCompile>(compat.compileJavaTaskName).configure {
     options.encoding = "UTF-8"
 }
 
+if (!beatorajaJarProperty.isPresent) {
+    tasks.named<JavaCompile>("compileJava").configure {
+        dependsOn(tasks.named(compat.classesTaskName))
+    }
+    tasks.named<JavaCompile>("compileTestJava").configure {
+        dependsOn(tasks.named(compat.classesTaskName))
+    }
+}
+
 sourceSets.named("main") {
     compileClasspath = compileClasspath + apiClasspath
 }
