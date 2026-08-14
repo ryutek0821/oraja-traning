@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "check": "node scripts/check-config.mjs && node scripts/migrations.mjs check && node scripts/schema-check.mjs",

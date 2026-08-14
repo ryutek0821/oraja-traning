@@ -16,6 +16,7 @@ CREATE TABLE artifact_revisions (
   created_at INTEGER NOT NULL,
   UNIQUE(profile_id, table_kind, revision),
   UNIQUE(profile_id, table_kind, content_hash),
+  UNIQUE(account_id, profile_id, table_kind, revision, content_hash, object_key),
   FOREIGN KEY(account_id, profile_id) REFERENCES profiles(account_id, id) ON DELETE CASCADE
 );
 
@@ -31,7 +32,11 @@ CREATE TABLE artifact_latest (
   object_key TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(profile_id, table_kind),
-  FOREIGN KEY(account_id, profile_id) REFERENCES profiles(account_id, id) ON DELETE CASCADE
+  FOREIGN KEY(account_id, profile_id) REFERENCES profiles(account_id, id) ON DELETE CASCADE,
+  FOREIGN KEY(account_id, profile_id, table_kind, revision, content_hash, object_key)
+    REFERENCES artifact_revisions(
+      account_id, profile_id, table_kind, revision, content_hash, object_key
+    ) ON DELETE CASCADE
 );
 
 CREATE INDEX artifact_latest_by_owner
