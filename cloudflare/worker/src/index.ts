@@ -44,7 +44,10 @@ import {
   exchangeAuthorizationCode,
   issueAuthorizationCode,
   oauthDiscovery,
+  oauthProtectedResourceMetadata,
   registerClient,
+  revokeOAuthToken,
+  rotateRefreshToken,
 } from "./oauth";
 import { cancelDeletion, requestDataExport, requestDeletion } from "./privacy";
 import { D1UploadSessionStore } from "./upload-store";
@@ -278,10 +281,13 @@ function apiFailure(error: unknown, origin?: string): Response {
 
 async function handleOAuthRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
-  if (!["/oauth/register", "/oauth/authorize", "/oauth/token", "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"].includes(url.pathname)) return null;
+  if (!["/oauth/register", "/oauth/authorize", "/oauth/token", "/oauth/revoke", "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"].includes(url.pathname)) return null;
   try {
     if ((url.pathname === "/.well-known/oauth-authorization-server" || url.pathname === "/.well-known/openid-configuration") && request.method === "GET") {
       return json(oauthDiscovery(env.PUBLIC_ORIGIN), 200, origin);
+    }
+    if ((url.pathname === "/.well-known/oauth-protected-resource" || url.pathname === "/.well-known/oauth-protected-resource/mcp") && request.method === "GET") {
+      return json(oauthProtectedResourceMetadata(env.PUBLIC_ORIGIN), 200, origin);
     }
     if (url.pathname === "/oauth/register" && request.method === "POST") {
       const body = await readJsonBody(request, 32 * 1024);
@@ -291,6 +297,7 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
       }), 201, origin);
     }
     if (url.pathname === "/oauth/authorize" && request.method === "GET") {
+      if (url.searchParams.get("response_type") !== "code") throw new ApiError("unsupported_response_type", 400);
       const accountId = await requireWebAccount(request, env, false);
       const redirectUri = url.searchParams.get("redirect_uri");
       const profile = await env.CONTROL_DB.prepare(
@@ -302,24 +309,46 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
         redirectUri,
         scope: url.searchParams.get("scope"),
         codeChallenge: url.searchParams.get("code_challenge"),
+        codeChallengeMethod: url.searchParams.get("code_challenge_method"),
+        resource: url.searchParams.get("resource"),
+        issuer: env.PUBLIC_ORIGIN,
         accountId,
         profileId: profile.id,
       });
       const destination = new URL(redirectUri ?? "https://invalid.example.invalid");
       destination.searchParams.set("code", code);
+      destination.searchParams.set("iss", new URL(env.PUBLIC_ORIGIN).origin);
       const state = url.searchParams.get("state");
       if (state) destination.searchParams.set("state", state);
       return new Response(null, { status: 302, headers: { location: destination.toString(), "cache-control": "no-store" } });
     }
     if (url.pathname === "/oauth/token" && request.method === "POST") {
       const form = await request.formData();
-      if (form.get("grant_type") !== "authorization_code") throw new ApiError("unsupported_grant_type", 400);
-      return json(await exchangeAuthorizationCode(env.CONTROL_DB, {
-        code: form.get("code"),
-        clientId: form.get("client_id"),
-        redirectUri: form.get("redirect_uri"),
-        codeVerifier: form.get("code_verifier"),
-      }), 200, origin);
+      const grantType = form.get("grant_type");
+      if (grantType === "authorization_code") {
+        return json(await exchangeAuthorizationCode(env.CONTROL_DB, {
+          code: form.get("code"),
+          clientId: form.get("client_id"),
+          redirectUri: form.get("redirect_uri"),
+          codeVerifier: form.get("code_verifier"),
+          resource: form.get("resource"),
+          issuer: env.PUBLIC_ORIGIN,
+        }), 200, origin);
+      }
+      if (grantType === "refresh_token") {
+        return json(await rotateRefreshToken(env.CONTROL_DB, {
+          refreshToken: form.get("refresh_token"),
+          clientId: form.get("client_id"),
+          resource: form.get("resource"),
+          issuer: env.PUBLIC_ORIGIN,
+        }), 200, origin);
+      }
+      throw new ApiError("unsupported_grant_type", 400);
+    }
+    if (url.pathname === "/oauth/revoke" && request.method === "POST") {
+      const form = await request.formData();
+      await revokeOAuthToken(env.CONTROL_DB, { token: form.get("token"), clientId: form.get("client_id") });
+      return new Response(null, { status: 200, headers: { "cache-control": "no-store" } });
     }
     throw new ApiError("method_not_allowed", 405);
   } catch (error) {
