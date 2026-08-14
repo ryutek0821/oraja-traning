@@ -7,7 +7,7 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; color: var(--ink); background: var(--paper); }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button, .button { border: 0; background: var(--ink); color: var(--panel); padding: .7rem 1rem; font-weight: 700; cursor: pointer; text-decoration: none; }
 button:hover, .button:hover { background: var(--cool); }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
@@ -43,7 +43,7 @@ dt { color: var(--quiet); font-size: .8rem; } dd { margin: .15rem 0 0; font-weig
 form { display: grid; gap: 1rem; }
 label { display: grid; gap: .3rem; }
 label:has(input[type="checkbox"]) { grid-template-columns: auto 1fr; align-items: center; }
-input { width: 100%; padding: .65rem; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+input, select { width: 100%; padding: .65rem; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
 .panel { padding: 1.5rem 0 2rem; border-top: 1px solid var(--ink); }
 .panel-head { display: flex; align-items: start; justify-content: space-between; gap: 1rem; }
 .cards, .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }

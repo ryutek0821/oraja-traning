@@ -57,6 +57,34 @@
             <div id="devices" class="rows"></div>
           </section>
 
+          <section class="panel" aria-labelledby="settings-title">
+            <div class="panel-head"><div><p class="eyebrow">SESSION CONTROL</p><h2 id="settings-title" data-i18n="settings">練習設定</h2></div></div>
+            <form id="settings-form">
+              <label><span data-i18n="timezone">タイムゾーン</span><input id="setting-timezone" name="timezone" autocomplete="off" required /></label>
+              <label><span data-i18n="target">目標判定数</span><input id="setting-target" name="target" type="number" min="10000" max="1000000" step="1000" required /></label>
+              <label><span data-i18n="reserve">予備判定数</span><input id="setting-reserve" name="reserve" type="number" min="0" max="500000" step="1000" required /></label>
+              <label><span data-i18n="readiness">今日の状態</span><select id="setting-readiness" name="readiness"><option value="normal" data-i18n="normal">通常</option><option value="tired" data-i18n="tired">疲労</option></select></label>
+              <button type="submit" data-i18n="saveSettings">設定を保存</button>
+            </form>
+          </section>
+
+          <section class="panel" aria-labelledby="capabilities-title">
+            <div class="panel-head"><div><p class="eyebrow">BEATORAJA TABLE URL</p><h2 id="capabilities-title" data-i18n="capabilities">秘密の表URL</h2></div></div>
+            <p data-i18n="capabilityHelp">URLは更新時に一度だけ表示します。共有・ログ記録をしないでください。</p>
+            <div id="capabilities" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="jobs-title">
+            <div class="panel-head"><div><p class="eyebrow">PROCESSING</p><h2 id="jobs-title" data-i18n="jobs">処理履歴とデータ品質</h2></div></div>
+            <div id="quality" class="muted"></div><div id="jobs" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="advisor-title">
+            <div class="panel-head"><div><p class="eyebrow">AI ADVISOR</p><h2 id="advisor-title" data-i18n="advisor">確認待ちの提案</h2></div><button id="refresh-advisor" class="quiet" type="button" data-i18n="refresh">更新</button></div>
+            <p data-i18n="advisorHelp">根拠期間と提供元を確認し、プロフィール所有者だけが承認または却下できます。</p>
+            <div id="advisor-proposals" class="rows"></div>
+          </section>
+
           <section class="panel" aria-labelledby="import-title">
             <div class="panel-head"><div><p class="eyebrow">MONTHLY SNAPSHOT</p><h2 id="import-title" data-i18n="import">5DBを提出</h2></div></div>
             <p data-i18n="importHelp">静止スナップショット5ファイルだけを選択してください。BMS本体、Replay、-wal、-shmは送信しません。</p>
@@ -80,6 +108,12 @@
       <p data-i18n="tokenHelp">IR設定へ保存し、共有・スクリーンショット・ログ記録をしないでください。</p>
       <code id="device-token"></code>
       <div class="actions"><button id="copy-token" type="button" data-i18n="copy">コピー</button><button id="close-token" class="secondary" type="button" data-i18n="saved">保存しました</button></div>
+    </dialog>
+    <dialog id="capability-dialog" aria-labelledby="capability-dialog-title">
+      <h2 id="capability-dialog-title" data-i18n="capabilityOnce">この秘密URLは一度だけ表示されます</h2>
+      <p data-i18n="capabilityHelp">URLは更新時に一度だけ表示します。共有・ログ記録をしないでください。</p>
+      <code id="capability-url"></code>
+      <div class="actions"><button id="copy-capability" type="button" data-i18n="copy">コピー</button><button id="close-capability" class="secondary" type="button" data-i18n="saved">保存しました</button></div>
     </dialog>
     <script src="/app.js" type="module"></script>
   </body>
