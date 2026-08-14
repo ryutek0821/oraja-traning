@@ -2,6 +2,7 @@ import { Container } from "@cloudflare/containers";
 import { CloudflareAuthEmailSender } from "./email";
 import {
   AuthError,
+  changePassword,
   completePasswordReset,
   confirmEmail,
   csrfCookie,
@@ -41,12 +42,16 @@ import { dashboardData } from "./dashboard";
 import { createAdvisorProposal, decideAdvisorProposal, listAdvisorProposals } from "./advisor";
 import { handleMcp } from "./mcp";
 import {
+  appendOAuthAudit,
   authenticateOAuthToken,
+  enforceOAuthRateLimit,
   exchangeAuthorizationCode,
+  inspectAuthorizationRequest,
   issueAuthorizationCode,
   oauthDiscovery,
   oauthProtectedResourceMetadata,
   registerClient,
+  requireDcrInitialAccessToken,
   revokeOAuthToken,
   rotateRefreshToken,
 } from "./oauth";
@@ -99,6 +104,7 @@ export interface Env {
   AUTH_HASH_PEPPER?: string;
   DEVICE_TOKEN_PEPPER?: string;
   ENVELOPE_MASTER_KEY?: string;
+  OAUTH_DCR_INITIAL_ACCESS_TOKEN?: string;
 }
 
 const JSON_HEADERS = {
@@ -253,6 +259,11 @@ async function handleAuth(request: Request, env: Env, origin?: string): Promise<
       const result = await rotateSession(env.CONTROL_DB, sessionToken, options);
       return json({ account_public_id: result.accountPublicId }, 200, origin, sessionHeaders(result));
     }
+    if (url.pathname === "/v1/auth/password" && request.method === "POST") {
+      const body = await requestPayload(request);
+      const result = await changePassword(env.CONTROL_DB, sessionToken, body.current_password, body.new_password, options);
+      return json({ account_public_id: result.accountPublicId }, 200, origin, sessionHeaders(result));
+    }
     if (url.pathname === "/v1/auth/email" && request.method === "POST") {
       const body = await requestPayload(request);
       return json(await requestEmailChange(env.CONTROL_DB, sessionToken, body.email, options), 202, origin);
@@ -287,13 +298,44 @@ function bearerTokenForOAuth(request: Request): string | null {
 }
 
 function apiFailure(error: unknown, origin?: string): Response {
-  if (error instanceof ApiError) return json({ error: { code: error.code } }, error.status, origin);
+  if (error instanceof ApiError) {
+    const headers = error.retryAfterSeconds ? { "retry-after": String(error.retryAfterSeconds) } : undefined;
+    return json({ error: { code: error.code } }, error.status, origin, headers);
+  }
   return json({ error: { code: "internal_error" } }, 500, origin);
+}
+
+function oauthFailure(error: unknown, origin?: string): Response {
+  const code = error instanceof ApiError ? error.code : "server_error";
+  const status = error instanceof ApiError ? error.status : 500;
+  const headers = error instanceof ApiError && error.retryAfterSeconds
+    ? { "retry-after": String(error.retryAfterSeconds) }
+    : undefined;
+  return json({ error: code }, status, origin, headers);
+}
+
+function htmlEscape(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character] ?? character);
+}
+
+function oauthConsentHtml(input: {
+  clientName: string;
+  profileName: string;
+  scopes: string[];
+  fields: Record<string, string>;
+  csrfToken: string;
+}): string {
+  const hidden = Object.entries({ ...input.fields, csrf_token: input.csrfToken })
+    .map(([name, value]) => `<input type="hidden" name="${htmlEscape(name)}" value="${htmlEscape(value)}">`).join("");
+  const scopes = input.scopes.map((scope) => `<li><code>${htmlEscape(scope)}</code></li>`).join("");
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>接続の確認 / 연결 확인</title></head><body><main><h1>接続の確認 / 연결 확인</h1><p><strong>${htmlEscape(input.clientName)}</strong> がプロフィール <strong>${htmlEscape(input.profileName)}</strong> へのアクセスを求めています。</p><p><strong>${htmlEscape(input.clientName)}</strong>에서 프로필 <strong>${htmlEscape(input.profileName)}</strong>에 대한 접근을 요청합니다.</p><h2>許可する権限 / 허용할 권한</h2><ul>${scopes}</ul><p>許可後も設定から連携全体を失効できます。/ 허용 후에도 설정에서 연결 전체를 취소할 수 있습니다.</p><form method="post" action="/oauth/authorize">${hidden}<button type="submit" name="decision" value="approve">許可 / 허용</button><button type="submit" name="decision" value="deny">拒否 / 거부</button></form></main></body></html>`;
 }
 
 async function handleOAuthRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
   if (!["/oauth/register", "/oauth/authorize", "/oauth/token", "/oauth/revoke", "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"].includes(url.pathname)) return null;
+  const requestIdValue = requestId(request);
+  let auditClientId: string | undefined;
   try {
     if ((url.pathname === "/.well-known/oauth-authorization-server" || url.pathname === "/.well-known/openid-configuration") && request.method === "GET") {
       return json(oauthDiscovery(env.PUBLIC_ORIGIN), 200, origin);
@@ -302,41 +344,94 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
       return json(oauthProtectedResourceMetadata(env.PUBLIC_ORIGIN), 200, origin);
     }
     if (url.pathname === "/oauth/register" && request.method === "POST") {
+      await requireDcrInitialAccessToken(env.OAUTH_DCR_INITIAL_ACCESS_TOKEN, request.headers.get("authorization"));
       const body = await readJsonBody(request, 32 * 1024);
       return json(await registerClient(env.CONTROL_DB, {
         clientName: body.client_name,
         redirectUris: body.redirect_uris,
+        tokenEndpointAuthMethod: body.token_endpoint_auth_method,
+        grantTypes: body.grant_types,
+        responseTypes: body.response_types,
       }), 201, origin);
     }
-    if (url.pathname === "/oauth/authorize" && request.method === "GET") {
-      if (url.searchParams.get("response_type") !== "code") throw new ApiError("unsupported_response_type", 400);
+    if (url.pathname === "/oauth/authorize" && (request.method === "GET" || request.method === "POST")) {
+      const form = request.method === "POST" ? await request.formData() : null;
+      const parameter = (name: string): string | null => {
+        const value = form ? form.get(name) : url.searchParams.get(name);
+        return typeof value === "string" ? value : null;
+      };
+      if (parameter("response_type") !== "code") throw new ApiError("unsupported_response_type", 400);
+      auditClientId = parameter("client_id") ?? undefined;
+      await enforceOAuthRateLimit(env.CONTROL_DB, "authorize", `${auditClientId ?? "missing"}:${clientIp(request)}`);
       const accountId = await requireWebAccount(request, env, false);
-      const redirectUri = url.searchParams.get("redirect_uri");
       const profile = await env.CONTROL_DB.prepare(
-        "SELECT id FROM profiles WHERE account_id = ?1 AND status = 'active' ORDER BY created_at LIMIT 1",
-      ).bind(accountId).first<{ id: string }>();
+        "SELECT id, display_name FROM profiles WHERE account_id = ?1 AND status = 'active' ORDER BY created_at LIMIT 1",
+      ).bind(accountId).first<{ id: string; display_name: string }>();
       if (!profile) throw new ApiError("profile_not_found", 404);
-      const code = await issueAuthorizationCode(env.CONTROL_DB, {
-        clientId: url.searchParams.get("client_id"),
-        redirectUri,
-        scope: url.searchParams.get("scope"),
-        codeChallenge: url.searchParams.get("code_challenge"),
-        codeChallengeMethod: url.searchParams.get("code_challenge_method"),
-        resource: url.searchParams.get("resource"),
+      const authorizationInput = {
+        clientId: parameter("client_id"),
+        redirectUri: parameter("redirect_uri"),
+        scope: parameter("scope"),
+        codeChallenge: parameter("code_challenge"),
+        codeChallengeMethod: parameter("code_challenge_method"),
+        resource: parameter("resource"),
         issuer: env.PUBLIC_ORIGIN,
+      };
+      const inspected = await inspectAuthorizationRequest(env.CONTROL_DB, authorizationInput);
+      if (request.method === "GET") {
+        const csrfToken = readCookie(request, "oraja_csrf");
+        if (!csrfToken) throw new ApiError("csrf_required", 403);
+        const fields = Object.fromEntries(
+          ["response_type", "client_id", "redirect_uri", "scope", "code_challenge", "code_challenge_method", "resource", "state"]
+            .map((name) => [name, parameter(name)] as const)
+            .filter((entry): entry is readonly [string, string] => entry[1] !== null),
+        );
+        return new Response(oauthConsentHtml({
+          clientName: inspected.clientName,
+          profileName: profile.display_name,
+          scopes: inspected.scopes,
+          fields,
+          csrfToken,
+        }), {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "content-security-policy": "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            "x-frame-options": "DENY",
+          },
+        });
+      }
+      const sessionToken = readCookie(request, "__Host-oraja_session");
+      if (!sessionToken || !(await verifyCsrf(env.CONTROL_DB, sessionToken, parameter("csrf_token"), Math.floor(Date.now() / 1000)))) {
+        throw new ApiError("csrf_required", 403);
+      }
+      const destination = new URL(inspected.redirectUri);
+      const state = parameter("state");
+      if (state) destination.searchParams.set("state", state);
+      destination.searchParams.set("iss", new URL(env.PUBLIC_ORIGIN).origin);
+      if (parameter("decision") !== "approve") {
+        destination.searchParams.set("error", "access_denied");
+        await appendOAuthAudit(env.CONTROL_DB, {
+          eventType: "oauth.denied", status: "denied", reasonCode: "resource_owner_denied",
+          requestId: requestIdValue, accountId, profileId: profile.id, resource: inspected.resource, clientId: inspected.clientId,
+        });
+        return new Response(null, { status: 302, headers: { location: destination.toString(), "cache-control": "no-store" } });
+      }
+      const code = await issueAuthorizationCode(env.CONTROL_DB, {
+        ...authorizationInput,
+        requestId: requestIdValue,
         accountId,
         profileId: profile.id,
       });
-      const destination = new URL(redirectUri ?? "https://invalid.example.invalid");
       destination.searchParams.set("code", code);
-      destination.searchParams.set("iss", new URL(env.PUBLIC_ORIGIN).origin);
-      const state = url.searchParams.get("state");
-      if (state) destination.searchParams.set("state", state);
       return new Response(null, { status: 302, headers: { location: destination.toString(), "cache-control": "no-store" } });
     }
     if (url.pathname === "/oauth/token" && request.method === "POST") {
       const form = await request.formData();
       const grantType = form.get("grant_type");
+      auditClientId = typeof form.get("client_id") === "string" ? String(form.get("client_id")) : undefined;
+      await enforceOAuthRateLimit(env.CONTROL_DB, "token", `${auditClientId ?? "missing"}:${clientIp(request)}`);
       if (grantType === "authorization_code") {
         return json(await exchangeAuthorizationCode(env.CONTROL_DB, {
           code: form.get("code"),
@@ -345,6 +440,7 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
           codeVerifier: form.get("code_verifier"),
           resource: form.get("resource"),
           issuer: env.PUBLIC_ORIGIN,
+          requestId: requestIdValue,
         }), 200, origin);
       }
       if (grantType === "refresh_token") {
@@ -353,18 +449,30 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
           clientId: form.get("client_id"),
           resource: form.get("resource"),
           issuer: env.PUBLIC_ORIGIN,
+          requestId: requestIdValue,
         }), 200, origin);
       }
       throw new ApiError("unsupported_grant_type", 400);
     }
     if (url.pathname === "/oauth/revoke" && request.method === "POST") {
       const form = await request.formData();
-      await revokeOAuthToken(env.CONTROL_DB, { token: form.get("token"), clientId: form.get("client_id") });
+      auditClientId = typeof form.get("client_id") === "string" ? String(form.get("client_id")) : undefined;
+      await enforceOAuthRateLimit(env.CONTROL_DB, "revoke", `${auditClientId ?? "missing"}:${clientIp(request)}`);
+      await revokeOAuthToken(env.CONTROL_DB, { token: form.get("token"), clientId: form.get("client_id"), requestId: requestIdValue });
       return new Response(null, { status: 200, headers: { "cache-control": "no-store" } });
     }
     throw new ApiError("method_not_allowed", 405);
   } catch (error) {
-    return apiFailure(error, origin);
+    if (url.pathname.startsWith("/oauth/")) {
+      await appendOAuthAudit(env.CONTROL_DB, {
+        eventType: `oauth.${url.pathname.slice("/oauth/".length)}_denied`,
+        status: "denied",
+        reasonCode: error instanceof ApiError ? error.code : "internal_error",
+        requestId: requestIdValue,
+        clientId: auditClientId,
+      }).catch(() => undefined);
+    }
+    return oauthFailure(error, origin);
   }
 }
 

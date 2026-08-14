@@ -746,6 +746,26 @@ export async function revokeAllSessions(
     .run();
 }
 
+async function revokeOAuthGrantsForAccount(db: D1Database, accountId: string, reason: string, now: number): Promise<void> {
+  await db.batch([
+    db.prepare(
+      `UPDATE oauth_grants
+          SET revoked_at = COALESCE(revoked_at, ?1), revoke_reason = COALESCE(revoke_reason, ?2)
+        WHERE account_id = ?3 AND revoked_at IS NULL`,
+    ).bind(now, reason, accountId),
+    db.prepare(
+      `UPDATE oauth_tokens
+          SET revoked_at = COALESCE(revoked_at, ?1)
+        WHERE account_id = ?2 AND revoked_at IS NULL`,
+    ).bind(now, accountId),
+    db.prepare(
+      `UPDATE oauth_authorization_codes
+          SET used_at = COALESCE(used_at, ?1)
+        WHERE account_id = ?2 AND used_at IS NULL`,
+    ).bind(now, accountId),
+  ]);
+}
+
 export async function rotateSession(
   db: D1Database,
   sessionToken: string,
@@ -831,6 +851,7 @@ export async function useRecoveryCode(
     .run();
   if (changes(consumed) !== 1) throw publicError("invalid_recovery_code", 401);
   await revokeAllSessions(db, account.id, options);
+  await revokeOAuthGrantsForAccount(db, account.id, "account_recovery", now);
   const session = await createSession(db, account.id, now);
   await db
     .prepare(
@@ -1099,6 +1120,7 @@ export async function completePasswordReset(
       .bind(now, token.account_id),
   ]);
   if (changes(resetState[0] ?? {}) !== 1) throw publicError("invalid_reset_token", 400);
+  await revokeOAuthGrantsForAccount(db, token.account_id, "password_reset", now);
   const session = await createSession(db, token.account_id, now);
   await db.batch([
     db.prepare(
@@ -1118,5 +1140,53 @@ export async function completePasswordReset(
     sessionToken: session.sessionToken,
     csrfToken: session.csrfToken,
     expiresAt: session.expiresAt,
+  };
+}
+
+export async function changePassword(
+  db: D1Database,
+  sessionToken: string,
+  currentPasswordInput: unknown,
+  newPasswordInput: unknown,
+  options: AuthOptions = {},
+): Promise<LoginResult> {
+  const now = nowSeconds(options);
+  const session = await requireActiveSession(db, sessionToken, now);
+  const currentPassword = validatePassword(currentPasswordInput);
+  const newPassword = validatePassword(newPasswordInput);
+  await enforceRateLimit(db, "account", session.account_id, now, options.hashingSecret);
+  const credential = await db.prepare(
+    "SELECT password_hash FROM credentials WHERE account_id = ?1 AND revoked_at IS NULL",
+  ).bind(session.account_id).first<{ password_hash: string }>();
+  if (!credential || !(await verifyPassword(currentPassword, credential.password_hash))) {
+    await recordFailure(db, "account", session.account_id, now, options.hashingSecret);
+    throw publicError("invalid_credentials", 401);
+  }
+  const passwordHash = await hashPassword(newPassword);
+  const updated = await db.prepare(
+    `UPDATE credentials
+        SET password_hash = ?1, password_params_version = ?2,
+            password_rehash_required = 0, updated_at = ?3
+      WHERE account_id = ?4 AND revoked_at IS NULL`,
+  ).bind(passwordHash, AUTH_POLICY.passwordParamsVersion, now, session.account_id).run();
+  if (changes(updated) !== 1) throw publicError("invalid_credentials", 401);
+  await revokeAllSessions(db, session.account_id, options);
+  await revokeOAuthGrantsForAccount(db, session.account_id, "password_change", now);
+  const replacement = await createSession(db, session.account_id, now);
+  await db.prepare(
+    `INSERT INTO audit_events(
+       id, account_id, profile_id, actor_kind, event_type, reason_code,
+       request_id, resource_hash, input_hash, status, occurred_at
+     ) VALUES (?1, ?2, NULL, 'account', 'password_changed', 'current_password', ?3, NULL, NULL, 'success', ?4)`,
+  ).bind(randomId(), session.account_id, options.requestId ?? null, now).run();
+  await clearFailure(db, "account", session.account_id, options.hashingSecret);
+  const account = await db.prepare("SELECT public_id FROM accounts WHERE id = ?1")
+    .bind(session.account_id).first<{ public_id: string }>();
+  if (!account) throw publicError("unauthorized", 401);
+  return {
+    accountPublicId: account.public_id,
+    sessionToken: replacement.sessionToken,
+    csrfToken: replacement.csrfToken,
+    expiresAt: replacement.expiresAt,
   };
 }
