@@ -9,11 +9,8 @@
     "contract",
     "schema_version",
     "manifest_id",
-    "account_id",
-    "profile_id",
     "created_at",
     "game_mode",
-    "trust_domain",
     "files",
     "snapshot",
     "privacy"
@@ -22,11 +19,8 @@
     "contract": { "const": "five-db-upload-manifest" },
     "schema_version": { "const": "1" },
     "manifest_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
-    "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
-    "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "created_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
     "game_mode": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/gameMode" },
-    "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
     "files": {
       "type": "array",
       "minItems": 5,
@@ -50,7 +44,7 @@
           "size_bytes": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 5368709120
+            "maximum": 2147483648
           },
           "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" }
         }
@@ -75,11 +69,10 @@
     "privacy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["contains_bms", "contains_replay", "aggregate_eligible"],
+      "required": ["contains_bms", "contains_replay"],
       "properties": {
         "contains_bms": { "const": false },
-        "contains_replay": { "const": false },
-        "aggregate_eligible": { "const": false }
+        "contains_replay": { "const": false }
       }
     }
   },

@@ -217,6 +217,7 @@ export interface UploadSessionStore {
   putProfileEnvelope(profileScope: string, envelope: ProfileEnvelopeRecord): Promise<ProfileEnvelopeRecord>;
   findDedup(profileScope: string, sha256: string, sizeBytes: number): Promise<StoredFileRef | null>;
   putDedup(ref: StoredFileRef): Promise<StoredFileRef>;
+  removeDedup(ref: StoredFileRef): Promise<void>;
   listExpired(now: number): Promise<UploadSessionRecord[]>;
 }
 
@@ -929,6 +930,12 @@ export class MemoryUploadSessionStore implements UploadSessionStore {
     return { ...ref };
   }
 
+  async removeDedup(ref: StoredFileRef): Promise<void> {
+    const key = `${ref.profileScope}:${ref.sha256}:${ref.sizeBytes}`;
+    const existing = this.dedup.get(key);
+    if (existing?.objectKey === ref.objectKey) this.dedup.delete(key);
+  }
+
   async listExpired(now: number): Promise<UploadSessionRecord[]> {
     return [...this.sessions.values()]
       .filter((session) => session.state === "active" && session.expiresAt <= now)
@@ -1198,6 +1205,7 @@ export class UploadService {
     }
     ensureActive(session, Math.floor(this.nowProvider()));
     const ownedObjects: string[] = [];
+    const ownedRefs: StoredFileRef[] = [];
     try {
       for (const file of session.files) {
         if (file.state === "deduplicated" || file.state === "completed") continue;
@@ -1216,6 +1224,7 @@ export class UploadService {
           objectKey: file.objectKey,
           keyVersion: file.encryption.keyVersion,
         });
+        if (ref.objectKey === file.objectKey) ownedRefs.push(ref);
         if (ref.objectKey !== file.objectKey) await this.bucket.delete(file.objectKey);
         await this.store.markFileCompleted(scope, uploadId, file.fileName, ref);
       }
@@ -1227,6 +1236,7 @@ export class UploadService {
       await this.store.markCompleted(scope, uploadId, completedAt);
       return { state: "completed", unchanged: refreshed.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256 };
     } catch (error) {
+      await Promise.all(ownedRefs.map((ref) => this.store.removeDedup(ref).catch(() => undefined)));
       await this.cleanupSessionObjects(scope, session, ownedObjects);
       await this.store.markAborted(scope, uploadId, "aborted").catch(() => undefined);
       if (error instanceof UploadProtocolError) throw error;
