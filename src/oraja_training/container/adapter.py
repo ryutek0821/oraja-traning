@@ -553,8 +553,7 @@ class ContainerAdapter:
             input_manifest = validate_input_manifest(manifest)
         except ManifestError as exc:
             raise ContainerError(str(exc), code=exc.code, status=422) from exc
-        if _entrypoint is not None and input_manifest.job_type != _entrypoint:
-            raise ContainerError("job type does not match entry point", code="invalid_contract", status=422)
+        entrypoint = _entrypoint or "five_db_backfill"
         if upload_manifest is not None:
             try:
                 accepted_upload = validate_upload_manifest(upload_manifest)
@@ -612,7 +611,7 @@ class ContainerAdapter:
                 readiness=readiness,
                 recommendation_input=recommendation_input,
                 recommendation_repository=recommendation_repository,
-                entrypoint=input_manifest.job_type,
+                entrypoint=entrypoint,
                 token=token,
                 started=started,
             )
@@ -645,7 +644,10 @@ class ContainerAdapter:
                 input_manifest_sha256=manifest_sha256(input_manifest.as_dict()),
                 output_revision=revision,
                 generated_at=generated_at,
-                counters=counters,
+                counters={
+                    "accepted_events": counters["accepted_events"],
+                    "rejected_events": counters["rejected_events"],
+                },
                 artifacts=[artifact.as_manifest() for artifact in artifact_records],
             )
             validate_output_manifest(output, input_manifest=input_manifest)

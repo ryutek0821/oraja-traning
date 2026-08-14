@@ -28,9 +28,6 @@ OBJECT_KEY = re.compile(
 KEY_REF = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 
-JOB_TYPES = frozenset(
-    {"five_db_backfill", "monthly_audit", "single_play_incremental"}
-)
 DATABASE_NAMES = (
     "score.db",
     "scoredatalog.db",
@@ -44,8 +41,6 @@ INPUT_KEYS = frozenset(
         "schema_version",
         "job_id",
         "idempotency_key",
-        "job_type",
-        "input_digest",
         "account_id",
         "profile_id",
         "trust_domain",
@@ -62,12 +57,10 @@ OUTPUT_KEYS = frozenset(
         "schema_version",
         "job_id",
         "idempotency_key",
-        "job_type",
-        "input_digest",
         "account_id",
         "profile_id",
         "trust_domain",
-        "aggregate_eligible",
+        "eligibility_status",
         "input_manifest_sha256",
         "output_revision",
         "generated_at",
@@ -107,10 +100,6 @@ class InputManifest(Mapping[str, Any]):
         return str(self.value["job_id"])
 
     @property
-    def job_type(self) -> str:
-        return str(self.value["job_type"])
-
-    @property
     def profile_id(self) -> str:
         return str(self.value["profile_id"])
 
@@ -123,16 +112,12 @@ class InputManifest(Mapping[str, Any]):
         return str(self.value["trust_domain"])
 
     @property
-    def input_digest(self) -> str:
-        return str(self.value["input_digest"])
-
-    @property
     def input_bundle(self) -> Mapping[str, Any]:
         return self.value["input_bundle"]
 
     @property
-    def aggregate_eligible(self) -> bool:
-        return bool(self.value["policy"]["aggregate_eligible"])
+    def eligibility_status(self) -> str:
+        return str(self.value["policy"]["eligibility_status"])
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible copy suitable for persistence."""
@@ -250,9 +235,21 @@ def _sha(value: Any, name: str) -> str:
     return _string(value, name, pattern=SHA256)
 
 
-def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ManifestError(f"{name} must be an integer >= {minimum}")
+def _integer(
+    value: Any,
+    name: str,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        bounds = f">= {minimum}" if maximum is None else f"between {minimum} and {maximum}"
+        raise ManifestError(f"{name} must be an integer {bounds}")
     return value
 
 
@@ -290,16 +287,9 @@ def validate_input_manifest(value: Mapping[str, Any]) -> InputManifest:
     job_id = _uuid(manifest["job_id"], "job_id")
     profile_id = _uuid(manifest["profile_id"], "profile_id")
     _uuid(manifest["account_id"], "account_id")
-    input_digest = _sha(manifest["input_digest"], "input_digest")
-    idempotency_key = _string(manifest["idempotency_key"], "idempotency_key", pattern=IDEMPOTENCY_KEY)
-    expected_key = f"job:{profile_id}:{input_digest}"
-    if idempotency_key != expected_key:
-        raise ManifestError("idempotency_key is not bound to profile and input_digest")
-    job_type = _string(manifest["job_type"], "job_type")
-    if job_type not in JOB_TYPES:
-        raise ManifestError("unsupported container job type", code="unsupported_job_type")
+    _string(manifest["idempotency_key"], "idempotency_key", pattern=IDEMPOTENCY_KEY)
     trust_domain = manifest["trust_domain"]
-    if trust_domain not in {"official", "self_hosted"}:
+    if trust_domain != "official":
         raise ManifestError("trust_domain is invalid")
     _sha(manifest["source_manifest_sha256"], "source_manifest_sha256")
     _timestamp(manifest["requested_at"], "requested_at")
@@ -321,13 +311,26 @@ def validate_input_manifest(value: Mapping[str, Any]) -> InputManifest:
         raise ManifestError("input key reference crosses the profile partition")
 
     policy = _object(manifest["policy"], "policy")
-    _exact_keys(policy, {"aggregate_eligible", "include_raw_db_in_model"}, "policy")
-    if not isinstance(policy["aggregate_eligible"], bool):
-        raise ManifestError("policy.aggregate_eligible must be boolean")
+    _exact_keys(
+        policy,
+        {
+            "eligibility_status",
+            "eligibility_reason_code",
+            "eligibility_policy_version",
+            "include_raw_db_in_model",
+        },
+        "policy",
+    )
+    if policy["eligibility_status"] not in {"pending", "eligible", "ineligible", "revoked"}:
+        raise ManifestError("policy.eligibility_status is invalid")
+    reason = policy["eligibility_reason_code"]
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 64):
+        raise ManifestError("policy.eligibility_reason_code is invalid")
+    version = policy["eligibility_policy_version"]
+    if not isinstance(version, str) or not 1 <= len(version) <= 32:
+        raise ManifestError("policy.eligibility_policy_version is invalid")
     if policy["include_raw_db_in_model"] is not False:
         raise ManifestError("raw databases cannot be passed directly to the model")
-    if trust_domain == "self_hosted" and policy["aggregate_eligible"] is not False:
-        raise ManifestError("self-hosted input cannot be aggregate eligible")
 
     # Keep this field in the error path so an invalid UUID cannot be used as
     # an object partition even when this function is called outside Worker.
@@ -410,11 +413,11 @@ def build_output_manifest(
     source = input_manifest.value if isinstance(input_manifest, InputManifest) else input_manifest
     validated = validate_input_manifest(source)
     _sha(input_manifest_sha256, "input_manifest_sha256")
-    _integer(output_revision, "output_revision", minimum=1)
+    _integer(output_revision, "output_revision", minimum=1, maximum=2**63 - 1)
     _timestamp(generated_at, "generated_at")
-    _exact_keys(counters, {"accepted_events", "rejected_events", "course_events"}, "counters")
+    _exact_keys(counters, {"accepted_events", "rejected_events"}, "counters")
     normalized_counters: dict[str, int] = {}
-    for key in ("accepted_events", "rejected_events", "course_events"):
+    for key in ("accepted_events", "rejected_events"):
         normalized_counters[key] = _integer(counters[key], f"counters.{key}")
     if not artifacts:
         raise ManifestError("output must contain at least one artifact")
@@ -431,24 +434,19 @@ def build_output_manifest(
         if artifact["content_type"] not in {"application/json", "application/zstd"}:
             raise ManifestError("output artifact content type is not allowed")
         normalized_artifacts.append(dict(artifact))
-    aggregate_eligible = validated.aggregate_eligible
-    if validated.trust_domain == "self_hosted":
-        aggregate_eligible = False
     result = {
         "contract": "container-output-manifest",
         "schema_version": "1",
         "job_id": validated.job_id,
         "idempotency_key": validated["idempotency_key"],
-        "job_type": validated.job_type,
-        "input_digest": validated.input_digest,
         "account_id": validated.account_id,
         "profile_id": validated.profile_id,
         "trust_domain": validated.trust_domain,
-        "aggregate_eligible": aggregate_eligible,
+        "eligibility_status": validated.eligibility_status,
         "input_manifest_sha256": input_manifest_sha256,
         "output_revision": output_revision,
         "generated_at": generated_at,
-        "normalization": {"version": "normalization-v1", "event_contract": "ir-event.v1"},
+        "normalization": {"version": "normalization-v1", "event_contract": "play-event.v1"},
         "counters": normalized_counters,
         "artifacts": normalized_artifacts,
         "raw_db_exported": False,
@@ -468,25 +466,26 @@ def validate_output_manifest(
         raise ManifestError("unsupported container output contract")
     _uuid(manifest["job_id"], "job_id")
     _string(manifest["idempotency_key"], "idempotency_key", pattern=IDEMPOTENCY_KEY)
-    _string(manifest["job_type"], "job_type")
-    _sha(manifest["input_digest"], "input_digest")
     _uuid(manifest["account_id"], "account_id")
     profile_id = _uuid(manifest["profile_id"], "profile_id")
     _sha(manifest["input_manifest_sha256"], "input_manifest_sha256")
-    _integer(manifest["output_revision"], "output_revision", minimum=1)
+    _integer(
+        manifest["output_revision"],
+        "output_revision",
+        minimum=1,
+        maximum=2**63 - 1,
+    )
     _timestamp(manifest["generated_at"], "generated_at")
-    if manifest["trust_domain"] not in {"official", "self_hosted"}:
+    if manifest["trust_domain"] != "official":
         raise ManifestError("output trust_domain is invalid")
-    if not isinstance(manifest["aggregate_eligible"], bool):
-        raise ManifestError("output aggregate_eligible must be boolean")
-    if manifest["trust_domain"] == "self_hosted" and manifest["aggregate_eligible"] is not False:
-        raise ManifestError("self-hosted output cannot be aggregate eligible")
+    if manifest["eligibility_status"] not in {"pending", "eligible", "ineligible", "revoked"}:
+        raise ManifestError("output eligibility_status is invalid")
     normalization = _object(manifest["normalization"], "normalization")
     _exact_keys(normalization, {"version", "event_contract"}, "normalization")
-    if normalization != {"version": "normalization-v1", "event_contract": "ir-event.v1"}:
+    if normalization != {"version": "normalization-v1", "event_contract": "play-event.v1"}:
         raise ManifestError("unsupported normalization contract")
     counters = _object(manifest["counters"], "counters")
-    _exact_keys(counters, {"accepted_events", "rejected_events", "course_events"}, "counters")
+    _exact_keys(counters, {"accepted_events", "rejected_events"}, "counters")
     for key, item in counters.items():
         _integer(item, f"counters.{key}")
     artifacts = manifest["artifacts"]
@@ -506,9 +505,9 @@ def validate_output_manifest(
     if manifest["raw_db_exported"] is not False:
         raise ManifestError("raw database export is forbidden")
     if input_manifest is not None:
-        for key in ("job_id", "idempotency_key", "job_type", "input_digest", "account_id", "profile_id", "trust_domain"):
+        for key in ("job_id", "idempotency_key", "account_id", "profile_id", "trust_domain"):
             if manifest[key] != input_manifest[key]:
                 raise ManifestError(f"output {key} does not match input manifest")
-        if manifest["idempotency_key"] != f"job:{profile_id}:{manifest['input_digest']}":
-            raise ManifestError("output idempotency key is not bound to input digest")
+        if manifest["eligibility_status"] != input_manifest.eligibility_status:
+            raise ManifestError("output eligibility_status does not match input manifest")
     return dict(manifest)
