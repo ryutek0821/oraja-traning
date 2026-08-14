@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -335,6 +335,20 @@ CREATE INDEX idx_experiment_targets_resolution
 """
 
 
+SCHEMA_V6 = """
+CREATE TABLE chart_pattern_features (
+  sha256          TEXT PRIMARY KEY,
+  rhythm_family   INTEGER,
+  avg_chord       REAL,
+  chord_ge3       REAL,
+  micro_rate      REAL,
+  long_jack_rate  REAL,
+  practice_low    INTEGER,
+  analysis_version INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -397,7 +411,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     if current == 0:
         try:
             conn.executescript(
-                "BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
+                "BEGIN IMMEDIATE;\n"
+                + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
             )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
@@ -410,7 +425,9 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 2:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -420,7 +437,7 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 3:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -430,7 +447,17 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 4:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V5)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 5:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V6)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -672,6 +699,33 @@ def upsert_charts(
           updated_at = excluded.updated_at
         """,
         charts,
+    )
+
+
+def upsert_chart_pattern_features(
+    conn: sqlite3.Connection, features: Iterable[Mapping[str, Any]]
+) -> None:
+    """Copy optional oraja-constellator analysis into the assistant store."""
+
+    conn.executemany(
+        """
+        INSERT INTO chart_pattern_features(
+          sha256, rhythm_family, avg_chord, chord_ge3, micro_rate,
+          long_jack_rate, practice_low, analysis_version
+        ) VALUES (
+          :sha256, :rhythm_family, :avg_chord, :chord_ge3, :micro_rate,
+          :long_jack_rate, :practice_low, :analysis_version
+        )
+        ON CONFLICT(sha256) DO UPDATE SET
+          rhythm_family=excluded.rhythm_family,
+          avg_chord=excluded.avg_chord,
+          chord_ge3=excluded.chord_ge3,
+          micro_rate=excluded.micro_rate,
+          long_jack_rate=excluded.long_jack_rate,
+          practice_low=excluded.practice_low,
+          analysis_version=excluded.analysis_version
+        """,
+        features,
     )
 
 

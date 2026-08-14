@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from email.message import Message
 import json
+import sqlite3
 from urllib.error import HTTPError
 
 import pytest
 
-from oraja_training.tables.fetch import TableFetchError, fetch_table
+from oraja_training import cli
+from oraja_training.cli import DEFAULT_TABLES
+from oraja_training.db import store
+from oraja_training.tables.fetch import (
+    TableData,
+    TableEntry,
+    TableFetchError,
+    fetch_table,
+)
 from oraja_training.tables.match import resolve
 
 
@@ -27,6 +36,37 @@ class Response:
 
     def __exit__(self, *args):
         return None
+
+
+def test_default_sources_cover_four_independent_difficulty_tables():
+    assert dict(DEFAULT_TABLES) == {
+        "genocide": (
+            "https://miraiscarlet.github.io/bms/table/"
+            "genocide_insane/insane_bms.html"
+        ),
+        "overjoy": "https://lr2.sakura.ne.jp/data/header.json",
+        "satellite": "https://stellabms.xyz/sl/table.html",
+        "stella": "https://stellabms.xyz/st/table.html",
+    }
+
+
+def test_https_header_upgrades_same_host_http_data_url():
+    calls = []
+
+    def opener(request, timeout):
+        calls.append(request.full_url)
+        if request.full_url.endswith("header.json"):
+            return Response(
+                {"data_url": "http://example.test/data.json"}
+            )
+        return Response([{"level": 1, "sha256": "f" * 64}])
+
+    table = fetch_table(
+        "one", "https://example.test/header.json", opener=opener
+    )
+
+    assert calls[-1] == "https://example.test/data.json"
+    assert table.data_url == "https://example.test/data.json"
 
 
 def test_fetches_html_meta_and_resolves_relative_urls(tmp_path):
@@ -122,6 +162,48 @@ def test_last_good_cache_is_used_when_refresh_fails(tmp_path):
     assert stale.entries[0].sha256 == sha
 
 
+def test_stale_table_cache_is_persisted_as_a_visible_warning(
+    tmp_path, monkeypatch
+):
+    assistant = tmp_path / "assistant.db"
+    sha = "d" * 64
+    conn = store.init(assistant)
+    with conn:
+        conn.execute(
+            "INSERT INTO charts VALUES (?, NULL, 'Chart', 'Artist', 1000, 7, NULL, 1)",
+            (sha,),
+        )
+    conn.close()
+    table = TableData(
+        table_id="satellite",
+        source_url="https://example.test/table.html",
+        header_url="https://example.test/header.json",
+        data_url="https://example.test/data.json",
+        header={"data_url": "data.json"},
+        entries=(TableEntry("satellite", "sl1", sha, None, "Chart", {}),),
+        fetched_at=123,
+        from_cache=True,
+        stale=True,
+    )
+    monkeypatch.setattr(cli, "fetch_table", lambda *args, **kwargs: table)
+
+    result = cli._refresh_tables(
+        assistant,
+        tmp_path / "cache",
+        (("satellite", "https://example.test/table.html"),),
+    )
+
+    conn = sqlite3.connect(assistant)
+    try:
+        error = conn.execute(
+            "SELECT last_error FROM table_sources WHERE table_id='satellite'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert result["tables"][0]["stale"] is True
+    assert error == "stale cache used after refresh failure"
+
+
 def test_match_prefers_sha_then_falls_back_to_md5_and_separates_tables():
     sha_a, sha_b = "a" * 64, "b" * 64
     md5_a, md5_b = "1" * 32, "2" * 32
@@ -147,6 +229,26 @@ def test_match_prefers_sha_then_falls_back_to_md5_and_separates_tables():
     assert report.for_table("genocide").match_rate == 1.0
     assert report.for_table("satellite").match_rate == 0.5
     assert report.unmatched_entries[0].reason == "not_owned"
+
+
+def test_match_preserves_one_chart_in_all_four_tables():
+    sha = "e" * 64
+    entries = [
+        {"table_id": table_id, "level": level, "sha256": sha}
+        for table_id, level in (
+            ("genocide", "★4"),
+            ("overjoy", "★★1"),
+            ("satellite", "sl3"),
+            ("stella", "st0"),
+        )
+    ]
+
+    report = resolve(entries, [{"sha256": sha, "md5": None}])
+
+    assert report.matched == 4
+    assert {match.entry.table_id for match in report.matches} == {
+        "genocide", "overjoy", "satellite", "stella",
+    }
 
 
 def test_ambiguous_md5_is_not_guessed():

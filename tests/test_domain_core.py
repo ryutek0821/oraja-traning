@@ -21,6 +21,8 @@ def test_prediction_is_storage_independent() -> None:
         weights=(0.0, 1.0, 0.0, 0.0),
         means=(0.0, 0.0, 0.0),
         scales=(1.0, 1.0, 1.0),
-        feature_names=("level", "density_p99", "scratch_rate"),
+        feature_names=(
+            "table_completion_margin", "density_p99", "scratch_rate"
+        ),
     )
     assert predict_snapshot(snapshot, 1.0, 0.0, 0.0) > 0.5

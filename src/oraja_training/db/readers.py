@@ -64,6 +64,11 @@ class InfoRow(DynamicRow):
 
 
 @dataclass(frozen=True, slots=True)
+class ChartPatternRow(DynamicRow):
+    """Optional analysis row produced by oraja-constellator."""
+
+
+@dataclass(frozen=True, slots=True)
 class ScoreLogRow(DynamicRow):
     """One schema-version-tolerant row from ``scorelog``."""
 
@@ -323,6 +328,25 @@ def read_songinfo(
         conn,
         "information",
         InfoRow,
+        sha256s,
+        {"sha256"},
+    )
+
+
+def read_chart_patterns(
+    conn: sqlite3.Connection, sha256s: Iterable[str] | None = None
+) -> list[ChartPatternRow]:
+    """Read optional high-resolution pattern analysis without requiring it."""
+
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bmscf_chart_analysis'"
+    ).fetchone()
+    if exists is None:
+        return []
+    return _read_by_hashes(
+        conn,
+        "bmscf_chart_analysis",
+        ChartPatternRow,
         sha256s,
         {"sha256"},
     )

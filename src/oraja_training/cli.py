@@ -30,8 +30,13 @@ from oraja_training.tables import fetch_table, resolve
 
 
 DEFAULT_TABLES = (
+    (
+        "genocide",
+        "https://miraiscarlet.github.io/bms/table/genocide_insane/insane_bms.html",
+    ),
+    ("overjoy", "https://lr2.sakura.ne.jp/data/header.json"),
     ("satellite", "https://stellabms.xyz/sl/table.html"),
-    ("genocide", "https://nekokan.dyndns.info/~lobsak/genocide/"),
+    ("stella", "https://stellabms.xyz/st/table.html"),
 )
 
 
@@ -88,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     refresh.add_argument("--cache-dir", type=Path, default=Path(".cache/tables"))
     refresh.add_argument(
         "--table", action="append", default=[], metavar="ID=URL",
-        help="source table page/header; defaults to Satellite and GENOCIDE",
+        help="source table page/header; defaults to GENOCIDE, Overjoy, Satellite and Stella",
     )
 
     features = subcommands.add_parser("features", help="songinfo feature operations")
@@ -213,13 +218,20 @@ def _refresh_tables(
                         """
                         INSERT INTO table_sources(
                           table_id, page_url, header_url, data_url, fetched_at, last_error
-                        ) VALUES (?, ?, ?, ?, ?, NULL)
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT(table_id) DO UPDATE SET
                           page_url=excluded.page_url, header_url=excluded.header_url,
                           data_url=excluded.data_url, fetched_at=excluded.fetched_at,
-                          last_error=NULL
+                          last_error=excluded.last_error
                         """,
-                        (table_id, url, table.header_url, table.data_url, table.fetched_at),
+                        (
+                            table_id,
+                            url,
+                            table.header_url,
+                            table.data_url,
+                            table.fetched_at,
+                            "stale cache used after refresh failure" if table.stale else None,
+                        ),
                     )
                 summary = report.for_table(table_id)
                 summaries.append(
@@ -383,6 +395,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "seed": session.seed,
                         "model_status": session.model_status,
                         "model_version": session.model_version,
+                        "table_warnings": list(session.table_warnings),
+                        "warmup_adjustment": session.warmup_adjustment,
                         "queue_items": len(session.queue),
                         "personal_charts": len(session.personal),
                         "core_expected_judged": session.core_expected_judged,
@@ -426,6 +440,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "menu_date": session.menu_date,
                     "seed": session.seed,
+                    "table_warnings": list(session.table_warnings),
+                    "warmup_adjustment": session.warmup_adjustment,
                     "queue_items": len(session.queue),
                     "personal_charts": len(session.personal),
                     "core_expected_judged": session.core_expected_judged,

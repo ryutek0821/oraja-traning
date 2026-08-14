@@ -33,17 +33,15 @@ oraja-training initialize \
 
 ```console
 oraja-training tables refresh \
-  --assistant-db ./assistant.db \
-  --table satellite=https://stellabms.xyz/sl/table.html \
-  --table genocide=https://your-current-genocide-table.example/table.html
+  --assistant-db ./assistant.db
 ```
 
 取得結果はETag/Last-Modified付きで`.cache/tables/`へ保存され、通信失敗時は最後の正常な
-キャッシュを使います。GENOCIDEの公開URLは移転することがあるため、beatorajaで現在
-使用している表URLを指定してください。
+キャッシュを使います。既定ではGENOCIDE（発狂難易度表）、Overjoy、Satellite、Stellaの
+4表を取得し、各表の尺度を混ぜずにクリアランプから適正帯を推定します。
 
 schema version 1の既存`assistant.db`は正しい値へ復元できないため、in-place移行しません。
-version 2は履歴を保持してversion 3へ移行します。現行schema versionは3です。
+version 2以降は履歴を保持して段階的に移行します。現行schema versionは6です。
 
 ## 毎日の更新
 
@@ -65,6 +63,22 @@ oraja-training daily-update \
 日次更新のたびに完走確率モデルも再評価します。200結果・10日へ達するまではcold-start、
 到達後も時間順holdoutと日単位bootstrapの改善ゲートを通った版だけを推薦へ使用します。
 これは普段の設定下での観測完走確率であり、開始ゲージ別のクリア確率ではありません。
+
+### ウォームアップ選定
+
+BMS固有の対照研究は見当たらないため、一般的なウォームアップ研究と鍵盤演奏の疲労研究を
+プレーデータへ保守的に当てはめます。短時間で段階的に強度を上げるというレビュー知見と、
+反復鍵盤動作による前腕疲労が打鍵精度を下げるという実験結果を根拠にしています
+（[McGowan et al., 2018](https://pubmed.ncbi.nlm.nih.gov/29968230/)、
+[Goubault et al., 2021](https://pmc.ncbi.nlm.nih.gov/articles/PMC8047012/)、
+[Drinkwater et al., 2010](https://pubmed.ncbi.nlm.nih.gov/20795334/)）。
+
+- 発狂・Overjoy・Satellite・Stellaを別尺度のまま扱い、各表のHARDクリア前線を推定
+- HARD/EXHARD、または直近30日で2回以上完走かつBP 5%以下の譜面だけを採用
+- 前線の2段階下から前線までを4曲以内で並べ、目標は更新ではなく`COMFORT`
+- 終盤密度、瞬間発狂、皿、LN、ソフラン/停止、微縦連、長いジャック、同時押し、曲長の
+  極端値を除外
+- 疲労日や前回ウォームアップ不調時は帯を1段階下げ、条件を満たす曲がなければ空欄と警告
 
 実打鍵は`player`テーブルのPGREAT～POORの10判定列の累積差分です。空POORは含めません。
 日替わり本編は期待判定10万以上、失敗時の補填として約1万のRESERVEを追加します。

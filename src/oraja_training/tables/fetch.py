@@ -11,7 +11,7 @@ import re
 import time
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen as _urlopen
 
 
@@ -129,6 +129,20 @@ def _header_url_from_html(body: bytes, source_url: str) -> str:
     if parser.header_url is None:
         raise TableFetchError(f"no bmstable meta tag found at {source_url}")
     return urljoin(source_url, parser.header_url)
+
+
+def _secure_same_host_url(base_url: str, resolved_url: str) -> str:
+    """Avoid mixed-content HTTP when an HTTPS table points at the same host."""
+
+    base = urlsplit(base_url)
+    resolved = urlsplit(resolved_url)
+    if (
+        base.scheme == "https"
+        and resolved.scheme == "http"
+        and base.hostname == resolved.hostname
+    ):
+        return urlunsplit(resolved._replace(scheme="https"))
+    return resolved_url
 
 
 def _validate_header(value: Any, url: str) -> dict[str, Any]:
@@ -297,7 +311,10 @@ def fetch_table(
                     resolved_header_url,
                 )
 
-        data_url = urljoin(resolved_header_url, str(header["data_url"]).strip())
+        data_url = _secure_same_host_url(
+            resolved_header_url,
+            urljoin(resolved_header_url, str(header["data_url"]).strip()),
+        )
         old_data_url = str((cache or {}).get("data_url", ""))
         data_response = _request(
             data_url,
