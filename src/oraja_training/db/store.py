@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 import sqlite3
+import json
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -234,6 +235,38 @@ CREATE TABLE recommendation_versions (
 """
 
 
+SCHEMA_V4 = """
+CREATE TABLE replay_metadata (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  path                   TEXT NOT NULL,
+  content_hash           TEXT NOT NULL,
+  previous_content_hash  TEXT,
+  observed_at            INTEGER NOT NULL,
+  mtime_ns               INTEGER NOT NULL,
+  compressed_size        INTEGER NOT NULL,
+  sha256                 TEXT NOT NULL,
+  mode                   INTEGER NOT NULL,
+  played_at              INTEGER NOT NULL,
+  gauge                  INTEGER NOT NULL,
+  selected_gauge_kind    TEXT NOT NULL,
+  randomoption           INTEGER,
+  randomoptionseed       INTEGER,
+  randomoption2          INTEGER,
+  randomoption2seed      INTEGER,
+  doubleoption           INTEGER,
+  seven_to_nine_pattern  INTEGER,
+  lane_shuffle_json      TEXT,
+  rand_json              TEXT,
+  match_status           TEXT NOT NULL,
+  matched_play_id        INTEGER REFERENCES plays(id),
+  UNIQUE(path, content_hash),
+  CHECK(match_status IN ('matched', 'unmatched', 'ambiguous'))
+);
+CREATE INDEX idx_replay_metadata_play
+  ON replay_metadata(sha256, mode, played_at);
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -295,7 +328,7 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 0:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4)
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
             )
@@ -307,7 +340,17 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 2:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 3:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -316,6 +359,91 @@ def migrate(conn: sqlite3.Connection) -> None:
         return
 
     raise RuntimeError(f"unsupported assistant DB schema_version {current}")
+
+
+def ingest_replay_metadata(
+    conn: sqlite3.Connection, metadata: Any, *, observed_at: int
+) -> tuple[str, bool, bool]:
+    """Persist a new slot version and update only an exactly matched play.
+
+    Returns ``(status, overwritten, changed)``. Re-observing identical slot
+    content is idempotent, except that an unmatched row may be reconciled after
+    its score event arrives.
+    """
+
+    path = str(metadata.path)
+    existing = conn.execute(
+        "SELECT id, match_status FROM replay_metadata WHERE path = ? AND content_hash = ?",
+        (path, metadata.content_hash),
+    ).fetchone()
+    matches = conn.execute(
+        """
+        SELECT id FROM plays
+        WHERE sha256 = ? AND mode = ? AND played_at = ? AND is_course = 0
+        ORDER BY id
+        LIMIT 2
+        """,
+        (metadata.sha256, metadata.mode, metadata.played_at),
+    ).fetchall()
+    if existing is not None:
+        previous_status = str(existing[1])
+        if previous_status != "matched" and len(matches) == 1:
+            matched_play_id = int(matches[0][0])
+            conn.execute(
+                "UPDATE replay_metadata SET match_status = 'matched', matched_play_id = ? WHERE id = ?",
+                (matched_play_id, int(existing[0])),
+            )
+            conn.execute(
+                "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
+                (metadata.selected_gauge_kind, matched_play_id),
+            )
+            return "matched", False, True
+        return previous_status, False, False
+
+    previous = conn.execute(
+        "SELECT content_hash FROM replay_metadata WHERE path = ? ORDER BY id DESC LIMIT 1",
+        (path,),
+    ).fetchone()
+    previous_hash = None if previous is None else str(previous[0])
+    if len(matches) == 1:
+        status = "matched"
+        matched_play_id = int(matches[0][0])
+    elif matches:
+        status = "ambiguous"
+        matched_play_id = None
+    else:
+        status = "unmatched"
+        matched_play_id = None
+
+    conn.execute(
+        """
+        INSERT INTO replay_metadata(
+          path, content_hash, previous_content_hash, observed_at, mtime_ns,
+          compressed_size, sha256, mode, played_at, gauge, selected_gauge_kind,
+          randomoption, randomoptionseed, randomoption2, randomoption2seed,
+          doubleoption, seven_to_nine_pattern, lane_shuffle_json, rand_json,
+          match_status, matched_play_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            path, metadata.content_hash, previous_hash, int(observed_at),
+            metadata.mtime_ns, metadata.compressed_size, metadata.sha256,
+            metadata.mode, metadata.played_at, metadata.gauge,
+            metadata.selected_gauge_kind, metadata.randomoption,
+            metadata.randomoptionseed, metadata.randomoption2,
+            metadata.randomoption2seed, metadata.doubleoption,
+            metadata.seven_to_nine_pattern,
+            None if metadata.lane_shuffle_pattern is None else json.dumps(metadata.lane_shuffle_pattern, separators=(",", ":")),
+            None if metadata.rand is None else json.dumps(metadata.rand, separators=(",", ":")),
+            status, matched_play_id,
+        ),
+    )
+    if matched_play_id is not None:
+        conn.execute(
+            "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
+            (metadata.selected_gauge_kind, matched_play_id),
+        )
+    return status, previous_hash is not None, True
 
 
 def init(path: str | Path) -> sqlite3.Connection:

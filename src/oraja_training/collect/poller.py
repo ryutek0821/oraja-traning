@@ -10,6 +10,7 @@ import sqlite3
 import time
 
 from oraja_training.collect.normalize import derive_play, payload_hash
+from oraja_training.collect import replay
 from oraja_training.collect.source import SourceSignature, source_signature
 from oraja_training.db import readers, store
 
@@ -27,6 +28,13 @@ class TickResult:
     lost_events: int
     generation_changed: bool
     scanned: bool = True
+    replay_scanned: int = 0
+    replay_matched: int = 0
+    replay_unmatched: int = 0
+    replay_ambiguous: int = 0
+    replay_invalid: int = 0
+    replay_unstable: int = 0
+    replay_overwritten: int = 0
 
 
 def _same_persisted_signal(
@@ -63,11 +71,13 @@ class Poller:
         self.db_dir = Path(db_dir).expanduser().resolve()
         self.scoredatalog_path = self.db_dir / "scoredatalog.db"
         self.score_path = self.db_dir / "score.db"
+        self.replay_dir = self.db_dir / "replay"
         self.poll_interval = float(poll_interval)
         self.busy_timeout_ms = int(busy_timeout_ms)
         self.max_retries = max(1, int(max_retries))
         self.clock = clock
         self._last_signature: SourceSignature | None = None
+        self._last_replay_signature: tuple[tuple[str, int, int, int, int], ...] | None = None
         self._owns_connection = not isinstance(assistant_db, sqlite3.Connection)
 
         if isinstance(assistant_db, sqlite3.Connection):
@@ -193,6 +203,88 @@ class Poller:
         )
         self.conn.commit()
 
+    def _replay_signature(self) -> tuple[tuple[str, int, int, int, int], ...]:
+        if not self.replay_dir.is_dir():
+            return ()
+        signals: list[tuple[str, int, int, int, int]] = []
+        for path in sorted(self.replay_dir.glob("*.brd")):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            signals.append(
+                (path.name, stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            )
+        return tuple(signals)
+
+    def _collect_replays(self, *, now: int, force: bool = False) -> TickResult:
+        signature = self._replay_signature()
+        if not force and signature == self._last_replay_signature:
+            return TickResult(0, 0, False, scanned=False)
+
+        report = replay.scan_report(self.replay_dir)
+        matched = unmatched = ambiguous = overwritten = 0
+        with self.conn:
+            for metadata in report.metadata:
+                status, was_overwritten, inserted = store.ingest_replay_metadata(
+                    self.conn, metadata, observed_at=now
+                )
+                if not inserted:
+                    continue
+                if status == "matched":
+                    matched += 1
+                elif status == "ambiguous":
+                    ambiguous += 1
+                else:
+                    unmatched += 1
+                overwritten += int(was_overwritten)
+
+            last_mtime = (
+                max(item[3] for item in signature) / 1_000_000_000
+                if signature else None
+            )
+            store.upsert_collector_state(
+                self.conn,
+                key="replay",
+                source_generation=0,
+                last_mtime=last_mtime,
+                last_size=sum(item[4] for item in signature),
+                last_run_at=now,
+                last_error=(
+                    None
+                    if not report.invalid and not report.unstable
+                    else f"invalid={report.invalid}, unstable={report.unstable}"
+                ),
+            )
+        self._last_replay_signature = signature
+        return TickResult(
+            0, 0, False,
+            scanned=bool(signature) or bool(report.invalid or report.unstable),
+            replay_scanned=len(report.metadata) + report.invalid + report.unstable,
+            replay_matched=matched,
+            replay_unmatched=unmatched,
+            replay_ambiguous=ambiguous,
+            replay_invalid=report.invalid,
+            replay_unstable=report.unstable,
+            replay_overwritten=overwritten,
+        )
+
+    @staticmethod
+    def _with_replays(score: TickResult, replays: TickResult) -> TickResult:
+        return TickResult(
+            score.new_plays,
+            score.lost_events,
+            score.generation_changed,
+            scanned=score.scanned or replays.scanned,
+            replay_scanned=replays.replay_scanned,
+            replay_matched=replays.replay_matched,
+            replay_unmatched=replays.replay_unmatched,
+            replay_ambiguous=replays.replay_ambiguous,
+            replay_invalid=replays.replay_invalid,
+            replay_unstable=replays.replay_unstable,
+            replay_overwritten=replays.replay_overwritten,
+        )
+
     def tick(self, *, force: bool = False) -> TickResult:
         """Run at most one complete content scan."""
 
@@ -204,7 +296,7 @@ class Poller:
         state = self._state()
         if not force:
             if self._last_signature is not None and trigger == self._last_signature:
-                return TickResult(0, 0, False, scanned=False)
+                return self._collect_replays(now=int(self.clock()))
             if (
                 self._last_signature is None
                 and state is not None
@@ -214,7 +306,7 @@ class Poller:
                 )
             ):
                 self._last_signature = trigger
-                return TickResult(0, 0, False, scanned=False)
+                return self._collect_replays(now=int(self.clock()))
 
         try:
             rows, aggregate, stable_signature = self._read_consistent_snapshot()
@@ -307,7 +399,14 @@ class Poller:
                 )
 
             self._last_signature = stable_signature
-            return TickResult(new_plays, lost_total, generation_changed)
+            score_result = TickResult(new_plays, lost_total, generation_changed)
+            # A replay slot can become visible just before its score row. Scan
+            # identical metadata again after a new play so an earlier
+            # ``unmatched`` history row can be reconciled safely.
+            replay_result = self._collect_replays(
+                now=now, force=force or new_plays > 0
+            )
+            return self._with_replays(score_result, replay_result)
         except Exception as exc:
             self._record_error(exc, trigger)
             raise

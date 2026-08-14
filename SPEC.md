@@ -218,6 +218,33 @@ CREATE TABLE collector_state (
   last_error        TEXT
 );
 
+-- .brd slotのmetadata-only履歴。keyinput/Replay本文は保存しない
+CREATE TABLE replay_metadata (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  path                   TEXT NOT NULL,
+  content_hash           TEXT NOT NULL,
+  previous_content_hash  TEXT,
+  observed_at            INTEGER NOT NULL,
+  mtime_ns               INTEGER NOT NULL,
+  compressed_size        INTEGER NOT NULL,
+  sha256                 TEXT NOT NULL,
+  mode                   INTEGER NOT NULL,
+  played_at              INTEGER NOT NULL,
+  gauge                  INTEGER NOT NULL,
+  selected_gauge_kind    TEXT NOT NULL,
+  randomoption           INTEGER,
+  randomoptionseed       INTEGER,
+  randomoption2          INTEGER,
+  randomoption2seed      INTEGER,
+  doubleoption           INTEGER,
+  seven_to_nine_pattern  INTEGER,
+  lane_shuffle_json      TEXT,
+  rand_json              TEXT,
+  match_status           TEXT NOT NULL,
+  matched_play_id        INTEGER REFERENCES plays(id),
+  UNIQUE(path, content_hash)
+);
+
 CREATE TABLE chart_features (
   sha256          TEXT PRIMARY KEY,
   feature_version INTEGER NOT NULL,
@@ -285,7 +312,7 @@ CREATE TABLE revisits (
 );
 ```
 
-**`schema_version` は 3**。version 2 からは日次取込・ベスト差分・難易度表・推薦履歴用テーブルを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 4**。version 2からは日次取込等、version 3からはReplay metadata履歴を加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 

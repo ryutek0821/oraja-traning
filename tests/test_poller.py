@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import gzip
+import json
 import sqlite3
 
 from oraja_training.collect.poller import Poller
 from oraja_training.db import readers
+from oraja_training.db import store
 
 
 SCORE_DDL = """
@@ -89,6 +92,25 @@ def _source_dir(tmp_path: Path) -> Path:
     return source
 
 
+def _replay(path: Path, *, sha256: str = "a" * 64, date: int = 100, gauge: int = 3) -> None:
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(
+        gzip.compress(
+            json.dumps(
+                {
+                    "sha256": sha256,
+                    "mode": 0,
+                    "date": date,
+                    "gauge": gauge,
+                    "randomoption": 4,
+                    "randomoptionseed": 99,
+                    "keyinput": "private-replay-body",
+                }
+            ).encode()
+        )
+    )
+
+
 def test_playcount_gap_generation_change_and_idempotency(tmp_path) -> None:
     source = _source_dir(tmp_path)
     assistant = tmp_path / "assistant.db"
@@ -164,3 +186,96 @@ def test_score_change_during_read_retries_snapshot(tmp_path, monkeypatch) -> Non
 
     assert result.new_plays == 1
     assert read_count == 2
+
+
+def test_replay_exact_match_history_overwrite_and_invalid_counter(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    slot = source / "replay" / "slot-0.brd"
+    _replay(slot)
+    assistant = tmp_path / "assistant.db"
+
+    with Poller(source, assistant, clock=lambda: 4_000) as poller:
+        first = poller.tick(force=True)
+        assert first.replay_scanned == 1
+        assert first.replay_matched == 1
+        row = poller.conn.execute(
+            "SELECT selected_gauge_kind, seed, random FROM plays"
+        ).fetchone()
+        assert tuple(row) == ("HARD", 2, 3)
+
+        _replay(slot, gauge=4)
+        broken = source / "replay" / "slot-1.brd"
+        broken.write_bytes(b"not-gzip")
+        second = poller.tick(force=True)
+        assert second.replay_matched == 1
+        assert second.replay_overwritten == 1
+        assert second.replay_invalid == 1
+        assert poller.conn.execute(
+            "SELECT selected_gauge_kind FROM plays"
+        ).fetchone()[0] == "EXHARD"
+        history = poller.conn.execute(
+            "SELECT content_hash, previous_content_hash, match_status "
+            "FROM replay_metadata ORDER BY id"
+        ).fetchall()
+        assert len(history) == 2
+        assert history[0][1] is None
+        assert history[1][1] == history[0][0]
+        assert {row[2] for row in history} == {"matched"}
+        columns = {row[1] for row in poller.conn.execute("PRAGMA table_info(replay_metadata)")}
+        assert "keyinput" not in columns
+
+
+def test_replay_ambiguous_and_unmatched_never_change_plays(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    assistant = tmp_path / "assistant.db"
+    with Poller(source, assistant, clock=lambda: 5_000) as poller:
+        poller.tick(force=True)
+        original = dict(
+            poller.conn.execute(
+                f"SELECT {', '.join(store.PLAY_COLUMNS)} FROM plays"
+            ).fetchone()
+        )
+        duplicate = dict(original)
+        duplicate["source_generation"] = 9
+        duplicate["playcount"] = 99
+        store.insert_play(poller.conn, duplicate)
+        poller.conn.commit()
+
+        _replay(source / "replay" / "ambiguous.brd")
+        _replay(source / "replay" / "unmatched.brd", sha256="b" * 64)
+        result = poller.tick(force=True)
+
+        assert result.replay_ambiguous == 1
+        assert result.replay_unmatched == 1
+        assert poller.conn.execute(
+            "SELECT count(*) FROM plays WHERE selected_gauge_kind IS NOT NULL"
+        ).fetchone()[0] == 0
+
+
+def test_replay_saved_before_score_is_reconciled_after_new_play(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    for name, table in (("score.db", "score"), ("scoredatalog.db", "scoredatalog")):
+        conn = sqlite3.connect(source / name)
+        conn.execute(f"DELETE FROM {table}")
+        conn.commit()
+        conn.close()
+    _replay(source / "replay" / "early.brd")
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 6_000) as poller:
+        early = poller.tick(force=True)
+        assert early.replay_unmatched == 1
+
+        _put(source / "scoredatalog.db", "scoredatalog", _row())
+        _put(source / "score.db", "score", _row())
+        later = poller.tick()
+
+        assert later.new_plays == 1
+        assert later.replay_matched == 1
+        assert poller.conn.execute(
+            "SELECT selected_gauge_kind FROM plays"
+        ).fetchone()[0] == "HARD"
+        assert tuple(
+            poller.conn.execute(
+                "SELECT count(*), max(match_status) FROM replay_metadata"
+            ).fetchone()
+        ) == (1, "matched")

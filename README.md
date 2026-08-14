@@ -138,9 +138,15 @@ Windowsでは、ユーザーPowerShellから次を実行するとログオン時
 解除は同じコマンドへ `-Uninstall` を付けます。登録・解除は `OrajaTrainingCollector` だけを対象にします。
 
 beatoraja側では、**自動リプレイ保存の1枠を `ALWAYS` に変更してください**。
-次の実装段階で、失敗プレイを含む開始時の選択ゲージを `.brd` リプレイから回収するために必要です。
+collectorは `replay/*.brd` のGZIP JSONから、開始ゲージ・seed・実配置などの
+allowlist済みmetadataだけを読みます。`keyinput` は復号・保存しません。圧縮/展開サイズを
+制限し、読取前後でファイルが同一の場合だけ採用します。
 
-停止は `Ctrl-C` です。入力側の `score.db` / `scoredatalog.db` / `scorelog.db` /
+Replayは `sha256 + mode + date` がただ1件のplayに完全一致した場合だけ
+`selected_gauge_kind` を更新します。未一致・曖昧一致・破損・読取中の上書きはplayを
+変更せず、tickの `replay_*` カウンタと `replay_metadata` のslot履歴で監査できます。
+
+停止は `Ctrl-C` です。入力側の `.brd`、`score.db` / `scoredatalog.db` / `scorelog.db` /
 `songdata.db` / `songinfo.db` には書き込みません。
 
 ## 同梱スナップショットで判明した仕様差

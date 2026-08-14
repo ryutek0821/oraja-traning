@@ -291,10 +291,10 @@ course生成とプレイ中の動的再推定はv1の非目標。
 |---|---|---|
 | **P0a: DB実機調査** | 5DBのスキーマ・件数・意味を実測 | **完了** |
 | **P0b: Replay実機調査** | Windowsで `.brd` の生成条件・上書き条件・保存率を確認 | **未完了**。Step 3の前提 |
-| **P1a: Collector基盤** | read-only backfill、差分収集、schema v3、入力整合性検証 | **完了**。静的2DBの日次取込と重複・巻戻し検出を実装 |
+| **P1a: Collector基盤** | read-only backfill、差分収集、schema v4、入力整合性検証 | **完了**。静的2DBの日次取込と重複・巻戻し検出を実装 |
 | **P1b: 実運用開始** | 実用 `assistant.db` を作りcollectorを常駐 | **実装完了・実機登録待ち**。`%LOCALAPPDATA%\oraja-training` とログオン時Scheduled Taskを採用。Windows接続回復後に登録・連続稼働を確認する |
 | **P2: 難易度表・特徴量** | 表取得/突合と `songinfo` 特徴を構築 | **完了**。ETag/last-good対応、実データ65,712/65,998譜面（99.57%） |
-| **P3: Replayメタデータ** | 開始ゲージ・seed・実配置を収集 | **未着手**。`selected_gauge_kind` の突合率を報告できること |
+| **P3: Replayメタデータ** | 開始ゲージ・seed・実配置を収集 | **実装完了・実機検証待ち**。制限付きmetadata scanner、slot履歴、一意突合と監査カウンタを実装 |
 | **P4: モデル** | 段階モデルを時間順holdoutで評価 | **実装済み**。十分な履歴とゲート通過までは決定的cold-startを使用 |
 | **P5: メニュー + 配信** | 10万判定メニュー、ローカル難易度表、最小Web UI | **実装済み**。Personal/Today表、Webキュー、疲労日モードを生成 |
 | **P6: 自己実験** | 翌日保持・転移・校正をランダム選曲と比較 | **未着手**。§6の検証結果が出ること |
@@ -471,7 +471,9 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 
 ## 12. Step 1 実装状況（2026-08-09）
 
-- read-only reader、schema v3、backfill、content-diff Poller、静的2DB日次取込を実装済み
+- read-only reader、schema v4、backfill、content-diff Poller、静的2DB日次取込を実装済み
+- Replayはobject形式のGZIP JSONだけを制限付きで読み、`keyinput` を復号・保存しない。slot上書き履歴と未一致・曖昧・破損カウンタを保存する
+- `sha256 + mode + date` がただ1件のplayへ完全一致した場合だけ `selected_gauge_kind` を更新する
 - `initialize` / `daily-update` により入力DBへWAL等を書かず、SHA-256で同一提出を冪等化
 - 初期実測値は個人データ由来のため公開版から除外。再現可能な合成fixtureを回帰基準とする
 - legacy: max survival 1.0 / `survival>1` 0 / completed 368 / `judged=notes` 272/272
