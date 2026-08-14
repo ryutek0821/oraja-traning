@@ -8,6 +8,7 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import Sequence
 
 from oraja_training.collect import backfill, snapshot
@@ -18,6 +19,12 @@ from oraja_training.domain import ProfileContext
 from oraja_training.features import build_all
 from oraja_training.model import fit_latest
 from oraja_training.plan import build_session, recommendation_output, write_export
+from oraja_training.plan.experiment import (
+    assign_session,
+    report_experiment,
+    resolve_targets,
+    start_experiment,
+)
 from oraja_training.serve import serve
 from oraja_training.tables import fetch_table, resolve
 
@@ -101,6 +108,39 @@ def _parser() -> argparse.ArgumentParser:
 
     review = subcommands.add_parser("review", help="show latest daily training summary")
     review.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
+
+    experiment = subcommands.add_parser(
+        "experiment", help="run the randomized coach/control self-experiment"
+    )
+    experiment_commands = experiment.add_subparsers(
+        dest="experiment_command", required=True
+    )
+    experiment_start = experiment_commands.add_parser("start")
+    experiment_start.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
+    experiment_start.add_argument("--name", required=True)
+    experiment_start.add_argument("--seed", required=True)
+    experiment_start.add_argument("--starts-at", type=int, default=None)
+    experiment_start.add_argument("--days", type=int, default=14)
+    experiment_start.add_argument("--min-samples-per-arm", type=int, default=20)
+
+    experiment_assign = experiment_commands.add_parser("assign")
+    experiment_assign.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
+    experiment_assign.add_argument("--experiment-id", type=int, required=True)
+    experiment_assign.add_argument("--session-key", required=True)
+    experiment_assign.add_argument("--session-at", type=int, default=None)
+    experiment_assign.add_argument(
+        "--candidates-json", type=Path, required=True,
+        help="JSON object with non-empty coach, control and transfer candidate arrays",
+    )
+
+    experiment_resolve = experiment_commands.add_parser("resolve")
+    experiment_resolve.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
+    experiment_resolve.add_argument("--experiment-id", type=int, required=True)
+    experiment_resolve.add_argument("--now", type=int, default=None)
+
+    experiment_report = experiment_commands.add_parser("report")
+    experiment_report.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
+    experiment_report.add_argument("--experiment-id", type=int, required=True)
 
     server = subcommands.add_parser("serve", help="serve tables and training cockpit")
     server.add_argument("--export-dir", type=Path, default=Path("export/current"))
@@ -400,6 +440,42 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "review":
         print(json.dumps(_latest_review(args.assistant_db), ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command == "experiment":
+        conn = store.init(args.assistant_db)
+        try:
+            if args.experiment_command == "start":
+                starts_at = int(time.time()) if args.starts_at is None else args.starts_at
+                result = start_experiment(
+                    conn,
+                    name=args.name,
+                    seed=args.seed,
+                    starts_at=starts_at,
+                    days=args.days,
+                    min_samples_per_arm=args.min_samples_per_arm,
+                )
+            elif args.experiment_command == "assign":
+                session_at = int(time.time()) if args.session_at is None else args.session_at
+                candidate_sets = json.loads(args.candidates_json.read_text(encoding="utf-8"))
+                if not isinstance(candidate_sets, dict):
+                    raise ValueError("--candidates-json must contain a JSON object")
+                result = assign_session(
+                    conn,
+                    experiment_id=args.experiment_id,
+                    session_key=args.session_key,
+                    session_at=session_at,
+                    candidate_sets=candidate_sets,
+                )
+            elif args.experiment_command == "resolve":
+                result = resolve_targets(
+                    conn, experiment_id=args.experiment_id, now=args.now
+                )
+            else:
+                result = report_experiment(conn, experiment_id=args.experiment_id)
+        finally:
+            conn.close()
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
 
     if args.command == "serve":

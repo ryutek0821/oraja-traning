@@ -310,9 +310,14 @@ CREATE TABLE revisits (
   last_result   TEXT,
   PRIMARY KEY(sha256, mode)
 );
+
+-- schema v5: 事前登録した自己実験。入力beatoraja DBとは分離する。
+CREATE TABLE experiments (...);          -- seed、期間、arm別最小標本数
+CREATE TABLE experiment_sessions (...); -- session arm、候補hash、選択確率、選曲
+CREATE TABLE experiment_targets (...);  -- retention/transfer × 1/3/7/14日
 ```
 
-**`schema_version` は 4**。version 2からは日次取込等、version 3からはReplay metadata履歴を加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 5**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブルを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 
@@ -378,10 +383,10 @@ src/oraja_training/
   model/fit.py         evaluate_and_fit(conn) -> ModelReport           # 時間順holdout・ゲート判定
 
   plan/menu.py         build_session(...) -> Session                   # A-8 の構成
-  plan/schedule.py     due_revisits(conn, now) -> list
+  plan/experiment.py   start / assign_session / resolve_targets / report_experiment
 
   serve/app.py         ThreadingHTTPServer: /table/header.json /table/score.json / /api/status
-  cli.py               initialize / daily-update / tables refresh / features build / menu / review / serve
+  cli.py               initialize / daily-update / tables refresh / features build / menu / review / experiment / serve
 ```
 
 `Poller` の整合性要件: 1回のスキャンで `scoredatalog.db` と `score.db` の**両方**について、読取の前後で
@@ -453,6 +458,15 @@ RESERVE 10k を別に提示する。focus譜面は3枠離して再試行し、�
 **探索枠**: 提示枠の20〜30%は同じ表・レベル・既プレイ状態からランダム抽出し、候補集合と選択確率を `predictions` に保存する（prequential評価に必須）。
 
 **course は生成しない。セッション開始時に枠を固定して配信する**（難易度表のホットリロード保証が無いため）。
+
+### A-8.1 自己実験
+
+- `seed + session_key`のSHA-256からarmを50/50で決め、session内でarmを混在させない。
+- coach/control各候補から一様抽出し、正規化候補JSONのSHA-256、arm確率、周辺selection probabilityを保存する。
+- 選曲譜面をretention、別指定の未練習類似譜面をtransferとして、session時刻の1/3/7/14日後から24時間を評価窓にする。
+- 窓内で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は期限後`missing`、複数件は`duplicate`とし、期限外playは採用しない。
+- arm別の成功率とBrierをtarget種別・間隔ごとに出す。両armが事前設定した最小標本数へ達するまで差は`inconclusive`とする。
+- すべての実験書込みはassistant-owned schema v5だけへ行い、beatoraja入力DBへ書かない。
 
 ---
 

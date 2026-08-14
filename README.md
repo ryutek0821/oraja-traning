@@ -91,6 +91,30 @@ Web画面はライブ`score.db`を読み取り専用で確認し、基準点か�
 `oraja-training review --assistant-db ./assistant.db`で直近日の打鍵、プレー数、ランプ・
 EX・BP更新、日次提出で復元できなかったプレー数を確認できます。
 
+## 2週間の自己実験
+
+coach推薦と同レベルrandom controlは、session単位で決定的に割り付けます。まず実験を開始し、
+表示された`experiment_id`を以後のコマンドへ渡します。
+
+```console
+oraja-training experiment start --assistant-db ./assistant.db \
+  --name p6-two-week --seed PRIVATE_FIXED_SEED --starts-at 1800000000
+oraja-training experiment assign --assistant-db ./assistant.db \
+  --experiment-id 1 --session-key 2026-08-15-am --session-at 1800000000 \
+  --candidates-json ./candidates.json
+oraja-training experiment resolve --assistant-db ./assistant.db \
+  --experiment-id 1
+oraja-training experiment report --assistant-db ./assistant.db \
+  --experiment-id 1
+```
+
+`candidates.json`は`coach`、`control`、`transfer`の各配列を持ち、要素は
+`{"sha256":"…","mode":0,"p_pred":0.7}`です。候補集合hash、arm確率、譜面の
+selection probabilityを保存し、同じsession keyの再実行は同じ割付を返します。選曲した譜面の
+保持と未練習類似譜面への転移を1/3/7/14日後に評価します。期限内のplayが一意な場合だけ解決し、
+複数は`duplicate`、未観測は`missing`として除外します。各armの事前最小標本数に達するまでは
+arm差とBrier差を`inconclusive`として出しません。書込み先は`assistant.db`だけです。
+
 ### Codexでの日次・定期レビュー
 
 プレー後に静的コピーした2DBをCodexへ渡し、「READMEの毎日の更新を実行し、review結果と

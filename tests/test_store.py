@@ -11,7 +11,7 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
     path = tmp_path / "assistant.db"
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
         tables = {
             row[0]
             for row in conn.execute(
@@ -36,6 +36,9 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
             "table_sources",
             "recommendation_versions",
             "replay_metadata",
+            "experiments",
+            "experiment_sessions",
+            "experiment_targets",
         }.issubset(tables)
         play_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(plays)")
@@ -93,7 +96,7 @@ def test_init_migrates_v2_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_imports'"
@@ -117,10 +120,34 @@ def test_init_migrates_v3_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='replay_metadata'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_init_migrates_v4_additively(tmp_path) -> None:
+    path = tmp_path / "assistant.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(store.SCHEMA_V2 + store.SCHEMA_V3 + store.SCHEMA_V4)
+        conn.execute("INSERT INTO schema_version VALUES (4)")
+        conn.execute(
+            "INSERT INTO sessions(created_at, arm, slots_json) VALUES (1, 'A', '[]')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = store.init(path)
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_targets'"
         ).fetchone()
     finally:
         conn.close()

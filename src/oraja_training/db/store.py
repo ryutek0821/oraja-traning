@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -267,6 +267,74 @@ CREATE INDEX idx_replay_metadata_play
 """
 
 
+SCHEMA_V5 = """
+CREATE TABLE experiments (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                TEXT NOT NULL,
+  seed                TEXT NOT NULL,
+  starts_at           INTEGER NOT NULL,
+  ends_at             INTEGER NOT NULL,
+  min_samples_per_arm INTEGER NOT NULL,
+  created_at          INTEGER NOT NULL,
+  CHECK(ends_at > starts_at),
+  CHECK(min_samples_per_arm > 0)
+);
+
+CREATE TABLE experiment_sessions (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  experiment_id         INTEGER NOT NULL REFERENCES experiments(id),
+  session_key           TEXT NOT NULL,
+  session_at            INTEGER NOT NULL,
+  arm                   TEXT NOT NULL,
+  arm_probability       REAL NOT NULL,
+  selection_probability REAL NOT NULL,
+  candidate_hash        TEXT NOT NULL,
+  candidates_json       TEXT NOT NULL,
+  selected_sha256       TEXT NOT NULL,
+  selected_mode         INTEGER NOT NULL,
+  selected_p_pred       REAL NOT NULL,
+  transfer_sha256       TEXT NOT NULL,
+  transfer_mode         INTEGER NOT NULL,
+  transfer_p_pred       REAL NOT NULL,
+  assigned_at           INTEGER NOT NULL,
+  UNIQUE(experiment_id, session_key),
+  CHECK(arm IN ('coach', 'control')),
+  CHECK(arm_probability > 0 AND arm_probability <= 1),
+  CHECK(selection_probability > 0 AND selection_probability <= 1),
+  CHECK(selected_p_pred >= 0 AND selected_p_pred <= 1),
+  CHECK(transfer_p_pred >= 0 AND transfer_p_pred <= 1)
+);
+CREATE INDEX idx_experiment_sessions_experiment
+  ON experiment_sessions(experiment_id, arm);
+
+CREATE TABLE experiment_targets (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id       INTEGER NOT NULL REFERENCES experiment_sessions(id),
+  target_kind      TEXT NOT NULL,
+  interval_days    INTEGER NOT NULL,
+  sha256           TEXT NOT NULL,
+  mode             INTEGER NOT NULL,
+  due_at           INTEGER NOT NULL,
+  window_closes_at INTEGER NOT NULL,
+  p_pred           REAL NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending',
+  outcome          INTEGER,
+  resolved_play_id INTEGER REFERENCES plays(id),
+  resolved_at      INTEGER,
+  resolution_note  TEXT,
+  UNIQUE(session_id, target_kind, interval_days),
+  CHECK(target_kind IN ('retention', 'transfer')),
+  CHECK(interval_days IN (1, 3, 7, 14)),
+  CHECK(status IN ('pending', 'resolved', 'missing', 'duplicate')),
+  CHECK(outcome IS NULL OR outcome IN (0, 1)),
+  CHECK(p_pred >= 0 AND p_pred <= 1),
+  CHECK(window_closes_at > due_at)
+);
+CREATE INDEX idx_experiment_targets_resolution
+  ON experiment_targets(status, due_at, window_closes_at);
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -328,7 +396,9 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 0:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
+            )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
             )
@@ -340,7 +410,7 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 2:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -350,7 +420,17 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 3:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 4:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V5)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
