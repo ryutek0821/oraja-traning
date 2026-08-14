@@ -2,83 +2,14 @@
   "contract": "domain-entities",
   "schema_version": "1",
   "id_format": "uuidv7-lowercase",
-  "profile_limit": {
-    "setting": "PROFILE_LIMIT",
-    "default": 1,
-    "minimum": 1,
-    "enforcement": "account-slot-transaction"
-  },
+  "authorization": "Every operation resolves the complete owner chain from the authenticated credential; body and path IDs never grant access.",
+  "profile_limit": { "setting": "PROFILE_LIMIT", "default": 1, "minimum": 1, "enforcement": "account-slot-transaction", "slot_reusable_after_profile_deletion": true },
   "entities": [
-    {
-      "name": "Account",
-      "id": "account_id",
-      "id_format": "uuidv7",
-      "owner": "self",
-      "parent": null,
-      "storage_boundary": "official:d1-or-self_hosted:local",
-      "lifecycle": ["pending", "active", "pending_delete", "deleted"],
-      "immutable_fields": ["account_id", "created_at"]
-    },
-    {
-      "name": "Profile",
-      "id": "profile_id",
-      "id_format": "uuidv7",
-      "owner": "account_id",
-      "parent": "account_id",
-      "storage_boundary": "profile-do-and-r2-prefix",
-      "lifecycle": ["active", "suspended", "pending_delete", "deleted"],
-      "immutable_fields": ["profile_id", "account_id", "trust_domain", "created_at"]
-    },
-    {
-      "name": "Device",
-      "id": "device_id",
-      "id_format": "uuidv7",
-      "owner": "profile_id",
-      "parent": "profile_id",
-      "storage_boundary": "d1-or-self_hosted-local",
-      "lifecycle": ["active", "revoked", "expired"],
-      "immutable_fields": ["device_id", "profile_id", "token_hash", "created_at"]
-    },
-    {
-      "name": "PlayEvent",
-      "id": "event_id",
-      "id_format": "uuidv7",
-      "owner": "profile_id",
-      "parent": "profile_id",
-      "storage_boundary": "profile-do-event-stream",
-      "lifecycle": ["received", "accepted", "normalized", "model_excluded"],
-      "immutable_fields": ["event_id", "profile_id", "trust_domain", "payload_digest", "occurred_at"]
-    },
-    {
-      "name": "Job",
-      "id": "job_id",
-      "id_format": "uuidv7",
-      "owner": "profile_id",
-      "parent": "profile_id",
-      "storage_boundary": "d1-and-workflow",
-      "lifecycle": ["queued", "running", "succeeded", "failed", "cancelled"],
-      "immutable_fields": ["job_id", "profile_id", "idempotency_key", "input_digest", "created_at"]
-    },
-    {
-      "name": "RecommendationVersion",
-      "id": "recommendation_version_id",
-      "id_format": "uuidv7",
-      "owner": "profile_id",
-      "parent": "profile_id",
-      "storage_boundary": "profile-do-and-private-r2",
-      "lifecycle": ["building", "ready", "superseded"],
-      "immutable_fields": ["recommendation_version_id", "profile_id", "revision", "manifest_digest", "created_at"]
-    }
-  ],
-  "trust_domains": [
-    {
-      "name": "official",
-      "aggregate_eligible_when": ["explicit_consent", "SP7", "source_attested", "is_course=false"]
-    },
-    {
-      "name": "self_hosted",
-      "aggregate_eligible_when": [],
-      "aggregate_policy": "never"
-    }
+    { "name": "Account", "id": "account_id", "id_format": "uuidv7", "owner": "self", "parent": null, "storage_boundary": "official-d1", "lifecycle": ["pending", "active", "pending_delete", "deleted"], "immutable_fields": ["account_id", "created_at"] },
+    { "name": "Profile", "id": "profile_id", "id_format": "uuidv7", "owner": "account_id", "parent": "account_id", "storage_boundary": "profile-do-and-r2-prefix", "lifecycle": ["active", "suspended", "pending_delete", "deleted"], "immutable_fields": ["profile_id", "account_id", "created_at"] },
+    { "name": "Device", "id": "device_id", "id_format": "uuidv7", "owner": "profile_id", "parent": "profile_id", "storage_boundary": "official-d1", "lifecycle": ["active", "revoked", "expired"], "immutable_fields": ["device_id", "profile_id", "token_hash", "created_at"] },
+    { "name": "PlayEvent", "id": "event_id", "id_format": "uuidv7", "owner": "profile_id", "parent": "profile_id", "storage_boundary": "profile-do-event-stream", "lifecycle": ["received", "accepted", "normalized", "model_excluded"], "immutable_fields": ["event_id", "profile_id", "payload_digest", "played_at", "received_at"] },
+    { "name": "Job", "id": "job_id", "id_format": "uuidv7", "owner": "profile_id", "parent": "profile_id", "storage_boundary": "profile-do-and-workflow", "lifecycle": ["queued", "running", "succeeded", "failed"], "immutable_fields": ["job_id", "profile_id", "idempotency_key", "input_digest", "created_at"] },
+    { "name": "RecommendationVersion", "id": "recommendation_version_id", "id_format": "uuidv7", "owner": "profile_id", "parent": "profile_id", "storage_boundary": "profile-do-and-private-r2", "lifecycle": ["building", "ready", "superseded"], "immutable_fields": ["recommendation_version_id", "profile_id", "revision", "manifest_digest", "created_at"] }
   ]
 }

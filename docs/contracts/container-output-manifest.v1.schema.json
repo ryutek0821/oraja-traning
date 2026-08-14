@@ -13,7 +13,7 @@
     "account_id",
     "profile_id",
     "trust_domain",
-    "aggregate_eligible",
+    "eligibility_status",
     "input_manifest_sha256",
     "output_revision",
     "generated_at",
@@ -30,7 +30,7 @@
     "account_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "profile_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
     "trust_domain": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/trustDomain" },
-    "aggregate_eligible": { "type": "boolean" },
+    "eligibility_status": { "enum": ["pending", "eligible", "ineligible", "revoked"] },
     "input_manifest_sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
     "output_revision": {
       "type": "integer",
@@ -44,17 +44,16 @@
       "required": ["version", "event_contract"],
       "properties": {
         "version": { "const": "normalization-v1" },
-        "event_contract": { "const": "ir-event.v1" }
+        "event_contract": { "const": "play-event.v1" }
       }
     },
     "counters": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["accepted_events", "rejected_events", "course_events"],
+      "required": ["accepted_events", "rejected_events"],
       "properties": {
         "accepted_events": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
-        "rejected_events": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" },
-        "course_events": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" }
+        "rejected_events": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/nonNegativeInteger" }
       }
     },
     "artifacts": {
@@ -76,25 +75,5 @@
       }
     },
     "raw_db_exported": { "const": false }
-  },
-  "allOf": [
-    {
-      "if": { "properties": { "trust_domain": { "const": "self_hosted" } } },
-      "then": { "properties": { "aggregate_eligible": { "const": false } } }
-    },
-    {
-      "if": { "properties": { "trust_domain": { "const": "official" } } },
-      "then": {
-        "properties": {
-          "artifacts": {
-            "items": {
-              "properties": {
-                "kind": { "enum": ["normalized_events", "feature_input", "model_input"] }
-              }
-            }
-          }
-        }
-      }
-    }
-  ]
+  }
 }
