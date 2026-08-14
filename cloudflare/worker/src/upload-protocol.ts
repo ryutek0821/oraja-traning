@@ -95,6 +95,7 @@ export interface UploadManifest {
 export interface UploadContext {
   /** Resolved from the authenticated session; never from the request body. */
   profileId: string;
+  accountId?: string;
 }
 
 export interface R2UploadedPartLike {
@@ -830,6 +831,80 @@ async function verifyEncryptedObject(
   }
 }
 
+/**
+ * Decrypt a completed upload object as a verified plaintext stream.
+ *
+ * The stream fails closed unless every persisted multipart boundary, frame
+ * tag, part digest, total digest, size, and R2 metadata value agrees with the
+ * immutable upload session.  Consumers therefore never receive an
+ * unverified successful EOF.
+ */
+export function decryptCompletedUploadObject(
+  object: R2ObjectLike,
+  file: UploadFileSession,
+  profileScopeValue: string,
+  cryptoBox: EnvelopeCrypto,
+): ReadableStream<Uint8Array> {
+  async function* plaintext(): AsyncGenerator<Uint8Array> {
+    if (!file.encryption || !object.body) fail("encryption_metadata_invalid", 500);
+    cryptoBox.assertR2Metadata(object.customMetadata, file.encryption);
+    const reader = new StreamByteReader(object.body);
+    const totalHasher: IHasher = await createSHA256();
+    totalHasher.init();
+    let totalSize = 0;
+    const parts = [...file.parts].sort((left, right) => left.partNumber - right.partNumber);
+    if (parts.length === 0) fail("object_integrity_failed", 422);
+    for (const part of parts) {
+      const partHasher: IHasher = await createSHA256();
+      partHasher.init();
+      let remaining = part.sizeBytes;
+      let frameNumber = 0;
+      while (remaining > 0) {
+        const header = await reader.readExact(4);
+        const frameSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(0);
+        if (frameSize < 1 || frameSize > file.encryption.frameSizeBytes || frameSize > remaining) {
+          fail("object_integrity_failed", 422);
+        }
+        const encrypted = await reader.readExact(frameSize + ENVELOPE_TAG_BYTES);
+        const plaintextFrame = await cryptoBox.decryptFrame(
+          profileScopeValue,
+          file.encryption,
+          part.partNumber,
+          frameNumber,
+          encrypted,
+        );
+        if (plaintextFrame.byteLength !== frameSize) fail("object_integrity_failed", 422);
+        partHasher.update(plaintextFrame);
+        totalHasher.update(plaintextFrame);
+        totalSize += plaintextFrame.byteLength;
+        remaining -= plaintextFrame.byteLength;
+        frameNumber += 1;
+        yield plaintextFrame;
+      }
+      if (partHasher.digest() !== part.sha256) fail("object_integrity_failed", 422);
+    }
+    await reader.assertEof();
+    if (totalSize !== file.sizeBytes || totalHasher.digest() !== file.sha256) {
+      fail("object_integrity_failed", 422);
+    }
+  }
+  const iterator = plaintext();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const item = await iterator.next();
+        if (item.done) controller.close();
+        else controller.enqueue(item.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await iterator.return(undefined);
+    },
+  });
+}
+
 function cloneSession(session: UploadSessionRecord): UploadSessionRecord {
   return JSON.parse(JSON.stringify(session)) as UploadSessionRecord;
 }
@@ -1196,12 +1271,12 @@ export class UploadService {
     return { state: result === "existing" ? "duplicate" : "uploaded", partNumber, sha256: part.sha256, sizeBytes: part.sizeBytes };
   }
 
-  async complete(context: UploadContext, uploadId: string): Promise<{ state: "completed"; unchanged: boolean; uploadId: string; manifestSha256: string }> {
+  async complete(context: UploadContext, uploadId: string): Promise<{ state: "completed"; unchanged: boolean; uploadId: string; manifestSha256: string; submissionKind: SubmissionKind }> {
     const scope = await profileScope(context.profileId);
     const session = await this.store.getSession(scope, uploadId);
     if (!session) fail("session_not_found", 404);
     if (session.state === "completed") {
-      return { state: "completed", unchanged: session.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256 };
+      return { state: "completed", unchanged: session.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256, submissionKind: session.submissionKind };
     }
     ensureActive(session, Math.floor(this.nowProvider()));
     const ownedObjects: string[] = [];
@@ -1234,7 +1309,7 @@ export class UploadService {
       }
       const completedAt = Math.floor(this.nowProvider());
       await this.store.markCompleted(scope, uploadId, completedAt);
-      return { state: "completed", unchanged: refreshed.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256 };
+      return { state: "completed", unchanged: refreshed.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256, submissionKind: session.submissionKind };
     } catch (error) {
       await Promise.all(ownedRefs.map((ref) => this.store.removeDedup(ref).catch(() => undefined)));
       await this.cleanupSessionObjects(scope, session, ownedObjects);
@@ -1283,6 +1358,10 @@ export class UploadService {
 }
 
 export type UploadAuthenticator = (request: Request) => Promise<UploadContext | null>;
+export type UploadCompletedHook = (
+  context: UploadContext,
+  result: { state: "completed"; unchanged: boolean; uploadId: string; manifestSha256: string; submissionKind: SubmissionKind },
+) => Promise<Record<string, unknown>>;
 
 function responseJson(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value) + "\n", {
@@ -1308,6 +1387,7 @@ export async function handleUploadRequest(
   request: Request,
   service: UploadService,
   authenticate: UploadAuthenticator,
+  onCompleted?: UploadCompletedHook,
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const startRoute = url.pathname === "/v1/uploads";
@@ -1328,7 +1408,9 @@ export async function handleUploadRequest(
       return responseJson(await service.status(context, statusMatch[1]));
     }
     if (completeMatch && request.method === "POST") {
-      return responseJson(await service.complete(context, completeMatch[1]));
+      const completed = await service.complete(context, completeMatch[1]);
+      const extension = onCompleted ? await onCompleted(context, completed) : {};
+      return responseJson({ ...completed, ...extension });
     }
     if (abortMatch && request.method === "DELETE") {
       return responseJson(await service.abort(context, abortMatch[1]));

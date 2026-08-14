@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import io
 import json
 from pathlib import Path
+import struct
+import sys
 import tempfile
 import zipfile
 
@@ -207,3 +211,40 @@ def test_documented_container_fixtures_are_accepted_by_python_runtime() -> None:
     validated_input = validate_input_manifest(input_value)
     assert validated_input.as_dict() == input_value
     assert validate_output_manifest(output_value) == output_value
+
+
+def test_worker_framed_transport_materializes_exact_verified_five_db(tmp_path: Path) -> None:
+    container_dir = Path(__file__).parents[1] / "cloudflare" / "container"
+    sys.path.insert(0, str(container_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("oraja_container_entrypoint", container_dir / "entrypoint.py")
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    source = build_synthetic_fixture(tmp_path / "source")
+    framed = bytearray(module.FRAMED_MAGIC)
+    for name in sorted(module.DATABASE_NAMES):
+        content = (source / name).read_bytes()
+        header = json.dumps(
+            {"file_name": name, "sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        framed.extend(struct.pack(">I", len(header)))
+        framed.extend(header)
+        framed.extend(content)
+    destination = tmp_path / "materialized"
+    destination.mkdir()
+    source_body = module._BoundedBody(io.BytesIO(framed), len(framed))
+    module._materialize_framed_input(source_body, destination)
+    assert source_body.remaining == 0
+    assert {path.name for path in destination.iterdir()} == module.DATABASE_NAMES
+    assert all((destination / name).read_bytes() == (source / name).read_bytes() for name in module.DATABASE_NAMES)
+
+    framed[-1] ^= 1
+    corrupt = module._BoundedBody(io.BytesIO(framed), len(framed))
+    (tmp_path / "corrupt").mkdir()
+    with pytest.raises(ManifestError, match="digest"):
+        module._materialize_framed_input(corrupt, tmp_path / "corrupt")

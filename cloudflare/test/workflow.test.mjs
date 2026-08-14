@@ -18,9 +18,11 @@ test("success outcome and latest pointer share one D1 batch", () => {
   assert.doesNotMatch(workflow, /recordOutcome\(job, "succeeded"/);
 });
 
-test("unwired processor cannot fabricate and publish digests", () => {
-  assert.match(workflow, /processor_integration_unavailable/);
+test("processor bridge verifies immutable input and artifacts before publish", () => {
+  assert.match(workflow, /processContainerJob\(job, env\)/);
+  assert.match(workflow, /input_manifest_pointer_missing/);
   assert.match(workflow, /artifact_manifest_missing/);
+  assert.doesNotMatch(workflow, /processor_integration_unavailable/);
   assert.match(worker, /export \{ GenerateWorkflow \} from "\.\/workflow"/);
   assert.match(worker, /async queue\(/);
   assert.match(worker, /async scheduled\(/);

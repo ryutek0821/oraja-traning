@@ -16,6 +16,7 @@ import {
   workflowInstanceId,
   type WorkflowStepName,
 } from "./workflow-state";
+import { processContainerJob, type ContainerBridgeResult } from "./container-bridge";
 
 export type WorkflowEnv = {
   CONTROL_DB: D1Database;
@@ -33,15 +34,18 @@ export type VerifyInputOutput = {
 
 export type NormalizeOutput = {
   normalizedDigest: string;
+  bridge: ContainerBridgeResult;
 };
 
 export type ModelOutput = {
   modelDigest: string;
+  bridge: ContainerBridgeResult;
 };
 
 export type TablesOutput = {
   recommendationDigest: string;
   menuDigest: string;
+  bridge: ContainerBridgeResult;
 };
 
 export type ArtifactOutput = {
@@ -131,45 +135,42 @@ async function runStep<T extends Record<string, unknown>>(
 function defaultActivities(env: WorkflowEnv, ledger: D1JobLedger): WorkflowActivities {
   return {
     async verifyR2Input(job) {
-      if (job.inputKey) {
-        const object = await env.RAW_BUCKET.head(job.inputKey);
-        if (!object) throw new WorkflowActivityError("input_manifest_not_found", true);
-        const recordedDigest = object.customMetadata?.input_digest;
-        if (recordedDigest && recordedDigest !== job.inputDigest) {
-          throw new WorkflowActivityError("input_digest_mismatch", false);
-        }
+      if (!job.inputKey?.startsWith("upload-session:")) {
+        throw new WorkflowActivityError("input_manifest_pointer_missing", false);
       }
       return { verified: true, inputDigest: job.inputDigest };
     },
 
     async normalize(job, input) {
-      void env.PYTHON_PROCESSOR;
       void input;
-      throw new WorkflowActivityError("processor_integration_unavailable", false);
+      const bridge = await processContainerJob(job, env);
+      return { normalizedDigest: bridge.outputManifestSha256, bridge };
     },
 
     async updateModel(job, input) {
-      return { modelDigest: await sha256Hex(`${job.profileId}:${job.revision}:model:${input.normalizedDigest}`) };
+      return {
+        modelDigest: await sha256Hex(`${job.profileId}:${job.revision}:model:${input.normalizedDigest}`),
+        bridge: input.bridge,
+      };
     },
 
     async generateTables(job, input) {
       return {
         recommendationDigest: await sha256Hex(`${job.profileId}:${job.revision}:recommendation:${input.modelDigest}`),
         menuDigest: await sha256Hex(`${job.profileId}:${job.revision}:menu:${input.modelDigest}`),
+        bridge: input.bridge,
       };
     },
 
     async verifyArtifact(job, input) {
-      void input;
-      if (!job.artifactKey) throw new WorkflowActivityError("artifact_key_missing", false);
-      const object = await env.ARTIFACT_BUCKET.head(job.artifactKey);
+      const object = await env.ARTIFACT_BUCKET.head(input.bridge.artifactKey);
       if (!object) throw new WorkflowActivityError("artifact_not_found", true);
-      const recordedDigest = object.customMetadata?.manifest_sha256;
-      if (!recordedDigest || !/^[0-9a-f]{64}$/.test(recordedDigest)) {
+      const recordedDigest = object.customMetadata?.sha256;
+      if (!recordedDigest || recordedDigest !== input.bridge.outputManifestSha256) {
         throw new WorkflowActivityError("artifact_manifest_missing", false);
       }
       const manifestSha256 = recordedDigest;
-      return { manifestSha256, artifactKey: job.artifactKey };
+      return { manifestSha256, artifactKey: input.bridge.artifactKey };
     },
 
     async publish(job, input) {

@@ -697,6 +697,7 @@ async function handleUploadRoute(request: Request, env: Env): Promise<Response |
     new D1UploadSessionStore(env.CONTROL_DB),
     EnvelopeCrypto.fromSecret(env.ENVELOPE_MASTER_KEY),
   );
+  const requestIdValue = requestId(request);
   return handleUploadRequest(request, service, async (candidate) => {
     const accountId = await requireWebAccount(candidate, env, candidate.method !== "GET");
     const profile = await env.CONTROL_DB
@@ -705,7 +706,25 @@ async function handleUploadRoute(request: Request, env: Env): Promise<Response |
       )
       .bind(accountId)
       .first<{ id: string }>();
-    return profile ? { profileId: profile.id } : null;
+    return profile ? { profileId: profile.id, accountId } : null;
+  }, async (context, completed) => {
+    if (!context.accountId) throw new ApiError("unauthorized", 401);
+    const jobKind = completed.submissionKind === "monthly" ? "monthly"
+      : completed.submissionKind === "audit" ? "regenerate" : "initial";
+    const accepted = await new JobDispatcher(
+      new D1JobLedger(env.CONTROL_DB),
+      env.JOB_QUEUE,
+    ).acceptAndEnqueue({
+      accountId: context.accountId,
+      profileId: context.profileId,
+      jobKind,
+      eventId: `upload:${completed.uploadId}:${completed.manifestSha256}`,
+      requestId: requestIdValue,
+      correlationId: completed.uploadId,
+      inputDigest: completed.manifestSha256,
+      inputKey: `upload-session:${completed.uploadId}`,
+    });
+    return { job_id: accepted.job.jobId, job_status: accepted.status };
   });
 }
 

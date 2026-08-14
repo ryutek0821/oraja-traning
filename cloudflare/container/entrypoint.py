@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import struct
+import tempfile
 from typing import Any
 import uuid
 
 from oraja_training.container import (
     ContainerAdapter,
     ContainerError,
+    MemoryArtifactStore,
     PassthroughDecryptor,
 )
 from oraja_training.container.manifest import ManifestError, parse_json
@@ -31,6 +36,8 @@ except ImportError:  # pragma: no cover - package/module execution fallback
 
 MAX_MANIFEST_HEADER_BYTES = 64 * 1024
 SAFE_BUNDLE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+FRAMED_MAGIC = b"ORAJA5DB1\n"
+DATABASE_NAMES = {"score.db", "scoredatalog.db", "scorelog.db", "songdata.db", "songinfo.db"}
 
 
 class _BoundedBody:
@@ -47,6 +54,60 @@ class _BoundedBody:
         chunk = self._source.read(requested)
         self._remaining -= len(chunk)
         return chunk
+
+    @property
+    def remaining(self) -> int:
+        return self._remaining
+
+
+def _read_exact(source: _BoundedBody, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = source.read(remaining)
+        if not chunk:
+            raise ManifestError("framed input ended early", code="invalid_input")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _materialize_framed_input(source: _BoundedBody, root: Path) -> None:
+    if _read_exact(source, len(FRAMED_MAGIC)) != FRAMED_MAGIC:
+        raise ManifestError("framed input magic is invalid", code="invalid_input")
+    seen: set[str] = set()
+    for _ in range(len(DATABASE_NAMES)):
+        header_size = struct.unpack(">I", _read_exact(source, 4))[0]
+        if header_size < 1 or header_size > 4096:
+            raise ManifestError("framed file header is invalid", code="invalid_input")
+        try:
+            header = json.loads(_read_exact(source, header_size))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ManifestError("framed file header is invalid", code="invalid_input") from exc
+        if not isinstance(header, dict) or set(header) != {"file_name", "sha256", "size_bytes"}:
+            raise ManifestError("framed file header is invalid", code="invalid_input")
+        name = header["file_name"]
+        digest = header["sha256"]
+        size = header["size_bytes"]
+        if name not in DATABASE_NAMES or name in seen:
+            raise ManifestError("framed file allowlist is invalid", code="invalid_input")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ManifestError("framed file digest is invalid", code="invalid_input")
+        if not isinstance(size, int) or size < 1 or size > 5 * 1024 * 1024 * 1024:
+            raise ManifestError("framed file size is invalid", code="payload_too_large")
+        hasher = hashlib.sha256()
+        remaining = size
+        with (root / name).open("wb") as destination:
+            while remaining:
+                chunk = _read_exact(source, min(1024 * 1024, remaining))
+                destination.write(chunk)
+                hasher.update(chunk)
+                remaining -= len(chunk)
+        if hasher.hexdigest() != digest:
+            raise ManifestError("framed file digest does not match", code="invalid_input")
+        seen.add(name)
+    if seen != DATABASE_NAMES or source.remaining != 0:
+        raise ManifestError("framed input file set is invalid", code="invalid_input")
 
 
 def _error_payload(error: ContainerError | ManifestError) -> dict[str, Any]:
@@ -127,19 +188,35 @@ class ProcessorHandler(HealthHandler):
             header_manifest = self.headers.get("X-Container-Input-Manifest")
             if header_manifest:
                 manifest = _decode_manifest_header(header_manifest)
-                input_bundle = manifest.get("input_bundle")
-                expected_size = input_bundle.get("size_bytes") if isinstance(input_bundle, Mapping) else None
                 raw_length = self.headers.get("Content-Length")
                 try:
                     content_length = int(raw_length or "-1")
                 except ValueError as exc:
                     raise ManifestError("content length is invalid", code="invalid_contract") from exc
-                if not isinstance(expected_size, int) or content_length != expected_size:
-                    raise ManifestError("content length does not match manifest", code="invalid_contract")
-                result = self.adapter.run(
-                    manifest,
-                    bundle=_BoundedBody(self.rfile, content_length),
-                )
+                revision = int(self.headers.get("X-Container-Output-Revision") or "1")
+                if self.headers.get("X-Container-Transport") == "five-db-framed-v1":
+                    if content_length < len(FRAMED_MAGIC):
+                        raise ManifestError("content length is invalid", code="invalid_contract")
+                    with tempfile.TemporaryDirectory(prefix="oraja-framed-") as temporary:
+                        source_dir = Path(temporary)
+                        _materialize_framed_input(_BoundedBody(self.rfile, content_length), source_dir)
+                        result = self.adapter.run(
+                            manifest,
+                            bundle=source_dir,
+                            revision=revision,
+                            generated_at=str(manifest.get("requested_at")),
+                        )
+                else:
+                    input_bundle = manifest.get("input_bundle")
+                    expected_size = input_bundle.get("size_bytes") if isinstance(input_bundle, Mapping) else None
+                    if not isinstance(expected_size, int) or content_length != expected_size:
+                        raise ManifestError("content length does not match manifest", code="invalid_contract")
+                    result = self.adapter.run(
+                        manifest,
+                        bundle=_BoundedBody(self.rfile, content_length),
+                        revision=revision,
+                        generated_at=str(manifest.get("requested_at")),
+                    )
             else:
                 request = self._read_json_request()
                 manifest = request.get("manifest")
@@ -152,12 +229,25 @@ class ProcessorHandler(HealthHandler):
                     manifest,
                     bundle=_safe_fixture_path(self.input_root, bundle_name),
                 )
+            artifact_store = self.adapter.artifact_store
+            if not isinstance(artifact_store, MemoryArtifactStore):
+                raise ContainerError("artifact response store is unavailable", code="temporary_unavailable", retryable=True, status=503)
+            artifact_payloads = []
+            for artifact in result.artifacts:
+                content = artifact_store.objects.get(artifact.object_key)
+                if content is None or hashlib.sha256(content).hexdigest() != artifact.sha256:
+                    raise ContainerError("artifact response failed integrity", code="temporary_unavailable", retryable=True, status=503)
+                artifact_payloads.append({
+                    **artifact.as_manifest(),
+                    "data_base64": base64.b64encode(content).decode("ascii"),
+                })
             json_response(
                 self,
                 {
                     "status": "succeeded",
                     "output_manifest": result.output_manifest,
                     "output_manifest_sha256": result.output_manifest_sha256,
+                    "artifacts": artifact_payloads,
                 },
                 status=200,
             )

@@ -544,6 +544,7 @@ class ContainerAdapter:
         recommendation_input: RecommendationInput | None = None,
         recommendation_repository: Any | None = None,
         revision: int = 1,
+        generated_at: str | None = None,
         cancellation: CancellationToken | None = None,
         _entrypoint: str | None = None,
     ) -> JobResult:
@@ -638,12 +639,12 @@ class ContainerAdapter:
                         content_type=stored.content_type,
                     )
                 )
-            generated_at = _iso_timestamp(self.clock())
+            rendered_generated_at = generated_at or _iso_timestamp(self.clock())
             output = build_output_manifest(
                 input_manifest,
                 input_manifest_sha256=manifest_sha256(input_manifest.as_dict()),
                 output_revision=revision,
-                generated_at=generated_at,
+                generated_at=rendered_generated_at,
                 counters={
                     "accepted_events": counters["accepted_events"],
                     "rejected_events": counters["rejected_events"],

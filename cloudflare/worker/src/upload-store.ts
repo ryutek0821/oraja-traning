@@ -135,6 +135,45 @@ export class D1UploadSessionStore implements UploadSessionStore {
     return row ? this.hydrate(row) : null;
   }
 
+  /** Resolve deduplicated files back to the immutable object owner metadata. */
+  async getCompletedSession(profileScope: string, uploadId: string): Promise<UploadSessionRecord | null> {
+    const session = await this.getSession(profileScope, uploadId);
+    if (!session || session.state !== "completed") return null;
+    const files: UploadFileSession[] = [];
+    for (const file of session.files) {
+      if (file.encryption && file.parts.length > 0) {
+        files.push(file);
+        continue;
+      }
+      const owner = await this.db.prepare(
+        `SELECT upload_id, file_name, sha256, size_bytes, state, object_key,
+                created_object_key, r2_upload_id, encryption_json, dedup_json
+           FROM upload_files
+          WHERE object_key = ?1 AND encryption_json IS NOT NULL
+          ORDER BY rowid ASC
+          LIMIT 1`,
+      ).bind(file.objectKey).first<FileRow & { upload_id: string }>();
+      if (!owner || owner.sha256 !== file.sha256 || owner.size_bytes !== file.sizeBytes) {
+        protocolError("object_integrity_failed", 422);
+      }
+      const partsResult = await this.db.prepare(
+        `SELECT file_name, part_number, etag, sha256, size_bytes
+           FROM upload_parts
+          WHERE upload_id = ?1 AND file_name = ?2
+          ORDER BY part_number`,
+      ).bind(owner.upload_id, owner.file_name).all<PartRow>();
+      const encryption = parseJson<ObjectEncryptionMetadata>(owner.encryption_json, "encryption_metadata_invalid");
+      if (!encryption || partsResult.results.length === 0) protocolError("object_integrity_failed", 422);
+      files.push({ ...file, encryption, parts: partsResult.results.map((part) => ({
+        partNumber: part.part_number,
+        etag: part.etag,
+        sha256: part.sha256,
+        sizeBytes: part.size_bytes,
+      })) });
+    }
+    return { ...session, files };
+  }
+
   async createSession(session: UploadSessionRecord): Promise<void> {
     const statements: D1PreparedStatement[] = [
       this.db

@@ -1,0 +1,288 @@
+import { canonicalJson } from "./workflow-state";
+import { sha256Hex, type JobEnvelope } from "./job-ledger";
+import { D1UploadSessionStore } from "./upload-store";
+import {
+  EnvelopeCrypto,
+  FIVE_DB_FILE_NAMES,
+  decryptCompletedUploadObject,
+  profileScope,
+  type UploadFileSession,
+} from "./upload-protocol";
+
+export type ContainerBridgeEnv = {
+  CONTROL_DB: D1Database;
+  RAW_BUCKET: R2Bucket;
+  ARTIFACT_BUCKET: R2Bucket;
+  PYTHON_PROCESSOR: DurableObjectNamespace;
+  ENVELOPE_MASTER_KEY?: string;
+};
+
+export type ContainerBridgeResult = {
+  outputManifestSha256: string;
+  artifactKey: string;
+};
+
+type ContainerArtifact = {
+  kind: string;
+  object_key: string;
+  sha256: string;
+  size_bytes: number;
+  content_type: string;
+  data_base64: string;
+};
+
+type ContainerResponse = {
+  status: string;
+  output_manifest: Record<string, unknown>;
+  output_manifest_sha256: string;
+  artifacts: ContainerArtifact[];
+};
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA256 = /^[0-9a-f]{64}$/;
+const MAX_BRIDGE_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_INLINE_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const MAGIC = new TextEncoder().encode("ORAJA5DB1\n");
+const encoder = new TextEncoder();
+
+export class ContainerBridgeError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly retryable: boolean,
+  ) {
+    super(code);
+    this.name = "ContainerBridgeError";
+  }
+}
+
+function requestedAt(jobId: string): string {
+  if (!UUID.test(jobId)) throw new ContainerBridgeError("invalid_job_identity", false);
+  const millis = Number.parseInt(jobId.replace(/-/g, "").slice(0, 12), 16);
+  return new Date(millis).toISOString().replace(".000Z", "Z");
+}
+
+function encodeBase64Url(value: string): string {
+  const bytes = encoder.encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeBase64(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new ContainerBridgeError("artifact_payload_invalid", false);
+  try {
+    return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+  } catch {
+    throw new ContainerBridgeError("artifact_payload_invalid", false);
+  }
+}
+
+async function sha256Bytes(value: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", value.slice().buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function fileHeader(file: UploadFileSession): Uint8Array {
+  return encoder.encode(canonicalJson({
+    file_name: file.fileName,
+    sha256: file.sha256,
+    size_bytes: file.sizeBytes,
+  }));
+}
+
+function uint32(value: number): Uint8Array {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value);
+  return bytes;
+}
+
+function transportLength(files: readonly UploadFileSession[]): number {
+  return files.reduce((total, file) => total + 4 + fileHeader(file).byteLength + file.sizeBytes, MAGIC.byteLength);
+}
+
+function framedStream(
+  files: readonly UploadFileSession[],
+  objects: readonly R2Object[],
+  scope: string,
+  cryptoBox: EnvelopeCrypto,
+): ReadableStream<Uint8Array> {
+  async function* frames(): AsyncGenerator<Uint8Array> {
+    yield MAGIC;
+    for (let index = 0; index < files.length; index += 1) {
+      const header = fileHeader(files[index]);
+      yield uint32(header.byteLength);
+      yield header;
+      const stream = decryptCompletedUploadObject(objects[index], files[index], scope, cryptoBox);
+      const reader = stream.getReader();
+      try {
+        while (true) {
+          const item = await reader.read();
+          if (item.done) break;
+          yield item.value;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+  }
+  const iterator = frames();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const item = await iterator.next();
+        if (item.done) controller.close();
+        else controller.enqueue(item.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await iterator.return(undefined);
+    },
+  });
+}
+
+function parseInputPointer(value: string | null): string {
+  const match = /^upload-session:([0-9a-f-]{36})$/i.exec(value ?? "");
+  if (!match || !UUID.test(match[1])) throw new ContainerBridgeError("input_manifest_pointer_missing", false);
+  return match[1].toLowerCase();
+}
+
+async function immutablePut(bucket: R2Bucket, key: string, content: Uint8Array, digest: string, contentType: string): Promise<void> {
+  const existing = await bucket.head(key);
+  if (existing) {
+    if (existing.customMetadata?.sha256 !== digest || existing.size !== content.byteLength) {
+      throw new ContainerBridgeError("artifact_immutable_conflict", false);
+    }
+    return;
+  }
+  await bucket.put(key, content, { httpMetadata: { contentType }, customMetadata: { sha256: digest } });
+  const stored = await bucket.head(key);
+  if (!stored || stored.customMetadata?.sha256 !== digest || stored.size !== content.byteLength) {
+    throw new ContainerBridgeError("artifact_store_failed", true);
+  }
+}
+
+function validateOutputIdentity(job: JobEnvelope, response: ContainerResponse): void {
+  const manifest = response.output_manifest;
+  if (response.status !== "succeeded"
+    || manifest.contract !== "container-output-manifest"
+    || manifest.schema_version !== "1"
+    || manifest.job_id !== job.jobId
+    || manifest.account_id !== job.accountId
+    || manifest.profile_id !== job.profileId
+    || manifest.idempotency_key !== job.idempotencyKey
+    || manifest.trust_domain !== job.trustDomain
+    || manifest.output_revision !== job.revision
+    || !SHA256.test(response.output_manifest_sha256)) {
+    throw new ContainerBridgeError("container_output_contract_invalid", false);
+  }
+}
+
+export async function processContainerJob(job: JobEnvelope, env: ContainerBridgeEnv): Promise<ContainerBridgeResult> {
+  if (!env.ENVELOPE_MASTER_KEY) throw new ContainerBridgeError("envelope_key_unavailable", true);
+  if (job.trustDomain !== "official") throw new ContainerBridgeError("unsupported_trust_domain", false);
+  const uploadId = parseInputPointer(job.inputKey);
+  const scope = await profileScope(job.profileId);
+  const session = await new D1UploadSessionStore(env.CONTROL_DB).getCompletedSession(scope, uploadId);
+  if (!session) throw new ContainerBridgeError("input_manifest_not_found", true);
+  if (session.manifestSha256 !== job.inputDigest) throw new ContainerBridgeError("input_digest_mismatch", false);
+  const byName = new Map(session.files.map((file) => [file.fileName, file]));
+  const files = FIVE_DB_FILE_NAMES.map((name) => byName.get(name));
+  if (files.some((file) => !file)) throw new ContainerBridgeError("input_file_set_invalid", false);
+  const ordered = files as UploadFileSession[];
+  const totalPlaintext = ordered.reduce((total, file) => total + file.sizeBytes, 0);
+  if (!Number.isSafeInteger(totalPlaintext) || totalPlaintext > MAX_BRIDGE_BYTES) {
+    throw new ContainerBridgeError("input_bundle_too_large", false);
+  }
+  const objects: R2Object[] = [];
+  for (const file of ordered) {
+    const object = await env.RAW_BUCKET.get(file.objectKey);
+    if (!object) throw new ContainerBridgeError("input_object_not_found", true);
+    objects.push(object);
+  }
+  const inputManifest = {
+    contract: "container-input-manifest",
+    schema_version: "1",
+    job_id: job.jobId,
+    idempotency_key: job.idempotencyKey,
+    account_id: job.accountId,
+    profile_id: job.profileId,
+    trust_domain: job.trustDomain,
+    source_manifest_sha256: job.inputDigest,
+    input_bundle: {
+      object_key: `profiles/${job.profileId}/uploads/${uploadId}/five-db.enc`,
+      sha256: job.inputDigest,
+      size_bytes: totalPlaintext,
+      encryption: "envelope-v1",
+      key_ref: `profile-key:${job.profileId}`,
+    },
+    requested_at: requestedAt(job.jobId),
+    game_mode: "SP7",
+    policy: {
+      eligibility_status: "eligible",
+      eligibility_reason_code: null,
+      eligibility_policy_version: "2026-07-01",
+      include_raw_db_in_model: false,
+    },
+  };
+  const cryptoBox = EnvelopeCrypto.fromSecret(env.ENVELOPE_MASTER_KEY);
+  const body = framedStream(ordered, objects, scope, cryptoBox);
+  const length = transportLength(ordered);
+  const stub = env.PYTHON_PROCESSOR.get(env.PYTHON_PROCESSOR.idFromName(job.jobId));
+  const response = await stub.fetch("http://python-processor/v1/jobs", {
+    method: "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(length),
+      "x-container-input-manifest": encodeBase64Url(canonicalJson(inputManifest)),
+      "x-container-output-revision": String(job.revision),
+      "x-container-transport": "five-db-framed-v1",
+    },
+    body,
+  });
+  if (!response.ok) {
+    const retryable = response.status >= 500 || response.status === 429;
+    throw new ContainerBridgeError("container_processing_failed", retryable);
+  }
+  const declared = Number(response.headers.get("content-length") ?? "0");
+  if (declared > MAX_INLINE_ARTIFACT_BYTES * 2) throw new ContainerBridgeError("container_response_too_large", false);
+  const payload = await response.json() as ContainerResponse;
+  validateOutputIdentity(job, payload);
+  const calculatedManifest = await sha256Hex(canonicalJson(payload.output_manifest));
+  if (calculatedManifest !== payload.output_manifest_sha256) {
+    throw new ContainerBridgeError("container_manifest_digest_mismatch", false);
+  }
+  if (!Array.isArray(payload.artifacts) || payload.artifacts.length < 1) {
+    throw new ContainerBridgeError("container_artifact_missing", false);
+  }
+  const manifestArtifacts = payload.output_manifest.artifacts;
+  if (!Array.isArray(manifestArtifacts) || manifestArtifacts.length !== payload.artifacts.length) {
+    throw new ContainerBridgeError("container_artifact_contract_invalid", false);
+  }
+  let inlineBytes = 0;
+  const prefix = `profiles/${job.profileId}/jobs/${job.jobId}/revisions/${job.revision}/`;
+  for (const artifact of payload.artifacts) {
+    if (!artifact.object_key.startsWith(prefix) || !SHA256.test(artifact.sha256)) {
+      throw new ContainerBridgeError("container_artifact_partition_invalid", false);
+    }
+    const declaredArtifact = manifestArtifacts.find((candidate) => (
+      candidate && typeof candidate === "object"
+      && (candidate as Record<string, unknown>).object_key === artifact.object_key
+      && (candidate as Record<string, unknown>).sha256 === artifact.sha256
+    ));
+    if (!declaredArtifact) throw new ContainerBridgeError("container_artifact_contract_invalid", false);
+    const content = decodeBase64(artifact.data_base64);
+    inlineBytes += content.byteLength;
+    if (inlineBytes > MAX_INLINE_ARTIFACT_BYTES
+      || content.byteLength !== artifact.size_bytes
+      || await sha256Bytes(content) !== artifact.sha256) {
+      throw new ContainerBridgeError("container_artifact_digest_mismatch", false);
+    }
+    await immutablePut(env.ARTIFACT_BUCKET, artifact.object_key, content, artifact.sha256, artifact.content_type);
+  }
+  const artifactKey = `${prefix}manifest.json`;
+  const manifestBytes = encoder.encode(canonicalJson(payload.output_manifest));
+  await immutablePut(env.ARTIFACT_BUCKET, artifactKey, manifestBytes, payload.output_manifest_sha256, "application/json");
+  return { outputManifestSha256: payload.output_manifest_sha256, artifactKey };
+}
