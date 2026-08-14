@@ -11,6 +11,38 @@ on:
           - preview
           - staging
           - production
+      change_issue:
+        description: "Approved change issue, for example #20 (staging/production)"
+        required: false
+        type: string
+      backup_evidence:
+        description: "Immutable pre-deploy backup evidence ID (staging/production)"
+        required: false
+        type: string
+      restore_drill_evidence:
+        description: "Latest isolated restore-drill record ID (staging/production)"
+        required: false
+        type: string
+      rollback_version:
+        description: "Previously approved 40-character commit SHA"
+        required: false
+        type: string
+      release_manifest_sha256:
+        description: "SHA-256 of the reviewed release manifest"
+        required: false
+        type: string
+      migration_plan_sha256:
+        description: "SHA-256 of the reviewed migration plan"
+        required: false
+        type: string
+      go_no_go:
+        description: "Promotion decision (staging/production must select go)"
+        required: true
+        default: hold
+        type: choice
+        options:
+          - hold
+          - go
 
 permissions:
   contents: read
@@ -57,6 +89,13 @@ jobs:
         working-directory: cloudflare
     env:
       BUILD_VERSION: ${{ github.sha }}
+      ORAJA_CHANGE_ISSUE: ${{ inputs.change_issue }}
+      ORAJA_BACKUP_EVIDENCE: ${{ inputs.backup_evidence }}
+      ORAJA_RESTORE_DRILL_EVIDENCE: ${{ inputs.restore_drill_evidence }}
+      ORAJA_ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+      ORAJA_RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
+      ORAJA_MIGRATION_PLAN_SHA256: ${{ inputs.migration_plan_sha256 }}
+      ORAJA_GO_NO_GO: ${{ inputs.go_no_go }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
@@ -86,6 +125,13 @@ jobs:
     env:
       BUILD_VERSION: ${{ github.sha }}
       ORAJA_PRODUCTION_DEPLOY_APPROVED: "true"
+      ORAJA_CHANGE_ISSUE: ${{ inputs.change_issue }}
+      ORAJA_BACKUP_EVIDENCE: ${{ inputs.backup_evidence }}
+      ORAJA_RESTORE_DRILL_EVIDENCE: ${{ inputs.restore_drill_evidence }}
+      ORAJA_ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+      ORAJA_RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
+      ORAJA_MIGRATION_PLAN_SHA256: ${{ inputs.migration_plan_sha256 }}
+      ORAJA_GO_NO_GO: ${{ inputs.go_no_go }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:

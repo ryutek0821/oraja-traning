@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { validateReleaseGate } from "./release-gate.mjs";
 
 const environment = process.argv[2];
 if (environment !== "production") throw new Error("only the production guard is supported");
@@ -10,6 +11,7 @@ if (approval !== "true") {
 for (const name of ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]) {
   if (!process.env[name]) throw new Error(`missing protected deployment secret: ${name}`);
 }
+validateReleaseGate(environment);
 const buildVersion = process.env.BUILD_VERSION ?? "production-local";
 if (!/^[A-Za-z0-9._-]+$/.test(buildVersion)) throw new Error("BUILD_VERSION contains unsupported characters");
 const result = spawnSync(

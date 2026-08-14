@@ -12,12 +12,17 @@
    Replace `preview` only with the explicitly approved environment. The
    script uses the named `CONTROL_DB` binding and `--remote`; it is not run by
    pull-request CI.
-3. Record the Worker version, migration list, binding names, and backup IDs in
-   the deployment record.
+3. Record the Worker version, migration list and its SHA-256, binding names,
+   pre-deploy backup ID, isolated restore-drill ID, previous approved 40-character
+   commit SHA, release-manifest SHA-256, operator, and approver. These values
+   are required by the staging/production deploy evidence gate.
 4. If a migration is incompatible, stop writes, keep read-only health and
    version endpoints available, restore the last approved backup, and deploy
    the previously approved Worker version.
-5. Never edit an applied migration. Add a forward repair migration after the
+5. Follow [backup-restore-drill.md](backup-restore-drill.md) and compare the
+   restored D1 rows, Durable Object state, encrypted R2 inventory, tombstones,
+   owner boundaries, and immutable latest pointers before reopening writes.
+6. Never edit an applied migration. Add a forward repair migration after the
    restore has been verified.
 
 The foundation migration is intentionally a no-op marker. Control-plane
