@@ -10,6 +10,7 @@ const JSON_HEADERS = {
 type ProfileStorage = {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
+  list<T>(options?: { prefix?: string; start?: string; limit?: number }): Promise<Map<string, T>>;
   transaction?<T>(callback: (storage: ProfileStorage) => Promise<T>): Promise<T>;
 };
 
@@ -67,6 +68,28 @@ function isStoredPlayEvent(value: unknown): value is StoredPlayEvent {
   );
 }
 
+function publicPlay(record: StoredPlayEvent): Record<string, unknown> {
+  return {
+    event_id: record.event.event_id,
+    occurred_at: record.event.occurred_at,
+    game_mode: record.event.game_mode,
+    rule: record.event.rule,
+    chart: record.event.chart,
+    play: {
+      clear: record.event.play.clear,
+      gauge_kind: record.event.play.gauge_kind,
+      assist_kind: record.event.play.assist_kind,
+      notes: record.event.play.notes,
+      passnotes: record.event.play.passnotes,
+      minbp: record.event.play.minbp,
+      ex_score: record.event.play.ex_score,
+      combo: record.event.play.combo,
+      options: record.event.play.options,
+    },
+    accepted_at: record.accepted_at,
+  };
+}
+
 function ackFor(record: StoredPlayEvent, status: PlayAck["status"], enqueueRequired: boolean): PlayAck {
   return {
     status,
@@ -106,6 +129,12 @@ export class ProfileDurableObject extends DurableObject {
     }
     if (request.method === "POST" && url.pathname === "/internal/play-events") {
       return this.accept(request);
+    }
+    if (request.method === "GET" && url.pathname === "/internal/training-summary") {
+      return this.trainingSummary(url);
+    }
+    if (request.method === "GET" && url.pathname === "/internal/plays") {
+      return this.listPlays(url);
     }
     const enqueueMatch = /^\/internal\/play-events\/([^/]+)\/enqueued$/.exec(url.pathname);
     if (request.method === "POST" && enqueueMatch) {
@@ -203,6 +232,53 @@ export class ProfileDurableObject extends DurableObject {
         return true;
       });
       return marked ? response({ marked: true }) : response({ error: { code: "not_found" } }, 404);
+    } catch {
+      return response({ error: { code: "temporary_unavailable" } }, 503);
+    }
+  }
+
+  private async trainingSummary(url: URL): Promise<Response> {
+    const days = Number(url.searchParams.get("days") ?? "30");
+    if (![7, 30, 90].includes(days)) return response({ error: { code: "invalid_days" } }, 400);
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    try {
+      const values = await this.storage().list<unknown>({ prefix: "play:", limit: 1000 });
+      const records = [...values.values()].filter(isStoredPlayEvent).filter((item) => Date.parse(item.event.occurred_at) >= cutoff);
+      const aggregate = records.reduce((result, item) => {
+        result.ex_score += item.event.play.ex_score;
+        result.minbp += item.event.play.minbp;
+        result.notes += item.event.play.notes;
+        return result;
+      }, { ex_score: 0, minbp: 0, notes: 0 });
+      return response({
+        window_days: days,
+        play_count: records.length,
+        totals: aggregate,
+        averages: {
+          ex_score: records.length ? aggregate.ex_score / records.length : 0,
+          minbp: records.length ? aggregate.minbp / records.length : 0,
+        },
+        data_quality: { scanned_limit: 1000, truncated: values.size === 1000 },
+      });
+    } catch {
+      return response({ error: { code: "temporary_unavailable" } }, 503);
+    }
+  }
+
+  private async listPlays(url: URL): Promise<Response> {
+    const limit = Number(url.searchParams.get("limit") ?? "50");
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (cursor !== undefined && !cursor.startsWith("play:"))) {
+      return response({ error: { code: "invalid_pagination" } }, 400);
+    }
+    try {
+      const values = await this.storage().list<unknown>({ prefix: "play:", start: cursor ? `${cursor}\0` : undefined, limit: limit + 1 });
+      const entries = [...values.entries()].filter((entry): entry is [string, StoredPlayEvent] => isStoredPlayEvent(entry[1]));
+      const page = entries.slice(0, limit);
+      return response({
+        plays: page.map(([, record]) => publicPlay(record)),
+        next_cursor: entries.length > limit ? page.at(-1)?.[0] ?? null : null,
+      });
     } catch {
       return response({ error: { code: "temporary_unavailable" } }, 503);
     }
