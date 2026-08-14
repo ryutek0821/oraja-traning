@@ -491,7 +491,7 @@ def build_counter_rollback_fixture(root: str | Path) -> Path:
         conn.execute(
             """
             UPDATE player SET
-              playcount = 9, playtime = 2_000,
+              playcount = 9, playtime = 2000,
               epg = 50, lpg = 10, egr = 1, lgr = 0,
               egd = 1, lgd = 0, ebd = 0, lbd = 0,
               epr = 0, lpr = 0, ems = 1, lms = 0
