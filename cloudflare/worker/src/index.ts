@@ -37,6 +37,7 @@ import {
   type PlayAck,
 } from "./ir-api";
 import { ProfileDurableObject } from "./profile-do";
+import { dashboardData } from "./dashboard";
 import { createAdvisorProposal, decideAdvisorProposal, listAdvisorProposals } from "./advisor";
 import { handleMcp } from "./mcp";
 import {
@@ -623,6 +624,13 @@ export default {
     if (url.pathname === "/mcp") return handleMcp(request, env);
     const authResponse = await handleAuth(request, env, origin);
     if (authResponse) return authResponse;
+    if (url.pathname === "/v1/dashboard") {
+      try {
+        return json(await dashboardData(request, env), 200, origin);
+      } catch (error) {
+        return apiFailure(error, origin);
+      }
+    }
     const deviceResponse = await handleDeviceRoutes(request, env, origin);
     if (deviceResponse) return deviceResponse;
     const playResponse = await handlePlayRoute(request, env, origin);

@@ -4,65 +4,83 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
-    <title>oraja-training</title>
-    <style>
-      :root { font-family: system-ui, sans-serif; line-height: 1.5; }
-      body { max-width: 58rem; margin: 0 auto; padding: 2rem 1rem; }
-      nav { display: flex; justify-content: space-between; gap: 1rem; }
-      section { border: 1px solid #8886; border-radius: .7rem; padding: 1rem; margin: 1rem 0; }
-      button, input { font: inherit; padding: .45rem .6rem; }
-      button { cursor: pointer; }
-      .muted { opacity: .75; }
-      [hidden] { display: none; }
-    </style>
+    <meta name="referrer" content="no-referrer" />
+    <title>oraja-training cockpit</title>
+    <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
-    <nav aria-label="Language and account">
-      <strong>oraja-training</strong>
-      <span><button id="ja" type="button">日本語</button> <button id="ko" type="button">한국어</button> <a href="/auth.html" data-i18n="account">アカウント</a></span>
-    </nav>
-    <main>
-      <h1 data-i18n="title">練習ダッシュボード</h1>
-      <p class="muted" data-i18n="intro">プロフィールごとの最新表、IR端末、データ操作を安全に管理します。</p>
-      <section aria-labelledby="profile-title">
-        <h2 id="profile-title" data-i18n="profile">プロフィール</h2>
-        <label><span data-i18n="profileId">プロフィールID</span> <input id="profile" autocomplete="off" /></label>
-        <button id="load" type="button" data-i18n="load">概要を取得</button>
-        <pre id="summary" aria-live="polite"></pre>
+    <a class="skip" href="#main">本文へ移動</a>
+    <header class="masthead">
+      <a class="wordmark" href="/" aria-label="oraja-training home"><span>07</span> oraja-training</a>
+      <nav aria-label="Account and language">
+        <button class="quiet" id="locale" type="button" aria-label="한국어로 전환">JA / KO</button>
+        <button class="quiet" id="logout" type="button" data-i18n="logout">ログアウト</button>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div>
+          <p class="eyebrow" data-i18n="eyebrow">BEATORAJA / SP7 TRAINING DESK</p>
+          <h1 id="hero-title" data-i18n="title">次の一曲を、<br />迷わず選ぶ。</h1>
+          <p class="lede" data-i18n="intro">公式IRの記録を、練習表と小さな判断材料へ変換します。</p>
+        </div>
+        <div class="lanes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
       </section>
-      <section aria-labelledby="actions-title">
-        <h2 id="actions-title" data-i18n="actions">操作</h2>
-        <button id="export" type="button" data-i18n="export">データをExport</button>
-        <button id="delete" type="button" data-i18n="delete">削除を申請</button>
-        <button id="cancel" type="button" data-i18n="cancel">7日取消</button>
-        <p id="message" role="status"></p>
-      </section>
-      <p class="muted" data-i18n="privacy">raw DB、token、会話全文は画面やMCPへ公開しません。</p>
+
+      <p id="status" class="status" role="status" aria-live="polite" data-i18n="loading">読み込み中…</p>
+
+      <div class="desk" id="dashboard" hidden>
+        <aside class="rail" aria-label="Profile status">
+          <p class="eyebrow" data-i18n="profile">PROFILE</p>
+          <h2 id="profile-name">—</h2>
+          <dl>
+            <div><dt data-i18n="timezone">タイムゾーン</dt><dd id="timezone">—</dd></div>
+            <div><dt data-i18n="profileStatus">状態</dt><dd id="profile-status">—</dd></div>
+            <div><dt data-i18n="lastRun">最終処理</dt><dd id="last-run">—</dd></div>
+          </dl>
+          <a class="button secondary" href="/guide.html" data-i18n="guide">IR導入ガイド</a>
+        </aside>
+
+        <div class="workarea">
+          <section class="panel" aria-labelledby="tables-title">
+            <div class="panel-head"><div><p class="eyebrow">PLAYER OUTPUT</p><h2 id="tables-title" data-i18n="tables">今日の練習表</h2></div><button id="refresh" class="quiet" type="button" data-i18n="refresh">更新</button></div>
+            <div id="artifacts" class="cards"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="summary-title">
+            <div class="panel-head"><div><p class="eyebrow">7 / 30 / 90 DAYS</p><h2 id="summary-title" data-i18n="summary">練習の輪郭</h2></div></div>
+            <div id="summaries" class="summary-grid"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="devices-title">
+            <div class="panel-head"><div><p class="eyebrow">OFFICIAL IR</p><h2 id="devices-title" data-i18n="devices">接続端末</h2></div><button id="new-device" type="button" data-i18n="addDevice">端末を追加</button></div>
+            <div id="devices" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="import-title">
+            <div class="panel-head"><div><p class="eyebrow">MONTHLY SNAPSHOT</p><h2 id="import-title" data-i18n="import">5DBを提出</h2></div></div>
+            <p data-i18n="importHelp">静止スナップショット5ファイルだけを選択してください。BMS本体、Replay、-wal、-shmは送信しません。</p>
+            <input id="db-files" type="file" multiple accept=".db" aria-describedby="db-hint" />
+            <p id="db-hint" class="muted">songdata.db / songinfo.db / score.db / scorelog.db / scoredatalog.db</p>
+            <button id="prepare-upload" type="button" data-i18n="prepare">内容を確認</button>
+            <progress id="upload-progress" value="0" max="100" hidden>0%</progress>
+          </section>
+
+          <section class="panel danger" aria-labelledby="privacy-title">
+            <div class="panel-head"><div><p class="eyebrow">DATA CONTROL</p><h2 id="privacy-title" data-i18n="privacy">データ管理</h2></div></div>
+            <p data-i18n="privacyHelp">Exportと削除はログイン中のプロフィールだけが対象です。削除は7日以内なら取り消せます。</p>
+            <div class="actions"><button id="export" class="secondary" type="button" data-i18n="export">Exportを作成</button><button id="delete" class="destructive" type="button" data-i18n="delete">削除を申請</button><button id="cancel-delete" class="secondary" type="button" data-i18n="cancel">削除を取り消す</button></div>
+          </section>
+        </div>
+      </div>
     </main>
-    <script>
-      const translations = {
-        ja: { account: "アカウント", title: "練習ダッシュボード", intro: "プロフィールごとの最新表、IR端末、データ操作を安全に管理します。", profile: "プロフィール", profileId: "プロフィールID", load: "概要を取得", actions: "操作", export: "データをExport", delete: "削除を申請", cancel: "7日取消", privacy: "raw DB、token、会話全文は画面やMCPへ公開しません。" },
-        ko: { account: "계정", title: "연습 대시보드", intro: "프로필별 최신 표, IR 장치와 데이터 작업을 안전하게 관리합니다.", profile: "프로필", profileId: "프로필 ID", load: "요약 가져오기", actions: "작업", export: "데이터 Export", delete: "삭제 신청", cancel: "7일 취소", privacy: "raw DB, token, 대화 전문은 화면이나 MCP에 공개하지 않습니다." },
-      };
-      const $ = (id) => document.getElementById(id);
-      const state = { lang: "ja" };
-      function setLanguage(lang) {
-        state.lang = lang;
-        document.documentElement.lang = lang;
-        for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = translations[lang][node.dataset.i18n];
-      }
-      async function post(path) {
-        const profile = $("profile").value.trim();
-        const response = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": document.cookie.match(/(?:^|; )oraja_csrf=([^;]+)/)?.[1] || "" }, body: JSON.stringify({ profile_id: profile }) });
-        const payload = await response.json().catch(() => ({}));
-        $("message").textContent = response.ok ? JSON.stringify(payload) : `${response.status}: ${payload.error?.code || "error"}`;
-      }
-      $("ja").onclick = () => setLanguage("ja");
-      $("ko").onclick = () => setLanguage("ko");
-      $("load").onclick = async () => { const profile = $("profile").value.trim(); const response = await fetch(`/t/${encodeURIComponent(profile)}/recommend/header.json`); $("summary").textContent = JSON.stringify(await response.json().catch(() => ({})), null, 2); };
-      $("export").onclick = () => post("/v1/privacy/export");
-      $("delete").onclick = () => post("/v1/privacy/delete");
-      $("cancel").onclick = () => post("/v1/privacy/delete/cancel");
-    </script>
+
+    <dialog id="token-dialog" aria-labelledby="token-title">
+      <h2 id="token-title" data-i18n="tokenTitle">このtokenは一度だけ表示されます</h2>
+      <p data-i18n="tokenHelp">IR設定へ保存し、共有・スクリーンショット・ログ記録をしないでください。</p>
+      <code id="device-token"></code>
+      <div class="actions"><button id="copy-token" type="button" data-i18n="copy">コピー</button><button id="close-token" class="secondary" type="button" data-i18n="saved">保存しました</button></div>
+    </dialog>
+    <script src="/app.js" defer></script>
   </body>
 </html>
