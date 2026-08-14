@@ -46,6 +46,7 @@ jobs:
       - run: npm run schema:check
       - run: npm run check
       - run: npm run typecheck
+      - run: npm run public:scan
       - run: mkdir -p artifacts
       - run: npm sbom --package-lock-only --sbom-format cyclonedx > artifacts/cloudflare-sbom.json
       - run: node -e "JSON.parse(require('fs').readFileSync('artifacts/cloudflare-sbom.json', 'utf8'))"

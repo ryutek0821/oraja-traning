@@ -2,7 +2,7 @@
 
 1. Read `SPEC.md`, `docs/architecture.md`, and the relevant contract before
    changing a boundary.
-2. Use synthetic fixtures only. Never add `player-file`, real databases,
+2. Use synthetic fixtures only. Never add real database snapshot directories,
    personal paths, secrets, replay data, or internal prompts.
 3. Keep account/profile ownership predicates explicit and preserve the
    `official` versus `self-hosted` trust boundary.

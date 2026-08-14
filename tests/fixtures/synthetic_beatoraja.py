@@ -1,7 +1,7 @@
 """Build public-safe, deterministic beatoraja source and catalog fixtures.
 
 The source databases are generated into pytest's temporary directory.  No
-``player-file`` snapshot, BMS body, personal name, or machine path is needed
+No real database snapshot, BMS body, personal name, or machine path is needed
 to run the collection, backfill, snapshot, and golden tests.
 
 The default builder creates a coherent static five-DB snapshot.  Variant

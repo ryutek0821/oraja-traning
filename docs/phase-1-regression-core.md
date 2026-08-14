@@ -31,7 +31,7 @@ GitHub上のissue本文は `gh issue view` で確認した。#25、#3、#4はい
 | core/menu golden | [`tests/golden/synthetic_outputs.json`](../tests/golden/synthetic_outputs.json) | 正規化play列、推薦候補、Daily Menu 100,000 + RESERVE 10,000、model stateを固定 |
 | 更新手順 | [`tests/golden/update_synthetic.py`](../tests/golden/update_synthetic.py)、[`tests/golden/README.md`](../tests/golden/README.md) | goldenの生成・check・レビュー条件を定義。数値だけの手編集は禁止 |
 | 回帰テスト | [`tests/test_synthetic_fixture.py`](../tests/test_synthetic_fixture.py)、[`tests/test_golden.py`](../tests/test_golden.py) | manifest、catalog ownership/hash edge、sidecar、破損/途中更新/巻戻り、privacy、golden budgetを検証 |
-| pytest接続 | [`tests/conftest.py`](../tests/conftest.py) | `player-file`ではなく合成builderをsession fixtureとして利用し、DBとsidecarの不変性を検査 |
+| pytest接続 | [`tests/conftest.py`](../tests/conftest.py) | 実DBではなく合成builderをsession fixtureとして利用し、DBとsidecarの不変性を検査 |
 
 ### #3 受入条件の監査
 
