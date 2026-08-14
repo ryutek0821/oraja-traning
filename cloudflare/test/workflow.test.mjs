@@ -35,3 +35,11 @@ test("job status, cancellation, and manual retry are owner-scoped routes", () =>
   assert.match(worker, /ledger\.manualRetry\(accountId, jobId, accountId\)/);
   assert.match(worker, /new JobDispatcher\(ledger, env\.JOB_QUEUE\)\.dispatch\(job\)/);
 });
+
+test("ledger-generated job and audit identities use UUIDv7", () => {
+  assert.match(ledger, /export function uuidV7/);
+  assert.match(ledger, /bytes\[6\] = \(bytes\[6\] & 0x0f\) \| 0x70/);
+  assert.match(ledger, /bytes\[8\] = \(bytes\[8\] & 0x3f\) \| 0x80/);
+  assert.match(ledger, /idFactory: \(\) => string = \(\) => uuidV7\(\)/);
+  assert.doesNotMatch(ledger, /idFactory: \(\) => string = \(\) => crypto\.randomUUID\(\)/);
+});
