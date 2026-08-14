@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import astuple, dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 import math
-import sqlite3
 import statistics
 from typing import Any
+
+from oraja_training.domain import FeatureRepository
 
 from .songinfo import (
     SongInfoDecodeError,
@@ -48,7 +49,7 @@ def _nearest_rank(values: Sequence[int], percentile: float) -> float:
     return float(ordered[rank - 1])
 
 
-def _row_value(row: Mapping[str, Any] | sqlite3.Row, key: str) -> Any:
+def _row_value(row: Mapping[str, Any], key: str) -> Any:
     try:
         return row[key]
     except (KeyError, IndexError):
@@ -56,7 +57,7 @@ def _row_value(row: Mapping[str, Any] | sqlite3.Row, key: str) -> Any:
 
 
 def extract_features(
-    row: Mapping[str, Any] | sqlite3.Row,
+    row: Mapping[str, Any],
     *,
     feature_version: int = FEATURE_VERSION,
 ) -> ChartFeatures:
@@ -127,61 +128,51 @@ def extract_features(
     )
 
 
-_INSERT = """
-INSERT INTO chart_features (
-  sha256, feature_version, density_mean, density_p90, density_p99,
-  end_density, burst_max, scratch_rate, scratch_p90, scratch_combo_rate,
-  ln_rate, soflan_var, soflan_changes, stop_count, chart_seconds, total_notes
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(sha256) DO UPDATE SET
-  feature_version=excluded.feature_version,
-  density_mean=excluded.density_mean,
-  density_p90=excluded.density_p90,
-  density_p99=excluded.density_p99,
-  end_density=excluded.end_density,
-  burst_max=excluded.burst_max,
-  scratch_rate=excluded.scratch_rate,
-  scratch_p90=excluded.scratch_p90,
-  scratch_combo_rate=excluded.scratch_combo_rate,
-  ln_rate=excluded.ln_rate,
-  soflan_var=excluded.soflan_var,
-  soflan_changes=excluded.soflan_changes,
-  stop_count=excluded.stop_count,
-  chart_seconds=excluded.chart_seconds,
-  total_notes=excluded.total_notes
-"""
+def build_feature_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    feature_version: int = FEATURE_VERSION,
+) -> tuple[ChartFeatures, ...]:
+    """Calculate feature values without reading from or writing to storage.
+
+    Invalid SongInformation rows are skipped for compatibility with the
+    original bulk import.  A remote adapter can use the returned immutable
+    values and decide independently how to report or persist skipped rows.
+    """
+
+    result: list[ChartFeatures] = []
+    for row in rows:
+        try:
+            result.append(extract_features(row, feature_version=feature_version))
+        except SongInfoDecodeError:
+            continue
+    return tuple(result)
 
 
-def build_all(
-    songinfo_conn: sqlite3.Connection,
-    assistant_conn: sqlite3.Connection | None = None,
+def build_from_repository(
+    repository: FeatureRepository,
     *,
     feature_version: int = FEATURE_VERSION,
 ) -> int:
-    """Upsert all valid ``information`` rows and return the written count.
+    """Run the pure feature calculation through a repository port."""
 
-    ``songinfo_conn`` may safely be a ``mode=ro``/``query_only`` connection;
-    only ``assistant_conn`` is written.  Passing one connection is supported
-    for compact fixtures containing both tables.
-    """
+    rows = repository.iter_songinfo()
+    features = build_feature_rows(rows, feature_version=feature_version)
+    return int(repository.save_features(features))
 
-    destination = assistant_conn if assistant_conn is not None else songinfo_conn
-    old_factory = songinfo_conn.row_factory
-    songinfo_conn.row_factory = sqlite3.Row
-    try:
-        rows = songinfo_conn.execute(
-            "SELECT sha256, distribution, speedchange, lanenotes FROM information "
-            "ORDER BY sha256"
-        )
-        written = 0
-        for row in rows:
-            try:
-                features = extract_features(row, feature_version=feature_version)
-            except SongInfoDecodeError:
-                continue
-            destination.execute(_INSERT, astuple(features))
-            written += 1
-        destination.commit()
-        return written
-    finally:
-        songinfo_conn.row_factory = old_factory
+
+def build_all(
+    songinfo_source: object,
+    assistant_source: object | None = None,
+    *,
+    feature_version: int = FEATURE_VERSION,
+) -> int:
+    """Compatibility shim; SQLite I/O lives in ``db.feature_adapter``."""
+
+    from oraja_training.db.feature_adapter import build_all as adapter_build_all
+
+    return adapter_build_all(
+        songinfo_source,
+        assistant_source,
+        feature_version=feature_version,
+    )

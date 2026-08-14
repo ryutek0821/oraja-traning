@@ -1,5 +1,4 @@
 import { Container } from "@cloudflare/containers";
-import { WorkflowEntrypoint } from "cloudflare:workers";
 import { CloudflareAuthEmailSender } from "./email";
 import {
   AuthError,
@@ -12,6 +11,7 @@ import {
   logoutSession,
   readCookie,
   registerAccount,
+  requestEmailChange,
   requestPasswordReset,
   rotateSession,
   sessionCookie,
@@ -47,6 +47,18 @@ import {
   registerClient,
 } from "./oauth";
 import { cancelDeletion, requestDataExport, requestDeletion } from "./privacy";
+import { D1UploadSessionStore } from "./upload-store";
+import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
+import {
+  D1JobLedger,
+  JobDispatcher,
+  consumeQueueMessage,
+  dispatchSchedule,
+  type JobEnvelope,
+} from "./job-ledger";
+import { SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
+import { handleCapabilityTable } from "./tables";
+export { GenerateWorkflow } from "./workflow";
 
 export { ProfileDurableObject };
 
@@ -64,11 +76,13 @@ export interface Env {
   BACKUP_BUCKET: R2Bucket;
   JOB_QUEUE: Queue;
   GENERATE_WORKFLOW: Workflow;
-  ASSETS: Fetcher;
+  ASSETS?: Fetcher;
   AUTH_EMAIL?: SendEmail;
   AUTH_EMAIL_FROM?: string;
   EMAIL_ENCRYPTION_KEY?: string;
+  AUTH_HASH_PEPPER?: string;
   DEVICE_TOKEN_PEPPER?: string;
+  ENVELOPE_MASTER_KEY?: string;
 }
 
 const JSON_HEADERS = {
@@ -76,19 +90,15 @@ const JSON_HEADERS = {
   "cache-control": "no-store",
 };
 
-function json(
-  value: unknown,
-  status = 200,
-  origin?: string,
-  extraHeaders?: HeadersInit,
-): Response {
+function json(value: unknown, status = 200, origin?: string, extraHeaders?: HeadersInit): Response {
   const headers = new Headers(JSON_HEADERS);
   if (origin) {
     headers.set("access-control-allow-origin", origin);
     headers.set("access-control-allow-credentials", "true");
+    headers.append("vary", "Origin");
   }
   if (extraHeaders) {
-    for (const [name, value] of new Headers(extraHeaders)) headers.append(name, value);
+    for (const [name, headerValue] of new Headers(extraHeaders)) headers.append(name, headerValue);
   }
   return new Response(JSON.stringify(value) + "\n", { status, headers });
 }
@@ -96,7 +106,7 @@ function json(
 function allowedOrigin(request: Request, env: Env): string | undefined {
   const origin = request.headers.get("Origin");
   if (!origin) return undefined;
-  const allowed = env.CORS_ORIGINS.split(",").map((item) => item.trim());
+  const allowed = env.CORS_ORIGINS.split(",").map((item) => item.trim()).filter(Boolean);
   return allowed.includes(origin) ? origin : undefined;
 }
 
@@ -114,14 +124,11 @@ function clientIp(request: Request): string {
 async function requestPayload(request: Request): Promise<Record<string, unknown>> {
   const contentLength = Number(request.headers.get("Content-Length") ?? "0");
   if (contentLength > 64 * 1024) throw new AuthError("payload_too_large", 413);
-  const contentType = request.headers.get("Content-Type") ?? "";
-  if (contentType.includes("application/json")) {
-    const body = await request.json();
-    if (!body || typeof body !== "object" || Array.isArray(body)) throw new AuthError("invalid_request", 400);
-    return body as Record<string, unknown>;
+  const body: unknown = await request.json();
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new AuthError("invalid_request", 400);
   }
-  const form = await request.formData();
-  return Object.fromEntries(form.entries());
+  return body as Record<string, unknown>;
 }
 
 function emailSender(env: Env): CloudflareAuthEmailSender | undefined {
@@ -137,14 +144,16 @@ function authOptions(request: Request, env: Env) {
     publicOrigin: env.PUBLIC_ORIGIN,
     emailSender: emailSender(env),
     emailEncryptionSecret: env.EMAIL_ENCRYPTION_KEY,
+    hashingSecret: env.AUTH_HASH_PEPPER,
   };
 }
 
-function sessionHeaders(result: { sessionToken: string; expiresAt: number }): HeadersInit {
-  return {
-    "set-cookie": sessionCookie(result.sessionToken),
-    "x-session-expires-at": String(result.expiresAt),
-  };
+function sessionHeaders(result: { sessionToken: string; csrfToken: string; expiresAt: number }): Headers {
+  const headers = new Headers();
+  headers.append("set-cookie", sessionCookie(result.sessionToken));
+  headers.append("set-cookie", csrfCookie(result.csrfToken));
+  headers.set("x-session-expires-at", String(result.expiresAt));
+  return headers;
 }
 
 function authErrorResponse(error: unknown, origin?: string): Response {
@@ -159,7 +168,6 @@ function authErrorResponse(error: unknown, origin?: string): Response {
 async function handleAuth(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/v1/auth/")) return null;
-  if (request.method === "OPTIONS") return null;
   const options = authOptions(request, env);
   try {
     if (url.pathname === "/v1/auth/register" && request.method === "POST") {
@@ -182,37 +190,26 @@ async function handleAuth(request: Request, env: Env, origin?: string): Promise<
         email_confirmation_sent: result.emailConfirmationSent,
       }, 201, origin);
     }
-
     if (url.pathname === "/v1/auth/login" && request.method === "POST") {
       const body = await requestPayload(request);
       const result = await loginAccount(env.CONTROL_DB, body.user_id, body.password, options);
-      const headers = new Headers(sessionHeaders(result));
-      headers.append("set-cookie", csrfCookie(result.csrfToken));
-      return json({ account_public_id: result.accountPublicId }, 200, origin, headers);
+      return json({ account_public_id: result.accountPublicId }, 200, origin, sessionHeaders(result));
     }
-
     if (url.pathname === "/v1/auth/recovery" && request.method === "POST") {
       const body = await requestPayload(request);
       const result = await useRecoveryCode(env.CONTROL_DB, body.user_id, body.code, options);
-      const headers = new Headers(sessionHeaders(result));
-      headers.append("set-cookie", csrfCookie(result.csrfToken));
-      return json({ account_public_id: result.accountPublicId }, 200, origin, headers);
+      return json({ account_public_id: result.accountPublicId }, 200, origin, sessionHeaders(result));
     }
-
     if (url.pathname === "/v1/auth/password-reset/request" && request.method === "POST") {
       const body = await requestPayload(request);
       await requestPasswordReset(env.CONTROL_DB, body.email, options);
       return json({ accepted: true }, 202, origin);
     }
-
     if (url.pathname === "/v1/auth/password-reset/complete" && request.method === "POST") {
       const body = await requestPayload(request);
       const result = await completePasswordReset(env.CONTROL_DB, body.token, body.password, options);
-      const headers = new Headers(sessionHeaders(result));
-      headers.append("set-cookie", csrfCookie(result.csrfToken));
-      return json({ account_public_id: result.accountPublicId }, 200, origin, headers);
+      return json({ account_public_id: result.accountPublicId }, 200, origin, sessionHeaders(result));
     }
-
     if (url.pathname === "/v1/auth/verify-email" && (request.method === "GET" || request.method === "POST")) {
       const token = request.method === "GET" ? url.searchParams.get("token") : (await requestPayload(request)).token;
       await confirmEmail(env.CONTROL_DB, token, options);
@@ -221,33 +218,28 @@ async function handleAuth(request: Request, env: Env, origin?: string): Promise<
 
     const sessionToken = readCookie(request, "__Host-oraja_session");
     if (!sessionToken) throw new AuthError("unauthorized", 401);
-    const csrf = request.headers.get("X-CSRF-Token") || readCookie(request, "oraja_csrf");
+    const csrf = request.headers.get("X-CSRF-Token");
     if (!(await verifyCsrf(env.CONTROL_DB, sessionToken, csrf, options.now))) {
       throw new AuthError("csrf_required", 403);
     }
-
     if (url.pathname === "/v1/auth/logout" && request.method === "POST") {
       await logoutSession(env.CONTROL_DB, sessionToken, options);
-      return new Response(null, {
-        status: 204,
-        headers: (() => {
-          const headers = new Headers();
-          if (origin) {
-            headers.set("access-control-allow-origin", origin);
-            headers.set("access-control-allow-credentials", "true");
-          }
-          headers.append("set-cookie", expiredSessionCookie());
-          headers.append("set-cookie", expiredCsrfCookie());
-          return headers;
-        })(),
-      });
+      const headers = new Headers();
+      headers.append("set-cookie", expiredSessionCookie());
+      headers.append("set-cookie", expiredCsrfCookie());
+      if (origin) {
+        headers.set("access-control-allow-origin", origin);
+        headers.set("access-control-allow-credentials", "true");
+      }
+      return new Response(null, { status: 204, headers });
     }
-
     if (url.pathname === "/v1/auth/session/rotate" && request.method === "POST") {
       const result = await rotateSession(env.CONTROL_DB, sessionToken, options);
-      const headers = new Headers(sessionHeaders(result));
-      headers.append("set-cookie", csrfCookie(result.csrfToken));
-      return json({ rotated: true }, 200, origin, headers);
+      return json({ account_public_id: result.accountPublicId }, 200, origin, sessionHeaders(result));
+    }
+    if (url.pathname === "/v1/auth/email" && request.method === "POST") {
+      const body = await requestPayload(request);
+      return json(await requestEmailChange(env.CONTROL_DB, sessionToken, body.email, options), 202, origin);
     }
     return json({ error: { code: "not_found" } }, 404, origin);
   } catch (error) {
@@ -260,15 +252,11 @@ function requireDevicePepper(env: Env): string {
   return env.DEVICE_TOKEN_PEPPER;
 }
 
-async function requireWebAccount(
-  request: Request,
-  env: Env,
-  mutate: boolean,
-): Promise<string> {
+async function requireWebAccount(request: Request, env: Env, mutate: boolean): Promise<string> {
   const sessionToken = readCookie(request, "__Host-oraja_session");
   if (!sessionToken) throw new ApiError("unauthorized", 401);
   if (mutate) {
-    const csrf = request.headers.get("X-CSRF-Token") || readCookie(request, "oraja_csrf");
+    const csrf = request.headers.get("X-CSRF-Token");
     if (!(await verifyCsrf(env.CONTROL_DB, sessionToken, csrf, Math.floor(Date.now() / 1000)))) {
       throw new ApiError("csrf_required", 403);
     }
@@ -289,13 +277,7 @@ function apiFailure(error: unknown, origin?: string): Response {
 
 async function handleOAuthRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
-  if (
-    url.pathname !== "/oauth/register" &&
-    url.pathname !== "/oauth/authorize" &&
-    url.pathname !== "/oauth/token" &&
-    url.pathname !== "/.well-known/oauth-authorization-server" &&
-    url.pathname !== "/.well-known/openid-configuration"
-  ) return null;
+  if (!["/oauth/register", "/oauth/authorize", "/oauth/token", "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"].includes(url.pathname)) return null;
   try {
     if ((url.pathname === "/.well-known/oauth-authorization-server" || url.pathname === "/.well-known/openid-configuration") && request.method === "GET") {
       return json(oauthDiscovery(env.PUBLIC_ORIGIN), 200, origin);
@@ -309,17 +291,16 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
     }
     if (url.pathname === "/oauth/authorize" && request.method === "GET") {
       const accountId = await requireWebAccount(request, env, false);
-      const clientId = url.searchParams.get("client_id");
       const redirectUri = url.searchParams.get("redirect_uri");
-      const scope = url.searchParams.get("scope");
-      const codeChallenge = url.searchParams.get("code_challenge");
-      const profile = await env.CONTROL_DB.prepare("SELECT id FROM profiles WHERE account_id = ?1 AND status = 'active' ORDER BY created_at LIMIT 1").bind(accountId).first<{ id: string }>();
+      const profile = await env.CONTROL_DB.prepare(
+        "SELECT id FROM profiles WHERE account_id = ?1 AND status = 'active' ORDER BY created_at LIMIT 1",
+      ).bind(accountId).first<{ id: string }>();
       if (!profile) throw new ApiError("profile_not_found", 404);
       const code = await issueAuthorizationCode(env.CONTROL_DB, {
-        clientId,
+        clientId: url.searchParams.get("client_id"),
         redirectUri,
-        scope,
-        codeChallenge,
+        scope: url.searchParams.get("scope"),
+        codeChallenge: url.searchParams.get("code_challenge"),
         accountId,
         profileId: profile.id,
       });
@@ -347,14 +328,14 @@ async function handleOAuthRoutes(request: Request, env: Env, origin?: string): P
 
 async function handleAdvisorRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
-  const proposalMatch = /^\/v1\/advisor\/proposals(?:\/([^/]+)\/(approve|reject))?$/.exec(url.pathname);
-  if (!proposalMatch) return null;
+  const match = /^\/v1\/advisor\/proposals(?:\/([^/]+)\/(approve|reject))?$/.exec(url.pathname);
+  if (!match) return null;
   try {
     const principal = await authenticateOAuthToken(env.CONTROL_DB, bearerTokenForOAuth(request));
-    if (proposalMatch[1] && proposalMatch[2]) {
+    if (match[1] && match[2]) {
       if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
       const body = await readJsonBody(request, 8 * 1024);
-      return json(await decideAdvisorProposal(env.CONTROL_DB, principal, decodeURIComponent(proposalMatch[1]), proposalMatch[2] === "approve" ? "approved" : "rejected", body.reason), 200, origin);
+      return json(await decideAdvisorProposal(env.CONTROL_DB, principal, decodeURIComponent(match[1]), match[2] === "approve" ? "approved" : "rejected", body.reason), 200, origin);
     }
     if (request.method === "GET") return json({ proposals: await listAdvisorProposals(env.CONTROL_DB, principal, url.searchParams.get("status") ?? undefined) }, 200, origin);
     if (request.method === "POST") {
@@ -367,24 +348,21 @@ async function handleAdvisorRoutes(request: Request, env: Env, origin?: string):
   }
 }
 
-async function profileInternalId(request: Request, env: Env): Promise<{ accountId: string; profileId: string }> {
-  const accountId = await requireWebAccount(request, env, true);
-  const body = await readJsonBody(request, 8 * 1024);
-  const profilePublicId = typeof body.profile_id === "string" ? body.profile_id : "";
-  const profile = await env.CONTROL_DB.prepare("SELECT id FROM profiles WHERE account_id = ?1 AND (id = ?2 OR public_id = ?2) AND status <> 'deleted'").bind(accountId, profilePublicId).first<{ id: string }>();
-  if (!profile) throw new ApiError("profile_not_found", 404);
-  return { accountId, profileId: profile.id };
-}
-
 async function handlePrivacyRoutes(request: Request, env: Env, origin?: string): Promise<Response | null> {
   const url = new URL(request.url);
   if (!["/v1/privacy/export", "/v1/privacy/delete", "/v1/privacy/delete/cancel"].includes(url.pathname)) return null;
   try {
-    const owner = await profileInternalId(request, env);
+    const accountId = await requireWebAccount(request, env, true);
     if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
-    if (url.pathname === "/v1/privacy/export") return json(await requestDataExport(env.CONTROL_DB, owner.accountId, owner.profileId), 202, origin);
-    if (url.pathname === "/v1/privacy/delete") return json(await requestDeletion(env.CONTROL_DB, owner.accountId, owner.profileId), 202, origin);
-    return json(await cancelDeletion(env.CONTROL_DB, owner.accountId, owner.profileId), 200, origin);
+    const body = await readJsonBody(request, 8 * 1024);
+    const profilePublicId = typeof body.profile_id === "string" ? body.profile_id : "";
+    const profile = await env.CONTROL_DB.prepare(
+      "SELECT id FROM profiles WHERE account_id = ?1 AND (id = ?2 OR public_id = ?2) AND status <> 'deleted'",
+    ).bind(accountId, profilePublicId).first<{ id: string }>();
+    if (!profile) throw new ApiError("profile_not_found", 404);
+    if (url.pathname === "/v1/privacy/export") return json(await requestDataExport(env.CONTROL_DB, accountId, profile.id), 202, origin);
+    if (url.pathname === "/v1/privacy/delete") return json(await requestDeletion(env.CONTROL_DB, accountId, profile.id), 202, origin);
+    return json(await cancelDeletion(env.CONTROL_DB, accountId, profile.id), 200, origin);
   } catch (error) {
     return apiFailure(error, origin);
   }
@@ -394,30 +372,27 @@ async function handleDeviceRoutes(request: Request, env: Env, origin?: string): 
   const url = new URL(request.url);
   const listOrCreate = /^\/v1\/profiles\/([^/]+)\/devices$/.exec(url.pathname);
   const revokeAll = /^\/v1\/profiles\/([^/]+)\/devices\/revoke-all$/.exec(url.pathname);
-  const deviceMutation = /^\/v1\/devices\/([^/]+)(?:\/revoke)?$/.exec(url.pathname);
-  const deviceId = deviceMutation?.[1];
-  const isRevokeAction = deviceMutation && url.pathname.endsWith("/revoke");
-  if (!listOrCreate && !revokeAll && !deviceMutation) return null;
-
+  const mutation = /^\/v1\/devices\/([^/]+)(?:\/revoke)?$/.exec(url.pathname);
+  if (!listOrCreate && !revokeAll && !mutation) return null;
   const requestIdValue = requestId(request);
   try {
     if (listOrCreate && request.method === "GET") {
       const accountId = await requireWebAccount(request, env, false);
-      const devices = await listDevices(env.CONTROL_DB, accountId, decodeURIComponent(listOrCreate[1]));
-      return json({ devices }, 200, origin);
+      return json({
+        devices: await listDevices(env.CONTROL_DB, accountId, decodeURIComponent(listOrCreate[1])),
+      }, 200, origin);
     }
     if (listOrCreate && request.method === "POST") {
       const accountId = await requireWebAccount(request, env, true);
       const body = await readJsonBody(request, 16 * 1024);
-      const result = await issueDeviceToken(
+      return json(await issueDeviceToken(
         env.CONTROL_DB,
         accountId,
         decodeURIComponent(listOrCreate[1]),
         body.label,
         requireDevicePepper(env),
         { requestId: requestIdValue },
-      );
-      return json(result, 201, origin);
+      ), 201, origin);
     }
     if (revokeAll && request.method === "POST") {
       const accountId = await requireWebAccount(request, env, true);
@@ -429,22 +404,19 @@ async function handleDeviceRoutes(request: Request, env: Env, origin?: string): 
       );
       return json({ revoked: count }, 200, origin);
     }
-    if (deviceMutation && deviceId && request.method === "PATCH" && !isRevokeAction) {
+    if (mutation) {
       const accountId = await requireWebAccount(request, env, true);
-      const body = await readJsonBody(request, 16 * 1024);
-      const device = await renameDevice(
-        env.CONTROL_DB,
-        accountId,
-        decodeURIComponent(deviceId),
-        body.label,
-        { requestId: requestIdValue },
-      );
-      return json(device, 200, origin);
-    }
-    if (deviceMutation && deviceId && (request.method === "DELETE" || (request.method === "POST" && isRevokeAction))) {
-      const accountId = await requireWebAccount(request, env, true);
-      await revokeDevice(env.CONTROL_DB, accountId, decodeURIComponent(deviceId), { requestId: requestIdValue });
-      return json({ revoked: true }, 200, origin);
+      const deviceId = decodeURIComponent(mutation[1]);
+      if (request.method === "PATCH" && !url.pathname.endsWith("/revoke")) {
+        const body = await readJsonBody(request, 16 * 1024);
+        return json(await renameDevice(env.CONTROL_DB, accountId, deviceId, body.label, {
+          requestId: requestIdValue,
+        }), 200, origin);
+      }
+      if (request.method === "DELETE" || (request.method === "POST" && url.pathname.endsWith("/revoke"))) {
+        await revokeDevice(env.CONTROL_DB, accountId, deviceId, { requestId: requestIdValue });
+        return json({ revoked: true }, 200, origin);
+      }
     }
     throw new ApiError("method_not_allowed", 405);
   } catch (error) {
@@ -463,16 +435,6 @@ function publicPlayAck(ack: PlayAck): Omit<PlayAck, "enqueue_required"> {
   };
 }
 
-async function markPlayEnqueued(
-  stub: DurableObjectStub,
-  eventId: string,
-): Promise<void> {
-  const marked = await stub.fetch(`https://profile.internal/internal/play-events/${encodeURIComponent(eventId)}/enqueued`, {
-    method: "POST",
-  });
-  if (!marked.ok) throw new ApiError("temporary_unavailable", 503, true, 5);
-}
-
 async function enqueuePlay(
   env: Env,
   identity: DeviceIdentity,
@@ -480,16 +442,22 @@ async function enqueuePlay(
   ack: PlayAck,
   digest: string,
 ): Promise<void> {
-  if (env.JOB_QUEUE) {
-    await env.JOB_QUEUE.send({
-      type: "play.accepted.v1",
-      job_id: ack.job_id,
-      event_id: event.event_id,
-      profile_id: identity.profileId,
-      revision: ack.revision,
-      input_digest: digest,
-    });
-  }
+  await env.JOB_QUEUE.send({
+    type: "play.accepted.v1",
+    job_id: ack.job_id,
+    event_id: event.event_id,
+    profile_id: identity.profileId,
+    revision: ack.revision,
+    input_digest: digest,
+  });
+}
+
+async function markPlayEnqueued(stub: DurableObjectStub, eventId: string): Promise<void> {
+  const result = await stub.fetch(
+    `https://profile.internal/internal/play-events/${encodeURIComponent(eventId)}/enqueued`,
+    { method: "POST" },
+  );
+  if (!result.ok) throw new ApiError("temporary_unavailable", 503, true, 5);
 }
 
 async function handlePlayRoute(request: Request, env: Env, origin?: string): Promise<Response | null> {
@@ -500,21 +468,15 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
     if (request.method !== "POST") throw new ApiError("method_not_allowed", 405);
     const pepper = requireDevicePepper(env);
     const now = Math.floor(Date.now() / 1000);
-    const ip = clientIp(request);
-    await enforceIrRateLimit(env.CONTROL_DB, "ip", ip, pepper, now);
+    await enforceIrRateLimit(env.CONTROL_DB, "ip", clientIp(request), pepper, now);
     const identity = await authenticateDeviceToken(env.CONTROL_DB, bearerToken(request), pepper, { now });
     await enforceIrRateLimit(env.CONTROL_DB, "token", identity.tokenHash, pepper, now);
-    const payload = await readJsonBody(request);
-    const event = validateIrEvent(payload, identity, now);
+    const event = validateIrEvent(await readJsonBody(request), identity, now);
     const digest = await eventDigest(event, identity);
-    if (!env.PROFILE_DO) throw new ApiError("temporary_unavailable", 503, true, 5);
     const stub = env.PROFILE_DO.get(env.PROFILE_DO.idFromName(identity.profileId));
     const durableResponse = await stub.fetch("https://profile.internal/internal/play-events", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-request-id": requestIdValue,
-      },
+      headers: { "content-type": "application/json", "x-request-id": requestIdValue },
       body: JSON.stringify({
         profile_internal_id: identity.profileId,
         device_internal_id: identity.deviceId,
@@ -523,21 +485,16 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
         event,
       }),
     });
-    if (durableResponse.status === 409) return json({ error: { code: "idempotency_conflict" } }, 409, origin);
-    if (!durableResponse.ok) throw new ApiError("temporary_unavailable", 503, true, 5);
-    let ack: PlayAck;
-    try {
-      ack = await durableResponse.json() as PlayAck;
-    } catch {
-      throw new ApiError("temporary_unavailable", 503, true, 5);
+    if (durableResponse.status === 409) {
+      return json({ error: { code: "idempotency_conflict" } }, 409, origin);
     }
+    if (!durableResponse.ok) throw new ApiError("temporary_unavailable", 503, true, 5);
+    const ack = await durableResponse.json() as PlayAck;
     if (
       (ack.status !== "accepted" && ack.status !== "duplicate") ||
       ack.event_id !== event.event_id ||
       ack.idempotency_key !== event.event_id
-    ) {
-      throw new ApiError("temporary_unavailable", 503, true, 5);
-    }
+    ) throw new ApiError("temporary_unavailable", 503, true, 5);
     if (ack.enqueue_required) {
       await enqueuePlay(env, identity, event, ack, digest);
       await markPlayEnqueued(stub, event.event_id);
@@ -548,78 +505,102 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
   }
 }
 
+async function handleUploadRoute(request: Request, env: Env): Promise<Response | null> {
+  if (!new URL(request.url).pathname.startsWith("/v1/uploads")) return null;
+  if (!env.ENVELOPE_MASTER_KEY) return json({ error: { code: "upload_not_configured" } }, 503);
+  const service = new UploadService(
+    env.RAW_BUCKET,
+    new D1UploadSessionStore(env.CONTROL_DB),
+    EnvelopeCrypto.fromSecret(env.ENVELOPE_MASTER_KEY),
+  );
+  return handleUploadRequest(request, service, async (candidate) => {
+    const accountId = await requireWebAccount(candidate, env, candidate.method !== "GET");
+    const profile = await env.CONTROL_DB
+      .prepare(
+        "SELECT id FROM profiles WHERE account_id = ?1 AND status = 'active' ORDER BY created_at LIMIT 1",
+      )
+      .bind(accountId)
+      .first<{ id: string }>();
+    return profile ? { profileId: profile.id } : null;
+  });
+}
+
 export class PythonProcessor extends Container {
   defaultPort = 8080;
   sleepAfter = "10m";
   enableInternet = false;
 }
 
-export class GenerateWorkflow extends WorkflowEntrypoint<Env, { job_id: string }> {
-  async run(
-    event: { payload: { job_id: string } },
-    step: { do<T>(name: string, callback: () => Promise<T>): Promise<T> },
-  ): Promise<{ status: string; job_id: string }> {
-    return step.do("foundation-health-check", async () => ({
-      status: "foundation-ready",
-      job_id: event.payload.job_id,
-    }));
-  }
-}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const suppliedOrigin = request.headers.get("Origin");
     const origin = allowedOrigin(request, env);
-
-    if (url.pathname === "/healthz" && request.method === "GET") {
-      return json({ status: "ok", environment: env.ENVIRONMENT }, 200, origin);
-    }
-    if (url.pathname === "/version" && request.method === "GET") {
-      return json(
-        {
-          service: "oraja-training",
-          environment: env.ENVIRONMENT,
-          version: env.BUILD_VERSION,
-        },
-        200,
-        origin,
-      );
-    }
-
-    if (request.method === "OPTIONS" && origin) {
+    if (suppliedOrigin && !origin) return json({ error: { code: "origin_not_allowed" } }, 403);
+    if (request.method === "OPTIONS") {
+      if (!origin) return json({ error: { code: "origin_required" } }, 403);
       return new Response(null, {
         status: 204,
         headers: {
           "access-control-allow-origin": origin,
           "access-control-allow-credentials": "true",
-          "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
           "access-control-allow-headers": "content-type,authorization,x-csrf-token,x-request-id",
+          "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
           "access-control-max-age": "600",
+          "vary": "Origin",
         },
       });
     }
-
+    if (url.pathname === "/healthz" && request.method === "GET") {
+      return json({ status: "ok", environment: env.ENVIRONMENT });
+    }
+    if (url.pathname === "/version" && request.method === "GET") {
+      return json({ service: "oraja-training", environment: env.ENVIRONMENT, version: env.BUILD_VERSION });
+    }
     const oauthResponse = await handleOAuthRoutes(request, env, origin);
     if (oauthResponse) return oauthResponse;
-
     if (url.pathname === "/mcp") return handleMcp(request, env);
-
     const authResponse = await handleAuth(request, env, origin);
     if (authResponse) return authResponse;
-
     const deviceResponse = await handleDeviceRoutes(request, env, origin);
     if (deviceResponse) return deviceResponse;
-
     const playResponse = await handlePlayRoute(request, env, origin);
     if (playResponse) return playResponse;
-
+    const uploadResponse = await handleUploadRoute(request, env);
+    if (uploadResponse) return uploadResponse;
+    const tableResponse = await handleCapabilityTable(request, env);
+    if (tableResponse) return tableResponse;
     const advisorResponse = await handleAdvisorRoutes(request, env, origin);
     if (advisorResponse) return advisorResponse;
-
     const privacyResponse = await handlePrivacyRoutes(request, env, origin);
     if (privacyResponse) return privacyResponse;
-
     if (env.ASSETS) return env.ASSETS.fetch(request);
-    return json({ error: { code: "not_found" } }, 404, origin);
+    return json({ error: { code: "not_found" } }, 404);
+  },
+  async queue(batch: MessageBatch<JobEnvelope>, env: Env): Promise<void> {
+    const ledger = new D1JobLedger(env.CONTROL_DB);
+    for (const message of batch.messages) {
+      await consumeQueueMessage(message, {
+        ledger,
+        startWorkflow: async (job) => {
+          await env.GENERATE_WORKFLOW.create({
+            id: `job:${job.jobId}:run:${job.workflowRun}`,
+            params: job,
+          });
+        },
+      });
+    }
+  },
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    const schedule = (Object.entries(SCHEDULE_CRONS).find(([, cron]) => cron === controller.cron)?.[0]
+      ?? null) as ScheduleName | null;
+    if (!schedule) return;
+    const ledger = new D1JobLedger(env.CONTROL_DB);
+    await dispatchSchedule(
+      ledger,
+      new JobDispatcher(ledger, env.JOB_QUEUE),
+      schedule,
+      Math.floor(controller.scheduledTime / 1000),
+    );
   },
 };

@@ -9,6 +9,8 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from oraja_training.domain import Play
+
 
 JUDGEMENT_COLUMNS = (
     "epg",
@@ -85,7 +87,7 @@ def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
 
 
-def derive_play(
+def normalize_play(
     row: Mapping[str, Any],
     *,
     source: str,
@@ -93,8 +95,13 @@ def derive_play(
     aggregate_row: Mapping[str, Any] | None = None,
     lost_events: int = 0,
     ingested_at: int | None = None,
-) -> dict[str, Any]:
-    """Convert one beatoraja score-like row into the ``plays`` schema."""
+) -> Play:
+    """Convert one score-like mapping into a storage-neutral :class:`Play`.
+
+    The input is intentionally typed as ``Mapping`` rather than a SQLite row.
+    Readers and remote ingestion adapters can therefore share this conversion
+    without importing a database driver into the collection core.
+    """
 
     clear = int(row["clear"])
     notes = _optional_int(row.get("notes"))
@@ -125,34 +132,55 @@ def derive_play(
         and current_ex > aggregate_ex
     )
 
-    return {
-        "sha256": str(row["sha256"]),
-        "mode": int(row["mode"]),
-        "played_at": int(row["date"]),
-        "playcount": int(row["playcount"]),
-        "source_generation": int(source_generation),
-        "source": source,
-        "clear": clear,
-        "ex": current_ex,
-        "minbp": minbp,
-        "notes": notes,
-        "judged": judged,
-        "empty_poor": empty_poor,
-        "survival": survival,
-        "completed": completed,
-        "bp_rate": bp_rate,
-        "credited_gauge_kind": credited_gauge_kind,
-        "selected_gauge_kind": None,
-        "option": _optional_int(row.get("option")),
-        "seed": _optional_int(row.get("seed")),
-        "random": _optional_int(row.get("random")),
-        "trophy": None if row.get("trophy") is None else str(row["trophy"]),
-        "is_course": int(
+    return Play(
+        sha256=str(row["sha256"]),
+        mode=int(row["mode"]),
+        played_at=int(row["date"]),
+        playcount=int(row["playcount"]),
+        clear=clear,
+        notes=notes,
+        completed=completed,
+        source=source,
+        is_course=(
             source in {"collector", "legacy_last_snapshot", "daily_snapshot"}
             and clear == 0
         ),
-        "exceeded_aggregate_score": exceeded,
-        "lost_events": max(0, int(lost_events)),
-        "payload_hash": payload_hash(row),
-        "ingested_at": int(time.time()) if ingested_at is None else int(ingested_at),
-    }
+        source_generation=int(source_generation),
+        ex=current_ex,
+        minbp=minbp,
+        judged=judged,
+        empty_poor=empty_poor,
+        survival=survival,
+        bp_rate=bp_rate,
+        credited_gauge_kind=credited_gauge_kind,
+        selected_gauge_kind=None,
+        option=_optional_int(row.get("option")),
+        seed=_optional_int(row.get("seed")),
+        random=_optional_int(row.get("random")),
+        trophy=None if row.get("trophy") is None else str(row["trophy"]),
+        exceeded_aggregate_score=bool(exceeded),
+        lost_events=max(0, int(lost_events)),
+        payload_hash=payload_hash(row),
+        ingested_at=int(time.time()) if ingested_at is None else int(ingested_at),
+    )
+
+
+def derive_play(
+    row: Mapping[str, Any],
+    *,
+    source: str,
+    source_generation: int,
+    aggregate_row: Mapping[str, Any] | None = None,
+    lost_events: int = 0,
+    ingested_at: int | None = None,
+) -> dict[str, Any]:
+    """Compatibility mapping for the local SQLite adapter and old callers."""
+
+    return normalize_play(
+        row,
+        source=source,
+        source_generation=source_generation,
+        aggregate_row=aggregate_row,
+        lost_events=lost_events,
+        ingested_at=ingested_at,
+    ).as_record()

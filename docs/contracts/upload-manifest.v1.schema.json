@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oraja-training.dev/contracts/upload-manifest/v1/schema.json",
+  "title": "oraja-training five DB upload manifest v1",
+  "description": "Static, read-only beatoraja DB bundle. The five files are exact and sidecars are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "manifest_id",
+    "created_at",
+    "game_mode",
+    "files",
+    "snapshot",
+    "privacy"
+  ],
+  "properties": {
+    "contract": { "const": "five-db-upload-manifest" },
+    "schema_version": { "const": "1" },
+    "manifest_id": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" },
+    "created_at": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/timestamp" },
+    "game_mode": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/gameMode" },
+    "files": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file_name", "sha256", "size_bytes", "object_key"],
+        "properties": {
+          "file_name": {
+            "enum": [
+              "score.db",
+              "scoredatalog.db",
+              "scorelog.db",
+              "songdata.db",
+              "songinfo.db"
+            ]
+          },
+          "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483648
+          },
+          "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" }
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "static_snapshot",
+        "wal_present",
+        "shm_present",
+        "source_generation"
+      ],
+      "properties": {
+        "static_snapshot": { "const": true },
+        "wal_present": { "const": false },
+        "shm_present": { "const": false },
+        "source_generation": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/uuidv7" }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contains_bms", "contains_replay"],
+      "properties": {
+        "contains_bms": { "const": false },
+        "contains_replay": { "const": false }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "properties": {
+        "files": {
+          "contains": {
+            "type": "object",
+            "properties": { "file_name": { "const": "score.db" } },
+            "required": ["file_name"]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "files": {
+          "contains": {
+            "type": "object",
+            "properties": { "file_name": { "const": "scoredatalog.db" } },
+            "required": ["file_name"]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "files": {
+          "contains": {
+            "type": "object",
+            "properties": { "file_name": { "const": "scorelog.db" } },
+            "required": ["file_name"]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "files": {
+          "contains": {
+            "type": "object",
+            "properties": { "file_name": { "const": "songdata.db" } },
+            "required": ["file_name"]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "files": {
+          "contains": {
+            "type": "object",
+            "properties": { "file_name": { "const": "songinfo.db" } },
+            "required": ["file_name"]
+          }
+        }
+      }
+    }
+  ]
+}

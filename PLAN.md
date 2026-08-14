@@ -333,7 +333,7 @@ course生成とプレイ中の動的再推定はv1の非目標。
 
 ## 11. P0 実機調査結果（2026-08-09 実施・実DBで検証）
 
-対象: `player-file/` に配置された自環境の5DB。全て read-only（`immutable=1`）で参照。
+対象: リポジトリ外に配置した検証用5DB。全て read-only（`immutable=1`）で参照。
 
 ### 11.1 いちばん重要な訂正 —— `scoredatalog.db` は全プレイログではない
 
@@ -473,7 +473,7 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 
 - read-only reader、schema v3、backfill、content-diff Poller、静的2DB日次取込を実装済み
 - `initialize` / `daily-update` により入力DBへWAL等を書かず、SHA-256で同一提出を冪等化
-- `player-file/` 実測: charts 65,998 / legacy 384 / IR 542 / IR NoPlay除外 3
+- 初期実測値は個人データ由来のため公開版から除外。再現可能な合成fixtureを回帰基準とする
 - legacy: max survival 1.0 / `survival>1` 0 / completed 368 / `judged=notes` 272/272
 - credited gauge: HARD 99 / EASY 78 / NORMAL 37 / EXHARD 22 / NULL 148
 - `selected_gauge_kind` はStep 1では384/384 NULL

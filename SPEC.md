@@ -46,7 +46,7 @@ Worker の実デプロイ、IR JAR、5DB upload、生成ジョブ、Remote MCP/O
 1. **beatoraja のDBへは、いかなる経路でも書き込まない。**
    `score.db` / `scoredatalog.db` / `scorelog.db` / `songdata.db` / `songinfo.db` すべて。
    特に `songdata.db` は oraja-constellator が `bmscf_*` テーブルで使用中。
-2. **`player-file/*.db` はユーザーの実データ。** テストでは `file:...?immutable=1` で開く。
+2. **ユーザーの実DBはリポジトリへ置かない。** ローカル検証で参照する場合も `file:...?immutable=1` で開く。
 3. ライブ読取は `file:...?mode=ro` + `busy_timeout`。
    **`immutable=1` をライブDBに使ってはならない**（変更されない前提で施錠を省くため、書込み中の不整合を読む）。
 4. 難易度表はキャッシュ付きで取得する。スクレイピングやIRへの大量アクセスをしない。

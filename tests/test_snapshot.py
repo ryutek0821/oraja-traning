@@ -6,18 +6,18 @@ import sqlite3
 from oraja_training.collect import snapshot
 
 
-def test_daily_snapshot_baseline_and_idempotency(player_db_dir, tmp_path) -> None:
+def test_daily_snapshot_baseline_and_idempotency(synthetic_db_dir, tmp_path) -> None:
     score = tmp_path / "score-copy.db"
     log = tmp_path / "scoredatalog-copy.db"
-    shutil.copy2(player_db_dir / "score.db", score)
-    shutil.copy2(player_db_dir / "scoredatalog.db", log)
+    shutil.copy2(synthetic_db_dir / "score.db", score)
+    shutil.copy2(synthetic_db_dir / "scoredatalog.db", log)
     assistant = tmp_path / "assistant.db"
 
     first = snapshot.run(score, log, assistant)
-    assert first.cumulative_playcount == 507
-    assert first.baseline_judged == 1_080_762
+    assert first.cumulative_playcount == 12
+    assert first.baseline_judged == 140
     assert first.new_play_rows == 0
-    assert first.effective_date == "2026-08-08"
+    assert first.effective_date == "2023-11-16"
 
     again = snapshot.run(score, log, assistant)
     assert again.idempotent
@@ -27,17 +27,17 @@ def test_daily_snapshot_baseline_and_idempotency(player_db_dir, tmp_path) -> Non
     try:
         assert conn.execute(
             "SELECT delta_judged FROM player_daily ORDER BY date DESC LIMIT 1"
-        ).fetchone()[0] == 67_546
-        assert conn.execute("SELECT count(*) FROM score_state").fetchone()[0] == 933
+        ).fetchone()[0] == 30
+        assert conn.execute("SELECT count(*) FROM score_state").fetchone()[0] == 4
     finally:
         conn.close()
 
 
-def test_daily_snapshot_records_latest_and_lost_events(player_db_dir, tmp_path) -> None:
+def test_daily_snapshot_records_latest_and_lost_events(synthetic_db_dir, tmp_path) -> None:
     score = tmp_path / "score-copy.db"
     log = tmp_path / "scoredatalog-copy.db"
-    shutil.copy2(player_db_dir / "score.db", score)
-    shutil.copy2(player_db_dir / "scoredatalog.db", log)
+    shutil.copy2(synthetic_db_dir / "score.db", score)
+    shutil.copy2(synthetic_db_dir / "scoredatalog.db", log)
     assistant = tmp_path / "assistant.db"
     snapshot.run(score, log, assistant)
 
