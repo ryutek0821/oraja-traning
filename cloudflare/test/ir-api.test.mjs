@@ -33,6 +33,14 @@ test("play ingress enforces bearer scope, allowlist validation, DO persistence, 
   assert.match(durableObject, /payload_digest/);
 });
 
+test("IR read routes authenticate the device before owner-bound projections", () => {
+  assert.match(worker, /handleIrReadRoute/);
+  assert.match(worker, /authenticateDeviceToken\(env\.CONTROL_DB, bearerToken\(request\)/);
+  assert.match(worker, /readIrMethod\(url, identity/);
+  assert.match(source, /requestedPlayer !== identity\.profilePublicId/);
+  assert.match(durableObject, /projectIrScores/);
+});
+
 test("CORS exposes the device-management methods without widening payload routes", () => {
   assert.match(worker, /GET,POST,PATCH,DELETE,OPTIONS/);
   assert.match(worker, /content-type,authorization,x-csrf-token,x-request-id/);

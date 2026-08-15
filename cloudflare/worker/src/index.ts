@@ -21,6 +21,7 @@ import {
 } from "./auth";
 import {
   ApiError,
+  IR_READ_PATHS,
   authErrorResponse as irErrorResponse,
   authenticateDeviceToken,
   bearerToken,
@@ -29,6 +30,7 @@ import {
   issueDeviceToken,
   listDevices,
   readJsonBody,
+  readIrMethod,
   renameDevice,
   revokeAllDevices,
   revokeDevice,
@@ -696,6 +698,27 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
   }
 }
 
+async function handleIrReadRoute(request: Request, env: Env, origin?: string): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (!IR_READ_PATHS.has(url.pathname)) return null;
+  const requestIdValue = requestId(request);
+  try {
+    if (request.method !== "GET") throw new ApiError("method_not_allowed", 405);
+    const pepper = requireDevicePepper(env);
+    const now = Math.floor(Date.now() / 1000);
+    await enforceIrRateLimit(env.CONTROL_DB, "ip", clientIp(request), pepper, now);
+    const identity = await authenticateDeviceToken(env.CONTROL_DB, bearerToken(request), pepper, { now });
+    await enforceIrRateLimit(env.CONTROL_DB, "token", identity.tokenHash, pepper, now);
+    return json(await readIrMethod(url, identity, {
+      db: env.CONTROL_DB,
+      profileDo: env.PROFILE_DO,
+      buildVersion: env.BUILD_VERSION,
+    }), 200, origin);
+  } catch (error) {
+    return irErrorResponse(error, requestIdValue, origin);
+  }
+}
+
 async function handleUploadRoute(request: Request, env: Env): Promise<Response | null> {
   if (!new URL(request.url).pathname.startsWith("/v1/uploads")) return null;
   if (!env.ENVELOPE_MASTER_KEY) return json({ error: { code: "upload_not_configured" } }, 503);
@@ -855,6 +878,8 @@ export default {
     if (deviceResponse) return deviceResponse;
     const playResponse = await handlePlayRoute(request, env, origin);
     if (playResponse) return playResponse;
+    const irReadResponse = await handleIrReadRoute(request, env, origin);
+    if (irReadResponse) return irReadResponse;
     const uploadResponse = await handleUploadRoute(request, env);
     if (uploadResponse) return uploadResponse;
     const settingsResponse = await handleProfileSettingsRoutes(request, env, origin);
