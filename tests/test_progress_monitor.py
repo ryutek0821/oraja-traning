@@ -45,7 +45,7 @@ def _settings(tmp_path: Path) -> MonitorSettings:
     token.write_text("private-token\n", encoding="utf-8")
     return MonitorSettings(
         score_db=str(score),
-        server_url="http://100.118.150.23:8765/",
+        server_url="http://100.64.0.1:8765/",
         token_file=str(token),
     )
 

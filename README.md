@@ -103,10 +103,13 @@ oraja-training progress-token-create --output ./runtime/progress-token.txt
 ```console
 oraja-training serve \
   --export-dir ./export/current \
-  --host 100.118.150.23 --port 8765 \
+  --host 100.64.0.1 --port 8765 \
   --progress-state ./runtime/progress.json \
   --progress-token-file ./runtime/progress-token.txt
 ```
+
+`100.64.0.1`は説明用です。実行時は`tailscale ip -4`または`tailscale ip -6`で表示された
+このMac自身のTailnet IPへ置き換えてください。
 
 Macへのログイン後もサーバーを常駐・自動復旧させる場合は、ユーザーLaunchAgentを登録します。
 installerは設定hostがこのMacの`tailscale ip -4`または`tailscale ip -6`と一致しない場合、
@@ -114,7 +117,7 @@ tokenファイルが現在ユーザー所有かつgroup/otherから読めない�
 plistにはtokenのパスだけを保存し、token値は保存しません。
 
 ```console
-./scripts/install-progress-server-launch-agent.sh --host 100.118.150.23
+./scripts/install-progress-server-launch-agent.sh --host 100.64.0.1
 ```
 
 このLaunchAgentはログイン時に起動し、異常終了後は30秒以上の間隔を置いて再起動します。
@@ -131,7 +134,7 @@ RYU-DESKTOP2では、実際に使用しているplayerの`score.db`を指定し�
 ```powershell
 .\scripts\send-progress-windows.ps1 `
   -ScoreDb 'D:\path\to\beatoraja\player\PLAYER_NAME\score.db' `
-  -ServerUrl 'http://100.118.150.23:8765'
+  -ServerUrl 'http://100.64.0.1:8765'
 ```
 
 送信ツールはDBを読み取り専用で5秒ごとに確認し、値が変化した時と30秒ごとのheartbeatで
@@ -145,7 +148,7 @@ Mac側で拒否されます。90秒受信がなければTOPページを`STALE`�
 
 ```powershell
 .\scripts\start-progress-monitor-windows.ps1 `
-  -ServerUrl 'http://100.118.150.23:8765' `
+  -ServerUrl 'http://100.64.0.1:8765' `
   -TokenFile "$env:LOCALAPPDATA\oraja-training\progress-token.txt"
 ```
 
