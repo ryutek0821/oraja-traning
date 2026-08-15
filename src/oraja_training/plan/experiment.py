@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import sqlite3
@@ -13,6 +15,10 @@ from typing import Any, Mapping, Sequence
 ARMS = ("coach", "control")
 INTERVAL_DAYS = (1, 3, 7, 14)
 DAY_SECONDS = 86_400
+
+
+def _utc_iso(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,10 @@ def _normalise_candidates(
         result[group] = tuple(
             sorted(candidates, key=lambda item: (item.sha256, item.mode, item.p_pred))
         )
+    coach = {(item.sha256, item.mode) for item in result["coach"]}
+    control = {(item.sha256, item.mode) for item in result["control"]}
+    if coach & control:
+        raise ValueError("coach and control candidate sets must not overlap")
     return result
 
 
@@ -65,6 +75,177 @@ def _canonical_candidates(candidates: Mapping[str, Sequence[Candidate]]) -> str:
 def _draw(seed: str, session_key: str, purpose: str) -> int:
     material = f"oraja-experiment-v1\0{seed}\0{session_key}\0{purpose}".encode()
     return int.from_bytes(hashlib.sha256(material).digest(), "big")
+
+
+def _menu_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
+    candidate = _candidate(
+        {
+            "sha256": value.get("sha256"),
+            "mode": 0,
+            "p_pred": value.get("p_complete"),
+        }
+    )
+    return {
+        **asdict(candidate),
+        "title": str(value.get("title") or ""),
+        "artist": str(value.get("artist") or ""),
+    }
+
+
+def build_candidate_sets(
+    conn: sqlite3.Connection,
+    *,
+    experiment_id: int,
+    session_key: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Derive one auditable same-table/level comparison from the latest menu."""
+
+    experiment = conn.execute(
+        "SELECT seed FROM experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+    if experiment is None:
+        raise ValueError(f"unknown experiment {experiment_id}")
+    existing = conn.execute(
+        """
+        SELECT candidates_json FROM experiment_sessions
+        WHERE experiment_id = ? AND session_key = ?
+        """,
+        (experiment_id, session_key),
+    ).fetchone()
+    if existing is not None:
+        try:
+            stored = _normalise_candidates(json.loads(str(existing[0])))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError("stored experiment candidates are invalid") from error
+        return {
+            group: [asdict(item) for item in stored[group]]
+            for group in (*ARMS, "transfer")
+        }
+    row = conn.execute(
+        "SELECT slots_json FROM sessions ORDER BY created_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise ValueError("generate a Daily Menu before assigning an experiment session")
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("latest Daily Menu payload is invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError("latest Daily Menu payload is invalid")
+    queue = payload.get("queue")
+    personal = payload.get("personal")
+    if not isinstance(queue, list) or not isinstance(personal, list):
+        raise ValueError("latest Daily Menu has no candidate pool")
+
+    personal_rows = [item for item in personal if isinstance(item, dict)]
+    by_sha = {
+        str(item.get("sha256")): item
+        for item in personal_rows
+        if isinstance(item.get("sha256"), str)
+    }
+    queue_hashes = {
+        str(item.get("sha256"))
+        for item in queue
+        if isinstance(item, dict) and isinstance(item.get("sha256"), str)
+    }
+    reserved_rows = conn.execute(
+        """
+        SELECT selected_sha256, transfer_sha256
+        FROM experiment_sessions WHERE experiment_id = ?
+        """,
+        (experiment_id,),
+    ).fetchall()
+    reserved = {
+        str(value)
+        for reserved_row in reserved_rows
+        for value in reserved_row
+    }
+
+    focus_by_stratum: dict[
+        tuple[str, str, bool, str], list[dict[str, Any]]
+    ] = defaultdict(list)
+    for item in queue:
+        if (
+            not isinstance(item, dict)
+            or item.get("category") not in {"02 FOCUS-A", "04 FOCUS-B"}
+            or int(item.get("attempt") or 1) != 1
+        ):
+            continue
+        sha256 = item.get("sha256")
+        source = by_sha.get(str(sha256))
+        if source is None or str(sha256) in reserved:
+            continue
+        key = (
+            str(source.get("table_id") or item.get("table_id") or ""),
+            str(source.get("source_level") or item.get("source_level") or ""),
+            int(source.get("playcount") or 0) > 0,
+            str(source.get("primary_axis") or ""),
+        )
+        if key[0] and key[1] and key[3]:
+            focus_by_stratum[key].append(source)
+
+    possibilities: list[
+        tuple[
+            tuple[str, str, bool, str],
+            list[dict[str, Any]],
+            list[dict[str, Any]],
+            list[dict[str, Any]],
+        ]
+    ] = []
+    for key, coach_rows in sorted(focus_by_stratum.items()):
+        table_id, source_level, was_played, primary_axis = key
+        baseline = [
+            item
+            for item in personal_rows
+            if str(item.get("table_id") or "") == table_id
+            and str(item.get("source_level") or "") == source_level
+            and (int(item.get("playcount") or 0) > 0) == was_played
+            and str(item.get("sha256") or "") not in queue_hashes | reserved
+        ]
+        transfer_pool = [
+            item
+            for item in personal_rows
+            if str(item.get("table_id") or "") == table_id
+            and str(item.get("source_level") or "") == source_level
+            and int(item.get("playcount") or 0) == 0
+            and int(item.get("clear") or 0) == 0
+            and str(item.get("primary_axis") or "") == primary_axis
+            and str(item.get("sha256") or "") not in queue_hashes | reserved
+        ]
+        if not baseline or not transfer_pool:
+            continue
+        transfer = transfer_pool[
+            _draw(
+                str(experiment["seed"]),
+                session_key,
+                f"transfer-pool:{table_id}:{source_level}:{was_played}:{primary_axis}",
+            )
+            % len(transfer_pool)
+        ]
+        control_rows = [
+            item for item in baseline
+            if item.get("sha256") != transfer.get("sha256")
+        ]
+        if not control_rows:
+            continue
+        possibilities.append(
+            (key, coach_rows, control_rows, [transfer])
+        )
+    if not possibilities:
+        raise ValueError(
+            "latest Daily Menu has no focus/control/unused-transfer stratum"
+        )
+
+    selected = possibilities[
+        _draw(str(experiment["seed"]), session_key, "candidate-stratum")
+        % len(possibilities)
+    ]
+    _, coach_rows, control_rows, transfer_rows = selected
+    return {
+        "coach": [_menu_candidate(item) for item in coach_rows],
+        "control": [_menu_candidate(item) for item in control_rows],
+        "transfer": [_menu_candidate(item) for item in transfer_rows],
+    }
 
 
 def start_experiment(
@@ -109,6 +290,21 @@ def _assignment_result(conn: sqlite3.Connection, session_id: int) -> dict[str, A
     ).fetchone()
     if row is None:
         raise RuntimeError("assignment disappeared")
+    def selected(prefix: str) -> dict[str, Any]:
+        sha256 = str(row[f"{prefix}_sha256"])
+        mode = int(row[f"{prefix}_mode"])
+        result: dict[str, Any] = {
+            "sha256": sha256,
+            "mode": mode,
+            "p_pred": float(row[f"{prefix}_p_pred"]),
+        }
+        chart = conn.execute(
+            "SELECT title, artist FROM charts WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+        if chart is not None:
+            result["title"] = str(chart["title"] or "")
+            result["artist"] = str(chart["artist"] or "")
+        return result
     return {
         "session_id": int(row["id"]),
         "experiment_id": int(row["experiment_id"]),
@@ -117,16 +313,8 @@ def _assignment_result(conn: sqlite3.Connection, session_id: int) -> dict[str, A
         "arm_probability": float(row["arm_probability"]),
         "selection_probability": float(row["selection_probability"]),
         "candidate_hash": str(row["candidate_hash"]),
-        "selected": {
-            "sha256": str(row["selected_sha256"]),
-            "mode": int(row["selected_mode"]),
-            "p_pred": float(row["selected_p_pred"]),
-        },
-        "transfer": {
-            "sha256": str(row["transfer_sha256"]),
-            "mode": int(row["transfer_mode"]),
-            "p_pred": float(row["transfer_p_pred"]),
-        },
+        "selected": selected("selected"),
+        "transfer": selected("transfer"),
     }
 
 
@@ -152,6 +340,73 @@ def assign_session(
         raise ValueError("session_at is outside the experiment assignment period")
 
     candidates = _normalise_candidates(candidate_sets)
+    existing = conn.execute(
+        "SELECT id, session_at, candidates_json FROM experiment_sessions "
+        "WHERE experiment_id = ? AND session_key = ?",
+        (experiment_id, session_key),
+    ).fetchone()
+    if existing is not None:
+        if int(existing["session_at"]) != int(session_at):
+            raise ValueError("session_key was already assigned with different inputs")
+        try:
+            stored = _normalise_candidates(json.loads(str(existing["candidates_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError("stored experiment candidates are invalid") from error
+        if _canonical_candidates(stored) != _canonical_candidates(candidates):
+            raise ValueError("session_key was already assigned with different inputs")
+        return _assignment_result(conn, int(existing["id"]))
+
+    used_rows = conn.execute(
+        """
+        SELECT selected_sha256, selected_mode, transfer_sha256, transfer_mode
+        FROM experiment_sessions
+        WHERE experiment_id = ?
+        """,
+        (experiment_id,),
+    ).fetchall()
+    reserved = {
+        identity
+        for row in used_rows
+        for identity in (
+            (str(row["selected_sha256"]), int(row["selected_mode"])),
+            (str(row["transfer_sha256"]), int(row["transfer_mode"])),
+        )
+    }
+    candidates = {
+        group: tuple(
+            item
+            for item in candidates[group]
+            if (item.sha256, item.mode) not in reserved
+        )
+        for group in (*ARMS, "transfer")
+    }
+    for group in ARMS:
+        if not candidates[group]:
+            raise ValueError(
+                f"candidate set {group!r} has no chart unused by this experiment"
+            )
+    transfer_candidates = tuple(
+        item
+        for item in candidates["transfer"]
+        if conn.execute(
+            """
+            SELECT 1 FROM (
+              SELECT 1 FROM score_state
+              WHERE sha256 = ? AND mode = ? AND (playcount > 0 OR clear > 0)
+              UNION ALL
+              SELECT 1 FROM plays
+              WHERE sha256 = ? AND mode = ? AND is_course = 0
+                AND (playcount > 0 OR clear > 0 OR completed IS NOT NULL)
+            )
+            LIMIT 1
+            """,
+            (item.sha256, item.mode, item.sha256, item.mode),
+        ).fetchone()
+        is None
+    )
+    if not transfer_candidates:
+        raise ValueError("transfer candidates must be unpractised at session start")
+    candidates["transfer"] = transfer_candidates
     arm_identities = {
         (item.sha256, item.mode) for arm in ARMS for item in candidates[arm]
     }
@@ -161,22 +416,11 @@ def assign_session(
         raise ValueError("transfer candidates must be unpractised charts outside both arms")
     candidates_json = _canonical_candidates(candidates)
     candidate_hash = hashlib.sha256(candidates_json.encode()).hexdigest()
-    existing = conn.execute(
-        "SELECT id, session_at, candidate_hash FROM experiment_sessions "
-        "WHERE experiment_id = ? AND session_key = ?",
-        (experiment_id, session_key),
-    ).fetchone()
-    if existing is not None:
-        if int(existing["session_at"]) != int(session_at) or str(existing["candidate_hash"]) != candidate_hash:
-            raise ValueError("session_key was already assigned with different inputs")
-        return _assignment_result(conn, int(existing["id"]))
-
     arm = ARMS[_draw(str(experiment["seed"]), session_key, "arm") % len(ARMS)]
     arm_candidates = candidates[arm]
     selected = arm_candidates[
         _draw(str(experiment["seed"]), session_key, "selection") % len(arm_candidates)
     ]
-    transfer_candidates = candidates["transfer"]
     transfer = transfer_candidates[
         _draw(str(experiment["seed"]), session_key, "transfer")
         % len(transfer_candidates)
@@ -243,6 +487,9 @@ def resolve_targets(
     counts = {"resolved": 0, "missing": 0, "duplicate": 0, "pending": 0}
     with conn:
         for target in targets:
+            if resolved_at < int(target["window_closes_at"]):
+                counts["pending"] += 1
+                continue
             plays = conn.execute(
                 """
                 SELECT id, completed FROM plays
@@ -260,13 +507,27 @@ def resolve_targets(
             note: str | None = None
             outcome: int | None = None
             play_id: int | None = None
-            if len(plays) > 1:
+            if len(scorable) > 1:
                 status, note = "duplicate", "multiple plays in evaluation window"
             elif len(scorable) == 1:
-                status = "resolved"
-                play_id = int(scorable[0]["id"])
-                outcome = int(bool(scorable[0]["completed"]))
-            elif resolved_at >= int(target["window_closes_at"]):
+                candidate_play_id = int(scorable[0]["id"])
+                already_used = conn.execute(
+                    """
+                    SELECT 1 FROM experiment_targets other
+                    JOIN experiment_sessions session ON session.id = other.session_id
+                    WHERE session.experiment_id = ? AND other.id <> ?
+                      AND other.resolved_play_id = ?
+                    LIMIT 1
+                    """,
+                    (experiment_id, int(target["id"]), candidate_play_id),
+                ).fetchone()
+                if already_used is not None:
+                    status, note = "duplicate", "play already used by another target"
+                else:
+                    status = "resolved"
+                    play_id = candidate_play_id
+                    outcome = int(bool(scorable[0]["completed"]))
+            else:
                 status = "missing"
                 note = "no scorable play in evaluation window"
             if status == "pending":
@@ -283,6 +544,70 @@ def resolve_targets(
             )
             counts[status] += 1
     return counts
+
+
+def list_targets(
+    conn: sqlite3.Connection,
+    *,
+    experiment_id: int,
+    status: str | None = "pending",
+) -> dict[str, Any]:
+    """List the exact revisit schedule without exposing beatoraja source data."""
+
+    if status not in {None, "pending", "resolved", "missing", "duplicate"}:
+        raise ValueError("unknown experiment target status")
+    parameters: list[Any] = [experiment_id]
+    status_clause = ""
+    if status is not None:
+        status_clause = " AND target.status = ?"
+        parameters.append(status)
+    rows = conn.execute(
+        f"""
+        SELECT target.id, target.target_kind, target.interval_days,
+               target.sha256, target.mode, target.due_at,
+               target.window_closes_at, target.p_pred, target.status,
+               target.outcome, target.resolution_note,
+               session.session_key, session.arm, chart.title, chart.artist
+        FROM experiment_targets target
+        JOIN experiment_sessions session ON session.id = target.session_id
+        LEFT JOIN charts chart ON chart.sha256 = target.sha256
+        WHERE session.experiment_id = ?{status_clause}
+        ORDER BY target.due_at, target.target_kind, target.id
+        """,
+        parameters,
+    ).fetchall()
+    return {
+        "experiment_id": experiment_id,
+        "status": "all" if status is None else status,
+        "targets": [
+            {
+                "target_id": int(row["id"]),
+                "session_key": str(row["session_key"]),
+                "arm": str(row["arm"]),
+                "target_kind": str(row["target_kind"]),
+                "interval_days": int(row["interval_days"]),
+                "sha256": str(row["sha256"]),
+                "mode": int(row["mode"]),
+                "title": None if row["title"] is None else str(row["title"]),
+                "artist": None if row["artist"] is None else str(row["artist"]),
+                "due_at": int(row["due_at"]),
+                "due_at_utc": _utc_iso(int(row["due_at"])),
+                "window_closes_at": int(row["window_closes_at"]),
+                "window_closes_at_utc": _utc_iso(
+                    int(row["window_closes_at"])
+                ),
+                "p_pred": float(row["p_pred"]),
+                "status": str(row["status"]),
+                "outcome": None if row["outcome"] is None else int(row["outcome"]),
+                "resolution_note": (
+                    None
+                    if row["resolution_note"] is None
+                    else str(row["resolution_note"])
+                ),
+            }
+            for row in rows
+        ],
+    }
 
 
 def report_experiment(conn: sqlite3.Connection, *, experiment_id: int) -> dict[str, Any]:

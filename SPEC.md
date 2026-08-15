@@ -462,9 +462,9 @@ RESERVE 10k を別に提示する。focus譜面は3枠離して再試行し、�
 ### A-8.1 自己実験
 
 - `seed + session_key`のSHA-256からarmを50/50で決め、session内でarmを混在させない。
-- coach/control各候補から一様抽出し、正規化候補JSONのSHA-256、arm確率、周辺selection probabilityを保存する。
-- 選曲譜面をretention、別指定の未練習類似譜面をtransferとして、session時刻の1/3/7/14日後から24時間を評価窓にする。
-- 窓内で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は期限後`missing`、複数件は`duplicate`とし、期限外playは採用しない。
+- coach/controlは重複しない候補集合から一様抽出し、正規化候補JSONのSHA-256、arm確率、周辺selection probabilityを保存する。同じ実験で既に選曲・予約した譜面は以後の候補から除外する。
+- 選曲譜面をretention、session開始前に未練習かつ別指定の類似譜面をtransferとして、session時刻の1/3/7/14日後から24時間を評価窓にする。
+- 評価窓が閉じるまでは確定せず、窓全体で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は`missing`、複数件または同じplayの再利用は`duplicate`とし、期限外playは採用しない。
 - arm別の成功率とBrierをtarget種別・間隔ごとに出す。両armが事前設定した最小標本数へ達するまで差は`inconclusive`とする。
 - すべての実験書込みはassistant-owned schema v5だけへ行い、beatoraja入力DBへ書かない。
 

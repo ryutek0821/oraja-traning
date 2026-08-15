@@ -21,6 +21,8 @@ from oraja_training.model import fit_latest
 from oraja_training.plan import build_session, recommendation_output, write_export
 from oraja_training.plan.experiment import (
     assign_session,
+    build_candidate_sets,
+    list_targets,
     report_experiment,
     resolve_targets,
     start_experiment,
@@ -129,14 +131,32 @@ def _parser() -> argparse.ArgumentParser:
     experiment_assign.add_argument("--session-key", required=True)
     experiment_assign.add_argument("--session-at", type=int, default=None)
     experiment_assign.add_argument(
-        "--candidates-json", type=Path, required=True,
-        help="JSON object with non-empty coach, control and transfer candidate arrays",
+        "--candidates-json", type=Path,
+        help="optional JSON candidate sets; defaults to the latest Daily Menu",
     )
+
+    experiment_candidates = experiment_commands.add_parser("candidates")
+    experiment_candidates.add_argument(
+        "--assistant-db", type=Path, default=Path("assistant.db")
+    )
+    experiment_candidates.add_argument("--experiment-id", type=int, required=True)
+    experiment_candidates.add_argument("--session-key", required=True)
 
     experiment_resolve = experiment_commands.add_parser("resolve")
     experiment_resolve.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
     experiment_resolve.add_argument("--experiment-id", type=int, required=True)
     experiment_resolve.add_argument("--now", type=int, default=None)
+
+    experiment_targets = experiment_commands.add_parser("targets")
+    experiment_targets.add_argument(
+        "--assistant-db", type=Path, default=Path("assistant.db")
+    )
+    experiment_targets.add_argument("--experiment-id", type=int, required=True)
+    experiment_targets.add_argument(
+        "--status",
+        choices=("pending", "resolved", "missing", "duplicate", "all"),
+        default="pending",
+    )
 
     experiment_report = experiment_commands.add_parser("report")
     experiment_report.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
@@ -457,9 +477,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             elif args.experiment_command == "assign":
                 session_at = int(time.time()) if args.session_at is None else args.session_at
-                candidate_sets = json.loads(args.candidates_json.read_text(encoding="utf-8"))
-                if not isinstance(candidate_sets, dict):
-                    raise ValueError("--candidates-json must contain a JSON object")
+                if args.candidates_json is None:
+                    candidate_sets = build_candidate_sets(
+                        conn,
+                        experiment_id=args.experiment_id,
+                        session_key=args.session_key,
+                    )
+                else:
+                    candidate_sets = json.loads(
+                        args.candidates_json.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(candidate_sets, dict):
+                        raise ValueError("--candidates-json must contain a JSON object")
                 result = assign_session(
                     conn,
                     experiment_id=args.experiment_id,
@@ -467,9 +496,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     session_at=session_at,
                     candidate_sets=candidate_sets,
                 )
+            elif args.experiment_command == "candidates":
+                result = build_candidate_sets(
+                    conn,
+                    experiment_id=args.experiment_id,
+                    session_key=args.session_key,
+                )
             elif args.experiment_command == "resolve":
                 result = resolve_targets(
                     conn, experiment_id=args.experiment_id, now=args.now
+                )
+            elif args.experiment_command == "targets":
+                result = list_targets(
+                    conn,
+                    experiment_id=args.experiment_id,
+                    status=None if args.status == "all" else args.status,
                 )
             else:
                 result = report_experiment(conn, experiment_id=args.experiment_id)
