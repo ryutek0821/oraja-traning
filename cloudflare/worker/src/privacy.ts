@@ -5,7 +5,7 @@ import { profileScope } from "./upload-protocol";
 const DELETE_GRACE_SECONDS = 7 * 24 * 60 * 60;
 const EXPORT_RETENTION_SECONDS = 24 * 60 * 60;
 const BACKUP_RETENTION_SECONDS = 30 * 24 * 60 * 60;
-const EXPORT_SCHEMA_VERSION = "oraja.profile-export.v1";
+const EXPORT_SCHEMA_VERSION = "oraja.profile-export.v2";
 
 type Owner = { account_id: string; profile_id: string };
 type DueDeletion = Owner & { id: string; status?: "pending" | "confirmed" };
@@ -368,9 +368,18 @@ export async function completeExportTask(
   db: D1Database,
   taskId: string,
   archiveSha256: string,
+  encryption: {
+    algorithm: "AES-256-GCM";
+    contentIv: string;
+    wrappedKey: string;
+    wrapIv: string;
+    plaintextSha256: string;
+    archiveBytes: number;
+  },
   now = Math.floor(Date.now() / 1000),
 ): Promise<void> {
   if (!/^[0-9a-f]{64}$/.test(archiveSha256)) throw new ApiError("invalid_export_digest", 400);
+  if (!/^[0-9a-f]{64}$/.test(encryption.plaintextSha256)) throw new ApiError("invalid_export_digest", 400);
   const task = await db.prepare(
     `SELECT id, account_id, profile_id, export_id, task_kind
        FROM privacy_tasks
@@ -390,11 +399,15 @@ export async function completeExportTask(
     ).bind(now, taskId, task.export_id),
     db.prepare(
       `UPDATE privacy_export_jobs SET state = 'ready', completed_at = ?1,
-          archive_sha256 = ?2, failure_code = NULL
+          archive_sha256 = ?2, encryption_algorithm = ?5, content_iv_b64 = ?6,
+          wrapped_key_b64 = ?7, wrap_iv_b64 = ?8, plaintext_sha256 = ?9,
+          archive_bytes = ?10, failure_code = NULL
         WHERE export_id = ?3 AND state IN ('queued', 'snapshotting')
           AND EXISTS (SELECT 1 FROM privacy_tasks
                        WHERE id = ?4 AND status = 'succeeded' AND completed_at = ?1)`,
-    ).bind(now, archiveSha256, task.export_id, taskId),
+    ).bind(now, archiveSha256, task.export_id, taskId, encryption.algorithm,
+      encryption.contentIv, encryption.wrappedKey, encryption.wrapIv,
+      encryption.plaintextSha256, encryption.archiveBytes),
     db.prepare(
       `UPDATE exports SET status = 'ready', object_sha256 = ?1, ready_at = ?2
         WHERE id = ?3 AND status = 'queued' AND expires_at > ?2
@@ -422,22 +435,49 @@ export async function claimExportDownload(
   profileId: string,
   exportId: string,
   now = Math.floor(Date.now() / 1000),
-): Promise<{ targetKey: string }> {
+): Promise<{
+  targetKey: string;
+  algorithm: "AES-256-GCM";
+  contentIv: string;
+  wrappedKey: string;
+  wrapIv: string;
+  plaintextSha256: string;
+  ciphertextSha256: string;
+  schemaVersion: string;
+}> {
   const task = await db.prepare(
-    `SELECT t.target_key FROM privacy_tasks t
+    `SELECT t.target_key, j.encryption_algorithm, j.content_iv_b64,
+            j.wrapped_key_b64, j.wrap_iv_b64, j.plaintext_sha256,
+            j.archive_sha256, j.schema_version
+       FROM privacy_tasks t
        JOIN exports e ON e.id = t.export_id
+       JOIN privacy_export_jobs j ON j.export_id = e.id
       WHERE e.id = ?1 AND e.account_id = ?2 AND e.profile_id = ?3
         AND e.status = 'ready' AND e.downloaded_at IS NULL AND e.expires_at > ?4
         AND t.task_kind = 'export_snapshot' AND t.status = 'succeeded'`,
-  ).bind(exportId, accountId, profileId, now).first<{ target_key: string }>();
+  ).bind(exportId, accountId, profileId, now).first<{
+    target_key: string; encryption_algorithm: string; content_iv_b64: string;
+    wrapped_key_b64: string; wrap_iv_b64: string; plaintext_sha256: string;
+    archive_sha256: string; schema_version: string;
+  }>();
   if (!task) throw new ApiError("export_not_downloadable", 409);
+  if (task.encryption_algorithm !== "AES-256-GCM") throw new ApiError("export_encryption_invalid", 503);
   const result = await db.prepare(
     `UPDATE exports SET downloaded_at = ?1
       WHERE id = ?2 AND account_id = ?3 AND profile_id = ?4
         AND status = 'ready' AND downloaded_at IS NULL AND expires_at > ?1`,
   ).bind(now, exportId, accountId, profileId).run();
   if ((result.meta?.changes ?? 0) !== 1) throw new ApiError("export_not_downloadable", 409);
-  return { targetKey: task.target_key };
+  return {
+    targetKey: task.target_key,
+    algorithm: "AES-256-GCM",
+    contentIv: task.content_iv_b64,
+    wrappedKey: task.wrapped_key_b64,
+    wrapIv: task.wrap_iv_b64,
+    plaintextSha256: task.plaintext_sha256,
+    ciphertextSha256: task.archive_sha256,
+    schemaVersion: task.schema_version,
+  };
 }
 
 export async function expireDataExports(

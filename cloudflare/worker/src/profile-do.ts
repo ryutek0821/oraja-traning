@@ -35,6 +35,8 @@ type AcceptInput = {
   event: NormalizedIrEvent;
 };
 
+const MAX_PRIVACY_EXPORT_PAGE_BYTES = 4 * 1024 * 1024;
+
 function response(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value) + "\n", { status, headers: JSON_HEADERS });
 }
@@ -67,6 +69,14 @@ function isStoredPlayEvent(value: unknown): value is StoredPlayEvent {
     typeof value.accepted_at === "number" &&
     (value.enqueued_at === null || typeof value.enqueued_at === "number")
   );
+}
+
+function portableState(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(portableState);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !["profile_internal_id", "device_internal_id"].includes(key))
+    .map(([key, item]) => [key, portableState(item)]));
 }
 
 function publicPlay(record: StoredPlayEvent): Record<string, unknown> {
@@ -483,20 +493,27 @@ export class ProfileDurableObject extends DurableObject {
   private async exportPlays(url: URL): Promise<Response> {
     const limit = Number(url.searchParams.get("limit") ?? "500");
     const cursor = url.searchParams.get("cursor") ?? undefined;
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500 || (cursor !== undefined && !cursor.startsWith("play:"))) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500 || (cursor !== undefined && cursor.length > 512)) {
       return response({ error: { code: "invalid_pagination" } }, 400);
     }
     try {
       if (await this.storage().get<unknown>("privacy:tombstone") !== undefined) {
         return response({ error: { code: "profile_deleted" } }, 410);
       }
-      const values = await this.storage().list<unknown>({ prefix: "play:", start: cursor ? `${cursor}\0` : undefined, limit: limit + 1 });
-      const entries = [...values.entries()].filter((entry): entry is [string, StoredPlayEvent] => isStoredPlayEvent(entry[1]));
+      const values = await this.storage().list<unknown>({ start: cursor ? `${cursor}\0` : undefined, limit: limit + 1 });
+      const entries = [...values.entries()].filter(([key]) => key !== "profile:internal_id" && key !== "privacy:tombstone");
       const page = entries.slice(0, limit);
-      return response({
-        plays: page.map(([, record]) => exportPlay(record)),
+      const payload = {
+        entries: page.map(([key, value]) => ({
+          key: key.startsWith("play:") ? `plays/${key.slice("play:".length)}` : key,
+          value: isStoredPlayEvent(value) ? exportPlay(value) : portableState(value),
+        })),
         next_cursor: entries.length > limit ? page.at(-1)?.[0] ?? null : null,
-      });
+      };
+      if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > MAX_PRIVACY_EXPORT_PAGE_BYTES) {
+        return response({ error: { code: "profile_export_page_too_large" } }, 413);
+      }
+      return response(payload);
     } catch {
       return response({ error: { code: "temporary_unavailable" } }, 503);
     }

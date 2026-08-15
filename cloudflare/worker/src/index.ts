@@ -70,6 +70,7 @@ import {
   runPurgeTask,
 } from "./privacy";
 import { processExportSnapshots } from "./privacy-export";
+import { unwrapExportKey } from "./privacy-crypto";
 import { D1UploadSessionStore } from "./upload-store";
 import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
 import {
@@ -115,6 +116,7 @@ export interface Env {
   AUTH_HASH_PEPPER?: string;
   DEVICE_TOKEN_PEPPER?: string;
   ENVELOPE_MASTER_KEY?: string;
+  EXPORT_KEK?: string;
   OAUTH_DCR_INITIAL_ACCESS_TOKEN?: string;
 }
 
@@ -539,12 +541,22 @@ async function handlePrivacyRoutes(request: Request, env: Env, origin?: string):
         ).bind(downloadMatch[1], accountId, profile.id, now).run();
         throw new ApiError("export_temporarily_unavailable", 503);
       }
+      const userKey = await unwrapExportKey(
+        claimed.wrappedKey, claimed.wrapIv, downloadMatch[1], env.EXPORT_KEK,
+      );
       return new Response(object.body, {
         status: 200,
         headers: {
-          "content-type": "application/json; charset=utf-8",
-          "content-disposition": `attachment; filename="oraja-profile-export-${downloadMatch[1]}.json"`,
+          "content-type": "application/vnd.oraja.profile-export+encrypted",
+          "content-disposition": `attachment; filename="oraja-profile-export-${downloadMatch[1]}.oraenc"`,
           "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-oraja-export-schema": claimed.schemaVersion,
+          "x-oraja-export-cipher": claimed.algorithm,
+          "x-oraja-export-iv": claimed.contentIv,
+          "x-oraja-export-key": userKey,
+          "x-oraja-export-plaintext-sha256": claimed.plaintextSha256,
+          "x-oraja-export-ciphertext-sha256": claimed.ciphertextSha256,
         },
       });
     }

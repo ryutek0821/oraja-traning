@@ -15,6 +15,7 @@ account credential.
 | `EMAIL_ENCRYPTION_KEY` | Worker secret | service owner | issue #7 optional email recovery |
 | `ENVELOPE_MASTER_KEY` | Worker/Container secret | service owner | issue #9 |
 | `CAPABILITY_SECRET_KEY` | Worker secret | service owner | issue #14 |
+| `EXPORT_KEK` | Worker secret (32-byte base64url AES key) | service owner | issue #16 encrypted exports |
 
 ## Provisioning and rotation
 
