@@ -132,7 +132,7 @@ def test_progress_receiver_rejects_wildcard_and_lan_bindings() -> None:
             pass
         else:
             raise AssertionError(f"unsafe progress bind was accepted: {host}")
-    for host in ("127.0.0.1", "::1", "localhost", "100.118.150.23"):
+    for host in ("127.0.0.1", "::1", "localhost", "100.64.0.1"):
         _validate_progress_bind(host, "configured")
 
 
@@ -141,7 +141,7 @@ def test_server_socket_family_matches_the_literal_host() -> None:
     assert _server_type_for_host("localhost").address_family == socket.AF_INET
     assert _server_type_for_host("::1").address_family == socket.AF_INET6
     assert (
-        _server_type_for_host("fd7a:115c:a1e0::ef38:9617").address_family
+        _server_type_for_host("fd7a:115c:a1e0::1").address_family
         == socket.AF_INET6
     )
 

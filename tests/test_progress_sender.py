@@ -29,14 +29,14 @@ def test_send_progress_posts_cumulative_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(progress_sender, "urlopen", open_request)
     result = progress_sender.send_progress(
         "score.db",
-        "http://100.118.150.23:8765/",
+        "http://100.64.0.1:8765/",
         "secret-token",
         observed_at=2_000,
     )
 
     request = captured["request"]
     payload = json.loads(request.data)
-    assert request.full_url == "http://100.118.150.23:8765/api/progress"
+    assert request.full_url == "http://100.64.0.1:8765/api/progress"
     assert request.get_header("Authorization") == "Bearer secret-token"
     assert payload == {
         "source_id": "RYU-DESKTOP2",
