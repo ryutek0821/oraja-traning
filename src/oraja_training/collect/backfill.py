@@ -128,6 +128,9 @@ def run(
                         "long_jack_rate": row.get("long_jack_rate"),
                         "practice_low": row.get("practice_low"),
                         "analysis_version": int(row.get("analysis_version") or 0),
+                        "grid_bpm": row.get("grid_bpm"),
+                        "stream_sec": row.get("stream_sec"),
+                        "last_kill": row.get("last_kill"),
                     }
                     for row in pattern_rows
                     if not row.get("error")

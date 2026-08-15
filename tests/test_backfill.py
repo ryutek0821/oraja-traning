@@ -137,9 +137,10 @@ def test_backfill_follows_primary_key_and_noplay_rules(backfilled) -> None:
             "SELECT count(*) FROM chart_pattern_features"
         ).fetchone()[0] == 1
         assert conn.execute(
-            "SELECT practice_low FROM chart_pattern_features WHERE sha256 = ?",
+            "SELECT practice_low, grid_bpm, stream_sec, last_kill "
+            "FROM chart_pattern_features WHERE sha256 = ?",
             ("1" * 64,),
-        ).fetchone()[0] == 1
+        ).fetchone() == (1, 176.0, 14.0, 1.1)
     finally:
         conn.close()
 

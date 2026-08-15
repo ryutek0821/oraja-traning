@@ -167,8 +167,12 @@ score / scoredatalog / songdata / songinfo          header/score.json
 - **ソフラン**: 速度分散、速度変更回数、STOP数
 - **基本量**: 曲長、総ノーツ数
 
-RANDOM使用率が高いため、固定レーン前提の左右偏り・縦連・トリル等はv1特徴に入れない。
-oraja-constellatorの解析結果も、beatoraja側DBへ書き込まず安全に読める契約が定まるまでは利用しない。
+RANDOM使用率が高いため、固定レーン前提の左右偏り・縦連・トリル等はv1の成功確率モデルへ入れない。
+WARMUPの安全フィルタに限り、既存の`bmscf_chart_analysis`を検証済みallowlistでread-only取込する。
+`grid_bpm`は高速交互の危険度proxyとしてのみ使い、直接のトリル判定とは扱わない。
+`stream_sec` / `last_kill`と譜面内密度比で、持続発狂・終盤発狂・非平坦な密度推移を除外する。
+解析が無い譜面は低負荷と推定せず、保守的な負荷penaltyと警告を付ける。本ツール自身は
+constellator解析を実行せず、beatoraja側DBへ書き込まない。
 
 ### 4.3 スキル推定モデル
 
@@ -423,7 +427,7 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 ただし **`bmscf_chart_analysis` は 0行**（譜面解析が未実行、または初期化済み）。
 
 → 2つの含意:
-1. constellator の解析結果は将来の追加特徴として再利用できる可能性がある。ただしv1では使わず、解析実行も本ツールのスコープ外
+1. constellator の解析結果は、存在する場合だけWARMUP安全フィルタへread-only取込する。成功確率モデルには使わず、解析実行も本ツールのスコープ外
 2. 同時に、**本ツールが `songdata.db` に書き込むと衝突する**。§4.1の「beatoraja DBには書き込まない」方針は正しかった
 
 ### 11.7 プレイヤープロフィール（＝ MVPの想定ユーザーは自分）

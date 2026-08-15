@@ -34,7 +34,7 @@ from oraja_training.tables import fetch_table, resolve
 DEFAULT_TABLES = (
     (
         "genocide",
-        "https://miraiscarlet.github.io/bms/table/genocide_insane/insane_bms.html",
+        "https://nekokan.dyndns.info/~lobsak/genocide/insane.html",
     ),
     ("overjoy", "https://lr2.sakura.ne.jp/data/header.json"),
     ("satellite", "https://stellabms.xyz/sl/table.html"),
@@ -257,12 +257,15 @@ def _refresh_tables(
                     conn.execute(
                         """
                         INSERT INTO table_sources(
-                          table_id, page_url, header_url, data_url, fetched_at, last_error
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                          table_id, page_url, header_url, data_url, fetched_at,
+                          last_error, entry_count, matched_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(table_id) DO UPDATE SET
                           page_url=excluded.page_url, header_url=excluded.header_url,
                           data_url=excluded.data_url, fetched_at=excluded.fetched_at,
-                          last_error=excluded.last_error
+                          last_error=excluded.last_error,
+                          entry_count=excluded.entry_count,
+                          matched_count=excluded.matched_count
                         """,
                         (
                             table_id,
@@ -271,6 +274,8 @@ def _refresh_tables(
                             table.data_url,
                             table.fetched_at,
                             "stale cache used after refresh failure" if table.stale else None,
+                            len(table.entries),
+                            report.matched,
                         ),
                     )
                 summary = report.for_table(table_id)

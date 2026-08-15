@@ -57,7 +57,8 @@ QUOTAS = {
 }
 FEATURE_AXES = ("density", "scratch", "ln", "soflan")
 DIFFICULTY_TABLES = ("genocide", "overjoy", "satellite", "stella")
-WARMUP_FEATURES = (
+MIN_TABLE_MATCH_COVERAGE = 0.80
+CORE_WARMUP_FEATURES = (
     "density_p90",
     "end_density",
     "burst_max",
@@ -67,11 +68,19 @@ WARMUP_FEATURES = (
     "soflan_var",
     "soflan_changes",
     "stop_count",
+    "end_density_ratio",
+    "burst_ratio",
+)
+PATTERN_WARMUP_FEATURES = (
     "micro_rate",
     "long_jack_rate",
     "avg_chord",
     "chord_ge3",
+    "grid_bpm",
+    "stream_sec",
+    "last_kill",
 )
+WARMUP_FEATURES = CORE_WARMUP_FEATURES + PATTERN_WARMUP_FEATURES
 
 
 class MenuBuildError(DomainError):
@@ -118,6 +127,7 @@ class Candidate:
     recent_successes: int
     recent_failures: int
     recent_played_at: int
+    recent_second_played_at: int
     recent_bp_rate: float | None
     p_complete: float
     tier: str
@@ -276,6 +286,26 @@ def _optional_number(row: Mapping[str, Any], key: str) -> float | None:
     return rendered if math.isfinite(rendered) else None
 
 
+def _warmup_feature_value(
+    row: Mapping[str, Any], feature: str
+) -> float | None:
+    """Return a stored warmup metric or a conservative density-shape ratio."""
+
+    numerator_key = {
+        "end_density_ratio": "end_density",
+        "burst_ratio": "burst_max",
+    }.get(feature)
+    if numerator_key is None:
+        return _optional_number(row, feature)
+    numerator = _optional_number(row, numerator_key)
+    baseline = _optional_number(row, "density_p90")
+    if numerator is None or baseline is None:
+        return None
+    if baseline <= 0.0:
+        return 0.0 if numerator <= 0.0 else None
+    return numerator / baseline
+
+
 def _optional_percentile_ranks(values: Sequence[float | None]) -> list[float]:
     known = [(value, index) for index, value in enumerate(values) if value is not None]
     result = [0.0] * len(values)
@@ -330,7 +360,7 @@ def _load_candidates(
         )
     warmup_feature_ranks = {
         feature: _optional_percentile_ranks(
-            [_optional_number(row, feature) for row in deduped]
+            [_warmup_feature_value(row, feature) for row in deduped]
         )
         for feature in WARMUP_FEATURES
     }
@@ -374,7 +404,7 @@ def _load_candidates(
                         level for level, cleared in table_outcomes[table_id][6]
                         if cleared
                     ],
-                    0.75,
+                    0.90,
                 ),
             ),
             observations=len(table_outcomes[table_id][4]),
@@ -488,9 +518,16 @@ def _load_candidates(
             for feature in WARMUP_FEATURES
         }
         warmup_features = {
-            feature: _optional_number(row, feature) for feature in WARMUP_FEATURES
+            feature: _warmup_feature_value(row, feature)
+            for feature in WARMUP_FEATURES
         }
-        warmup_values = list(warmup_scores.values())
+        # Optional constellator pattern rows must not make a chart look safer
+        # than an analyzed chart merely because their percentile was absent.
+        warmup_values = [
+            warmup_scores[feature]
+            if warmup_features[feature] is not None else 0.55
+            for feature in WARMUP_FEATURES
+        ]
         warmup_load = (
             0.65 * max(warmup_values, default=0.0)
             + 0.35 * (sum(warmup_values) / len(warmup_values) if warmup_values else 0.0)
@@ -516,6 +553,9 @@ def _load_candidates(
                 recent_successes=int(row.get("recent_successes") or 0),
                 recent_failures=int(row.get("recent_failures") or 0),
                 recent_played_at=int(row.get("recent_played_at") or 0),
+                recent_second_played_at=int(
+                    row.get("recent_second_played_at") or 0
+                ),
                 recent_bp_rate=_optional_number(row, "recent_bp_rate"),
                 p_complete=probability,
                 tier=_tier(probability),
@@ -613,7 +653,8 @@ def _has_warmup_evidence(candidate: Candidate, *, now: int) -> bool:
         and candidate.recent_successes >= 2
         and candidate.recent_failures == 0
         and candidate.recent_played_at > 0
-        and now - candidate.recent_played_at <= 30 * 86_400
+        and candidate.recent_second_played_at > 0
+        and now - candidate.recent_second_played_at <= 30 * 86_400
         and candidate.recent_bp_rate is not None
         and candidate.recent_bp_rate <= 0.05
     )
@@ -622,9 +663,23 @@ def _has_warmup_evidence(candidate: Candidate, *, now: int) -> bool:
 def _warmup_features_are_safe(candidate: Candidate, *, readiness: str) -> bool:
     raw = candidate.warmup_features
     ranks = candidate.warmup_feature_scores
+    if any(raw.get(feature) is None for feature in CORE_WARMUP_FEATURES):
+        return False
     if (raw.get("stop_count") or 0.0) > 0.0:
         return False
     if (raw.get("soflan_changes") or 0.0) > 4.0:
+        return False
+    if (raw.get("end_density_ratio") or 0.0) > 1.5:
+        return False
+    if (raw.get("burst_ratio") or 0.0) > 1.8:
+        return False
+    # constellator has no direct two-lane trill metric.  Extreme rhythmic
+    # speed is therefore a fail-closed proxy, never presented as a diagnosis.
+    if (raw.get("grid_bpm") or 0.0) > 225.0:
+        return False
+    if (raw.get("stream_sec") or 0.0) > 30.0:
+        return False
+    if (raw.get("last_kill") or 0.0) > 1.3:
         return False
     if candidate.chart_seconds is not None and candidate.chart_seconds > 240.0:
         return False
@@ -637,10 +692,15 @@ def _warmup_features_are_safe(candidate: Candidate, *, readiness: str) -> bool:
         "ln_rate": 0.90,
         "soflan_var": 0.85,
         "soflan_changes": 0.85,
+        "end_density_ratio": 0.85,
+        "burst_ratio": 0.88,
         "micro_rate": 0.85,
         "long_jack_rate": 0.85,
         "avg_chord": 0.90,
         "chord_ge3": 0.88,
+        "grid_bpm": 0.88,
+        "stream_sec": 0.90,
+        "last_kill": 0.85,
     }
     if any(ranks.get(feature, 0.0) >= limit for feature, limit in thresholds.items()):
         return False
@@ -856,6 +916,18 @@ def _table_warnings(
     }
     frontier_by_id = {frontier.table_id: frontier for frontier in frontiers}
     warnings: list[str] = []
+    missing_analysis = sum(
+        any(
+            candidate.warmup_features.get(feature) is None
+            for feature in PATTERN_WARMUP_FEATURES
+        )
+        for candidate in candidates
+    )
+    if missing_analysis:
+        warnings.append(
+            "warmup: optional pattern analysis missing for "
+            f"{missing_analysis} owned charts; conservative load penalty applied"
+        )
     for table_id in DIFFICULTY_TABLES:
         source = by_id.get(table_id)
         if source is None:
@@ -864,9 +936,22 @@ def _table_warnings(
         error = source.get("last_error")
         if error:
             warnings.append(f"{table_id}: refresh failed ({error})")
-        elif table_id not in matched:
-            warnings.append(f"{table_id}: no owned charts matched")
         else:
+            total = int(source.get("entry_count") or 0)
+            source_matched = source.get("matched_count")
+            matched_count = int(source_matched or 0)
+            if table_id not in matched and matched_count == 0:
+                suffix = f" (0/{total})" if total else ""
+                warnings.append(f"{table_id}: no owned charts matched{suffix}")
+                continue
+            if total > 0 and source_matched is not None and (
+                matched_count < 8
+                or matched_count / total < MIN_TABLE_MATCH_COVERAGE
+            ):
+                warnings.append(
+                    f"{table_id}: low owned-chart match coverage "
+                    f"({matched_count}/{total})"
+                )
             frontier = frontier_by_id.get(table_id)
             if (
                 frontier is None

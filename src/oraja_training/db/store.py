@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -351,6 +351,19 @@ CREATE TABLE chart_pattern_features (
 """
 
 
+SCHEMA_V7 = """
+ALTER TABLE table_sources ADD COLUMN entry_count INTEGER;
+ALTER TABLE table_sources ADD COLUMN matched_count INTEGER;
+"""
+
+
+SCHEMA_V8 = """
+ALTER TABLE chart_pattern_features ADD COLUMN grid_bpm REAL;
+ALTER TABLE chart_pattern_features ADD COLUMN stream_sec REAL;
+ALTER TABLE chart_pattern_features ADD COLUMN last_kill REAL;
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -415,6 +428,7 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n"
                 + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                + SCHEMA_V7 + SCHEMA_V8
             )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
@@ -428,7 +442,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     if current == 2:
         try:
             conn.executescript(
-                "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
+                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -439,7 +454,10 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 3:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                + SCHEMA_V7 + SCHEMA_V8
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -449,7 +467,10 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 4:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6 + SCHEMA_V7
+                + SCHEMA_V8
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -459,7 +480,29 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 5:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V6)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 6:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 7:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V8)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -755,10 +798,12 @@ def upsert_chart_pattern_features(
         """
         INSERT INTO chart_pattern_features(
           sha256, rhythm_family, avg_chord, chord_ge3, micro_rate,
-          long_jack_rate, practice_low, analysis_version
+          long_jack_rate, practice_low, analysis_version, grid_bpm,
+          stream_sec, last_kill
         ) VALUES (
           :sha256, :rhythm_family, :avg_chord, :chord_ge3, :micro_rate,
-          :long_jack_rate, :practice_low, :analysis_version
+          :long_jack_rate, :practice_low, :analysis_version, :grid_bpm,
+          :stream_sec, :last_kill
         )
         ON CONFLICT(sha256) DO UPDATE SET
           rhythm_family=excluded.rhythm_family,
@@ -767,7 +812,10 @@ def upsert_chart_pattern_features(
           micro_rate=excluded.micro_rate,
           long_jack_rate=excluded.long_jack_rate,
           practice_low=excluded.practice_low,
-          analysis_version=excluded.analysis_version
+          analysis_version=excluded.analysis_version,
+          grid_bpm=excluded.grid_bpm,
+          stream_sec=excluded.stream_sec,
+          last_kill=excluded.last_kill
         """,
         features,
     )

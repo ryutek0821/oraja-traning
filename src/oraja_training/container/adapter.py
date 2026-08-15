@@ -809,6 +809,7 @@ class ContainerAdapter:
                         clock=self.clock,
                     )
                     recommendation = recommendation_output(session)
+                    recommendation_repository.save_output(recommendation)
             return fit_result, recommendation
         except (ContainerError, ManifestError):
             raise
