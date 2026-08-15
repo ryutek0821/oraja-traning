@@ -26,14 +26,23 @@ WITH ranked_state AS (
            PARTITION BY sha256 ORDER BY played_at DESC, mode ASC
          ) AS rn
   FROM score_state WHERE mode IN (0, 1)
+), recent_events AS (
+  SELECT p.*,
+         row_number() OVER (
+           PARTITION BY p.sha256, p.mode, p.played_at, p.playcount
+           ORDER BY CASE p.source WHEN 'collector' THEN 0 ELSE 1 END,
+                    p.ingested_at DESC, p.id DESC
+         ) AS semantic_rank
+  FROM plays AS p
+  WHERE p.mode IN (0, 1) AND p.is_course = 0
+    AND p.source IN ('collector', 'daily_snapshot')
 ), recent_ranked AS (
   SELECT p.*,
          row_number() OVER (
            PARTITION BY p.sha256 ORDER BY p.played_at DESC, p.id DESC
          ) AS recent_rank
-  FROM plays AS p
-  WHERE p.mode IN (0, 1) AND p.is_course = 0
-    AND p.source IN ('collector', 'daily_snapshot')
+  FROM recent_events AS p
+  WHERE p.semantic_rank = 1
 ), recent_summary AS (
   SELECT sha256,
          SUM(CASE WHEN completed = 1 AND clear >= 4 THEN 1 ELSE 0 END)

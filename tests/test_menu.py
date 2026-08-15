@@ -323,6 +323,46 @@ def test_recent_full_play_failed_lamps_are_not_warmup_successes(tmp_path) -> Non
         conn.close()
 
 
+def test_collector_and_daily_snapshot_copy_count_as_one_recent_play(
+    tmp_path,
+) -> None:
+    conn = _assistant(tmp_path)
+    sha256 = f"{4:064x}"
+    played_at = NOW - 60
+    try:
+        with conn:
+            for generation, source in ((0, "collector"), (-2, "daily_snapshot")):
+                conn.execute(
+                    """INSERT INTO plays(
+                        sha256, mode, played_at, playcount, source_generation,
+                        source, clear, completed, bp_rate, is_course,
+                        payload_hash, ingested_at
+                       ) VALUES (?, 0, ?, 1, ?, ?, 4, 1, 0.02, 0, ?, ?)""",
+                    (
+                        sha256,
+                        played_at,
+                        generation,
+                        source,
+                        "same-play",
+                        played_at,
+                    ),
+                )
+
+        record = next(
+            value
+            for value in SQLiteRecommendationRepository(conn).load_input(
+                ProfileContext()
+            ).candidates
+            if value["sha256"] == sha256
+        )
+        assert record["recent_successes"] == 1
+        assert record["recent_failures"] == 0
+        assert record["recent_played_at"] == played_at
+        assert record["recent_second_played_at"] == 0
+    finally:
+        conn.close()
+
+
 def test_missing_pattern_analysis_gets_a_penalty_and_visible_warning() -> None:
     rows = list(_warmup_records())
     safe = next(row for row in rows if row["sha256"] == f"{4:064x}")
