@@ -5,6 +5,7 @@ import gzip
 import json
 import sqlite3
 
+from oraja_training.collect import replay
 from oraja_training.collect.poller import Poller
 from oraja_training.db import readers
 from oraja_training.db import store
@@ -92,14 +93,21 @@ def _source_dir(tmp_path: Path) -> Path:
     return source
 
 
-def _replay(path: Path, *, sha256: str = "a" * 64, date: int = 100, gauge: int = 3) -> None:
+def _replay(
+    path: Path,
+    *,
+    sha256: str = "a" * 64,
+    mode: int = 0,
+    date: int = 100,
+    gauge: int = 3,
+) -> None:
     path.parent.mkdir(exist_ok=True)
     path.write_bytes(
         gzip.compress(
             json.dumps(
                 {
                     "sha256": sha256,
-                    "mode": 0,
+                    "mode": mode,
                     "date": date,
                     "gauge": gauge,
                     "randomoption": 4,
@@ -225,6 +233,74 @@ def test_replay_exact_match_history_overwrite_and_invalid_counter(tmp_path) -> N
         assert "keyinput" not in columns
 
 
+def test_replay_matches_only_the_bounded_result_timestamp_skew(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    _replay(source / "replay" / "within.brd", date=70)
+    _replay(source / "replay" / "outside.brd", date=69)
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_500) as poller:
+        result = poller.tick(force=True)
+        statuses = dict(
+            poller.conn.execute(
+                "SELECT path, match_status FROM replay_metadata ORDER BY path"
+            ).fetchall()
+        )
+
+    assert result.replay_matched == 1
+    assert result.replay_unmatched == 1
+    assert statuses[str(source / "replay" / "within.brd")] == "matched"
+    assert statuses[str(source / "replay" / "outside.brd")] == "unmatched"
+
+
+def test_replay_ln_mode_falls_back_to_score_mode_zero_only_without_exact_match(
+    tmp_path,
+) -> None:
+    source = _source_dir(tmp_path)
+    _replay(source / "replay" / "ln-mode.brd", mode=1)
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_750) as poller:
+        result = poller.tick(force=True)
+        matched = poller.conn.execute(
+            """
+            SELECT metadata.mode, play.mode, play.selected_gauge_kind
+            FROM replay_metadata metadata
+            JOIN plays play ON play.id = metadata.matched_play_id
+            """
+        ).fetchone()
+
+    assert result.replay_matched == 1
+    assert tuple(matched) == (1, 0, "HARD")
+
+
+def test_replay_ln_mode_prefers_an_exact_mode_candidate(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_875) as poller:
+        poller.tick(force=True)
+        original = dict(
+            poller.conn.execute(
+                f"SELECT {', '.join(store.PLAY_COLUMNS)} FROM plays"
+            ).fetchone()
+        )
+        exact = dict(original)
+        exact["mode"] = 1
+        exact["source_generation"] = 9
+        exact["selected_gauge_kind"] = None
+        store.insert_play(poller.conn, exact)
+        poller.conn.commit()
+        _replay(source / "replay" / "ln-mode.brd", mode=1)
+
+        result = poller.tick(force=True)
+        matched_mode = poller.conn.execute(
+            """
+            SELECT play.mode FROM replay_metadata metadata
+            JOIN plays play ON play.id = metadata.matched_play_id
+            """
+        ).fetchone()[0]
+
+    assert result.replay_matched == 1
+    assert matched_mode == 1
+
+
 def test_replay_ambiguous_and_unmatched_never_change_plays(tmp_path) -> None:
     source = _source_dir(tmp_path)
     assistant = tmp_path / "assistant.db"
@@ -238,6 +314,7 @@ def test_replay_ambiguous_and_unmatched_never_change_plays(tmp_path) -> None:
         duplicate = dict(original)
         duplicate["source_generation"] = 9
         duplicate["playcount"] = 99
+        duplicate["selected_gauge_kind"] = None
         store.insert_play(poller.conn, duplicate)
         poller.conn.commit()
 
@@ -250,6 +327,57 @@ def test_replay_ambiguous_and_unmatched_never_change_plays(tmp_path) -> None:
         assert poller.conn.execute(
             "SELECT count(*) FROM plays WHERE selected_gauge_kind IS NOT NULL"
         ).fetchone()[0] == 0
+
+
+def test_replay_match_becomes_ambiguous_if_a_second_play_arrives(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    assistant = tmp_path / "assistant.db"
+    _replay(source / "replay" / "slot.brd")
+    with Poller(source, assistant, clock=lambda: 5_250) as poller:
+        assert poller.tick(force=True).replay_matched == 1
+        original = dict(
+            poller.conn.execute(
+                f"SELECT {', '.join(store.PLAY_COLUMNS)} FROM plays"
+            ).fetchone()
+        )
+        duplicate = dict(original)
+        duplicate["source_generation"] = 9
+        duplicate["playcount"] = 99
+        duplicate["selected_gauge_kind"] = None
+        store.insert_play(poller.conn, duplicate)
+        poller.conn.commit()
+
+        result = poller.tick(force=True)
+
+        assert result.replay_ambiguous == 1
+        assert poller.conn.execute(
+            "SELECT match_status FROM replay_metadata"
+        ).fetchone()[0] == "ambiguous"
+        assert poller.conn.execute(
+            "SELECT count(*) FROM plays WHERE selected_gauge_kind IS NOT NULL"
+        ).fetchone()[0] == 0
+
+
+def test_replay_changed_during_read_is_counted_and_audited(
+    tmp_path, monkeypatch
+) -> None:
+    source = _source_dir(tmp_path)
+    _replay(source / "replay" / "unstable.brd")
+    monkeypatch.setattr(
+        replay,
+        "scan_report",
+        lambda _: replay.ReplayScanResult((), unstable=1),
+    )
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 5_500) as poller:
+        result = poller.tick(force=True)
+        state = poller.conn.execute(
+            "SELECT last_error FROM collector_state WHERE key = 'replay'"
+        ).fetchone()
+
+    assert result.replay_unstable == 1
+    assert result.replay_scanned == 1
+    assert state[0] == "invalid=0, unstable=1"
 
 
 def test_replay_saved_before_score_is_reconciled_after_new_play(tmp_path) -> None:

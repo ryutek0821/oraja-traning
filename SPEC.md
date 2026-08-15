@@ -140,6 +140,10 @@ gzip圧縮JSON。`keyinput` は URL-safe Base64 + GZIP（1イベント = 符号�
 
 `ReplayData.gauge` は `BMSPlayer` が `config.getGauge()` を保存するため、**開始時に選択したゲージ**である。
 一方、`clear` はアシスト、フルコンボ、Gauge Auto Shift 後の状態を反映した**結果ランプ**であり、同義ではない。
+Replay日時は結果確定時、score日時はその直後のDB保存時に採番されるため、突合はReplay日時以降30秒以内の
+`sha256 + mode`が一意な場合だけ許可する。複数候補は曖昧としてplayを変更しない。
+Replayの設定LNモードに完全一致する候補がないmode 1/2だけ、score側の非未定義LN譜面正規化に合わせて
+mode 0を照合する。完全mode一致がある場合はmode 0へフォールバックしない。
 
 ⚠️ Step 0（Windows実機確認）で生成条件・上書き条件を検証してから Step 3 に着手すること。
 
