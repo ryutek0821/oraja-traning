@@ -15,6 +15,7 @@ from oraja_training.plan.menu import (
     _select_warmup,
     build_session,
     build_session_from_input,
+    recommendation_output,
     write_export,
 )
 
@@ -172,6 +173,80 @@ def test_session_is_deterministic_and_reaches_budget(tmp_path) -> None:
     assert positions
     assert all(len(value) == 2 for value in positions.values())
     assert all(value[1] - value[0] - 1 == 3 for value in positions.values())
+
+
+def test_personal_menu_payload_preserves_mode_two_score_state(tmp_path) -> None:
+    conn = _assistant(tmp_path)
+    sha256 = f"{0:064x}"
+    with conn:
+        conn.execute(
+            "UPDATE score_state SET mode = 2 WHERE sha256 = ? AND mode = 0",
+            (sha256,),
+        )
+    try:
+        session = build_session(
+            conn, menu_date="2026-08-10", clock=lambda: 1_786_291_200
+        )
+        candidate = next(item for item in session.personal if item.sha256 == sha256)
+        assert candidate.mode == 2
+        assert all(item.mode in {0, 1, 2} for item in session.queue)
+        SQLiteRecommendationRepository(conn).save_output(
+            recommendation_output(session)
+        )
+        payload = json.loads(
+            conn.execute(
+                "SELECT slots_json FROM sessions ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        persisted = next(
+            item for item in payload["personal"] if item["sha256"] == sha256
+        )
+        assert persisted["mode"] == 2
+    finally:
+        conn.close()
+
+
+def test_pending_transfer_target_is_excluded_from_future_menus(tmp_path) -> None:
+    conn = _assistant(tmp_path)
+    reserved_sha256 = f"{0:064x}"
+    with conn:
+        experiment = conn.execute(
+            """
+            INSERT INTO experiments(
+              name, seed, starts_at, ends_at, min_samples_per_arm, created_at
+            ) VALUES ('reserved', 'seed', 1, 2000000000, 1, 1)
+            """
+        )
+        assignment = conn.execute(
+            """
+            INSERT INTO experiment_sessions(
+              experiment_id, session_key, session_at, arm, arm_probability,
+              selection_probability, candidate_hash, candidates_json,
+              selected_sha256, selected_mode, selected_p_pred,
+              transfer_sha256, transfer_mode, transfer_p_pred, assigned_at,
+              input_candidate_hash
+            ) VALUES (?, 'reserved', 1, 'coach', 0.5, 0.5, 'hash', '{}',
+                      ?, 0, 0.5, ?, 0, 0.5, 1, 'input-hash')
+            """,
+            (int(experiment.lastrowid), reserved_sha256, reserved_sha256),
+        )
+        conn.execute(
+            """
+            INSERT INTO experiment_targets(
+              session_id, target_kind, interval_days, sha256, mode,
+              due_at, window_closes_at, p_pred
+            ) VALUES (?, 'transfer', 14, ?, 0, 100, 200, 0.5)
+            """,
+            (int(assignment.lastrowid), reserved_sha256),
+        )
+    try:
+        session = build_session(
+            conn, menu_date="2026-08-10", clock=lambda: 1_786_291_200
+        )
+        assert reserved_sha256 not in {item.sha256 for item in session.personal}
+        assert reserved_sha256 not in {item.sha256 for item in session.queue}
+    finally:
+        conn.close()
 
 
 def test_export_has_unique_table_entries_and_repeated_queue(tmp_path) -> None:

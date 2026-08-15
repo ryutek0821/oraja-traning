@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -378,6 +378,13 @@ CREATE TABLE replay_scan_state (
 """
 
 
+SCHEMA_V10 = """
+ALTER TABLE experiment_sessions
+  ADD COLUMN input_candidate_hash TEXT NOT NULL DEFAULT '';
+UPDATE experiment_sessions SET input_candidate_hash = candidate_hash;
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -442,7 +449,7 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n"
                 + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
-                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
             )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
@@ -457,7 +464,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
-                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -470,7 +477,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
-                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -483,7 +490,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6 + SCHEMA_V7
-                + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -496,7 +503,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
-                + SCHEMA_V9
+                + SCHEMA_V9 + SCHEMA_V10
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -509,6 +516,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V10
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -519,7 +527,9 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 7:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V8 + SCHEMA_V9)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -529,7 +539,17 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 8:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V9)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V9 + SCHEMA_V10)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 9:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V10)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:

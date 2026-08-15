@@ -72,6 +72,14 @@ def _canonical_candidates(candidates: Mapping[str, Sequence[Candidate]]) -> str:
     )
 
 
+def _transfer_selection_probability(candidates_json: str) -> float:
+    try:
+        stored = _normalise_candidates(json.loads(candidates_json))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("stored experiment candidates are invalid") from error
+    return 1.0 / len(stored["transfer"])
+
+
 def _draw(seed: str, session_key: str, purpose: str) -> int:
     material = f"oraja-experiment-v1\0{seed}\0{session_key}\0{purpose}".encode()
     return int.from_bytes(hashlib.sha256(material).digest(), "big")
@@ -81,7 +89,7 @@ def _menu_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
     candidate = _candidate(
         {
             "sha256": value.get("sha256"),
-            "mode": 0,
+            "mode": value.get("mode", 0),
             "p_pred": value.get("p_complete"),
         }
     )
@@ -143,22 +151,33 @@ def build_candidate_sets(
         for item in personal_rows
         if isinstance(item.get("sha256"), str)
     }
-    queue_hashes = {
-        str(item.get("sha256"))
-        for item in queue
-        if isinstance(item, dict) and isinstance(item.get("sha256"), str)
-    }
+    queue_identities: set[tuple[str, int]] = set()
+    for item in queue:
+        if not isinstance(item, dict) or not isinstance(item.get("sha256"), str):
+            continue
+        sha256 = str(item["sha256"])
+        source = by_sha.get(sha256, {})
+        queue_identities.add(
+            (sha256, int(source.get("mode", item.get("mode", 0))))
+        )
     reserved_rows = conn.execute(
         """
-        SELECT selected_sha256, transfer_sha256
+        SELECT selected_sha256 AS sha256, selected_mode AS mode
         FROM experiment_sessions WHERE experiment_id = ?
+        UNION
+        SELECT transfer_sha256, transfer_mode
+        FROM experiment_sessions WHERE experiment_id = ?
+        UNION
+        SELECT target.sha256, target.mode
+        FROM experiment_targets target
+        JOIN experiment_sessions session ON session.id = target.session_id
+        WHERE session.experiment_id = ?
         """,
-        (experiment_id,),
+        (experiment_id, experiment_id, experiment_id),
     ).fetchall()
     reserved = {
-        str(value)
+        (str(reserved_row["sha256"]), int(reserved_row["mode"]))
         for reserved_row in reserved_rows
-        for value in reserved_row
     }
 
     focus_by_stratum: dict[
@@ -173,7 +192,10 @@ def build_candidate_sets(
             continue
         sha256 = item.get("sha256")
         source = by_sha.get(str(sha256))
-        if source is None or str(sha256) in reserved:
+        if source is None:
+            continue
+        identity = (str(sha256), int(source.get("mode", 0)))
+        if identity in reserved:
             continue
         key = (
             str(source.get("table_id") or item.get("table_id") or ""),
@@ -200,7 +222,9 @@ def build_candidate_sets(
             if str(item.get("table_id") or "") == table_id
             and str(item.get("source_level") or "") == source_level
             and (int(item.get("playcount") or 0) > 0) == was_played
-            and str(item.get("sha256") or "") not in queue_hashes | reserved
+            and (
+                str(item.get("sha256") or ""), int(item.get("mode", 0))
+            ) not in queue_identities | reserved
         ]
         transfer_pool = [
             item
@@ -210,27 +234,35 @@ def build_candidate_sets(
             and int(item.get("playcount") or 0) == 0
             and int(item.get("clear") or 0) == 0
             and str(item.get("primary_axis") or "") == primary_axis
-            and str(item.get("sha256") or "") not in queue_hashes | reserved
+            and (
+                str(item.get("sha256") or ""), int(item.get("mode", 0))
+            ) not in queue_identities | reserved
         ]
-        if not baseline or not transfer_pool:
+        if not baseline or len(transfer_pool) < len(INTERVAL_DAYS):
             continue
-        transfer = transfer_pool[
-            _draw(
-                str(experiment["seed"]),
-                session_key,
-                f"transfer-pool:{table_id}:{source_level}:{was_played}:{primary_axis}",
-            )
-            % len(transfer_pool)
-        ]
-        control_rows = [
-            item for item in baseline
-            if item.get("sha256") != transfer.get("sha256")
-        ]
+        transfers = sorted(
+            transfer_pool,
+            key=lambda item: (
+                str(item.get("sha256") or ""), int(item.get("mode", 0))
+            ),
+        )
+        transfer_identities = {
+            (str(item.get("sha256") or ""), int(item.get("mode", 0)))
+            for item in transfers
+        }
+        control_rows = sorted(
+            (
+                item for item in baseline
+                if (str(item.get("sha256") or ""), int(item.get("mode", 0)))
+                not in transfer_identities
+            ),
+            key=lambda item: (
+                str(item.get("sha256") or ""), int(item.get("mode", 0))
+            ),
+        )
         if not control_rows:
             continue
-        possibilities.append(
-            (key, coach_rows, control_rows, [transfer])
-        )
+        possibilities.append((key, coach_rows, control_rows, transfers))
     if not possibilities:
         raise ValueError(
             "latest Daily Menu has no focus/control/unused-transfer stratum"
@@ -290,13 +322,14 @@ def _assignment_result(conn: sqlite3.Connection, session_id: int) -> dict[str, A
     ).fetchone()
     if row is None:
         raise RuntimeError("assignment disappeared")
-    def selected(prefix: str) -> dict[str, Any]:
-        sha256 = str(row[f"{prefix}_sha256"])
-        mode = int(row[f"{prefix}_mode"])
+
+    def rendered_candidate(
+        sha256: str, mode: int, p_pred: float
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "sha256": sha256,
             "mode": mode,
-            "p_pred": float(row[f"{prefix}_p_pred"]),
+            "p_pred": p_pred,
         }
         chart = conn.execute(
             "SELECT title, artist FROM charts WHERE sha256 = ?", (sha256,)
@@ -305,6 +338,39 @@ def _assignment_result(conn: sqlite3.Connection, session_id: int) -> dict[str, A
             result["title"] = str(chart["title"] or "")
             result["artist"] = str(chart["artist"] or "")
         return result
+
+    selected = rendered_candidate(
+        str(row["selected_sha256"]),
+        int(row["selected_mode"]),
+        float(row["selected_p_pred"]),
+    )
+    legacy_transfer = rendered_candidate(
+        str(row["transfer_sha256"]),
+        int(row["transfer_mode"]),
+        float(row["transfer_p_pred"]),
+    )
+    transfer_probability = _transfer_selection_probability(
+        str(row["candidates_json"])
+    )
+    transfer_rows = conn.execute(
+        """
+        SELECT interval_days, sha256, mode, p_pred
+        FROM experiment_targets
+        WHERE session_id = ? AND target_kind = 'transfer'
+        ORDER BY interval_days
+        """,
+        (session_id,),
+    ).fetchall()
+    transfers: list[dict[str, Any]] = []
+    for target in transfer_rows:
+        rendered = rendered_candidate(
+            str(target["sha256"]),
+            int(target["mode"]),
+            float(target["p_pred"]),
+        )
+        rendered["interval_days"] = int(target["interval_days"])
+        rendered["selection_probability"] = transfer_probability
+        transfers.append(rendered)
     return {
         "session_id": int(row["id"]),
         "experiment_id": int(row["experiment_id"]),
@@ -312,9 +378,13 @@ def _assignment_result(conn: sqlite3.Connection, session_id: int) -> dict[str, A
         "arm": str(row["arm"]),
         "arm_probability": float(row["arm_probability"]),
         "selection_probability": float(row["selection_probability"]),
+        "transfer_selection_probability": transfer_probability,
         "candidate_hash": str(row["candidate_hash"]),
-        "selected": selected("selected"),
-        "transfer": selected("transfer"),
+        "input_candidate_hash": str(row["input_candidate_hash"]),
+        "selected": selected,
+        # Retain the original day-1 field for callers and schema-v5 rows.
+        "transfer": legacy_transfer,
+        "transfers": transfers,
     }
 
 
@@ -331,140 +401,209 @@ def assign_session(
 
     if not session_key:
         raise ValueError("session_key must not be empty")
-    experiment = conn.execute(
-        "SELECT * FROM experiments WHERE id = ?", (experiment_id,)
-    ).fetchone()
-    if experiment is None:
-        raise ValueError(f"unknown experiment {experiment_id}")
-    if not int(experiment["starts_at"]) <= int(session_at) < int(experiment["ends_at"]):
-        raise ValueError("session_at is outside the experiment assignment period")
+    submitted = _normalise_candidates(candidate_sets)
+    submitted_json = _canonical_candidates(submitted)
+    input_candidate_hash = hashlib.sha256(submitted_json.encode()).hexdigest()
+    if conn.in_transaction:
+        raise RuntimeError("assign_session requires a connection outside a transaction")
 
-    candidates = _normalise_candidates(candidate_sets)
-    existing = conn.execute(
-        "SELECT id, session_at, candidates_json FROM experiment_sessions "
-        "WHERE experiment_id = ? AND session_key = ?",
-        (experiment_id, session_key),
-    ).fetchone()
-    if existing is not None:
-        if int(existing["session_at"]) != int(session_at):
-            raise ValueError("session_key was already assigned with different inputs")
-        try:
-            stored = _normalise_candidates(json.loads(str(existing["candidates_json"])))
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise RuntimeError("stored experiment candidates are invalid") from error
-        if _canonical_candidates(stored) != _canonical_candidates(candidates):
-            raise ValueError("session_key was already assigned with different inputs")
-        return _assignment_result(conn, int(existing["id"]))
-
-    used_rows = conn.execute(
-        """
-        SELECT selected_sha256, selected_mode, transfer_sha256, transfer_mode
-        FROM experiment_sessions
-        WHERE experiment_id = ?
-        """,
-        (experiment_id,),
-    ).fetchall()
-    reserved = {
-        identity
-        for row in used_rows
-        for identity in (
-            (str(row["selected_sha256"]), int(row["selected_mode"])),
-            (str(row["transfer_sha256"]), int(row["transfer_mode"])),
-        )
-    }
-    candidates = {
-        group: tuple(
-            item
-            for item in candidates[group]
-            if (item.sha256, item.mode) not in reserved
-        )
-        for group in (*ARMS, "transfer")
-    }
-    for group in ARMS:
-        if not candidates[group]:
-            raise ValueError(
-                f"candidate set {group!r} has no chart unused by this experiment"
-            )
-    transfer_candidates = tuple(
-        item
-        for item in candidates["transfer"]
-        if conn.execute(
-            """
-            SELECT 1 FROM (
-              SELECT 1 FROM score_state
-              WHERE sha256 = ? AND mode = ? AND (playcount > 0 OR clear > 0)
-              UNION ALL
-              SELECT 1 FROM plays
-              WHERE sha256 = ? AND mode = ? AND is_course = 0
-                AND (playcount > 0 OR clear > 0 OR completed IS NOT NULL)
-            )
-            LIMIT 1
-            """,
-            (item.sha256, item.mode, item.sha256, item.mode),
+    session_id: int | None = None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        experiment = conn.execute(
+            "SELECT * FROM experiments WHERE id = ?", (experiment_id,)
         ).fetchone()
-        is None
-    )
-    if not transfer_candidates:
-        raise ValueError("transfer candidates must be unpractised at session start")
-    candidates["transfer"] = transfer_candidates
-    arm_identities = {
-        (item.sha256, item.mode) for arm in ARMS for item in candidates[arm]
-    }
-    if any(
-        (item.sha256, item.mode) in arm_identities for item in candidates["transfer"]
-    ):
-        raise ValueError("transfer candidates must be unpractised charts outside both arms")
-    candidates_json = _canonical_candidates(candidates)
-    candidate_hash = hashlib.sha256(candidates_json.encode()).hexdigest()
-    arm = ARMS[_draw(str(experiment["seed"]), session_key, "arm") % len(ARMS)]
-    arm_candidates = candidates[arm]
-    selected = arm_candidates[
-        _draw(str(experiment["seed"]), session_key, "selection") % len(arm_candidates)
-    ]
-    transfer = transfer_candidates[
-        _draw(str(experiment["seed"]), session_key, "transfer")
-        % len(transfer_candidates)
-    ]
-    assigned = int(time.time()) if assigned_at is None else int(assigned_at)
-    selection_probability = (1.0 / len(ARMS)) * (1.0 / len(arm_candidates))
+        if experiment is None:
+            raise ValueError(f"unknown experiment {experiment_id}")
+        if not (
+            int(experiment["starts_at"])
+            <= int(session_at)
+            < int(experiment["ends_at"])
+        ):
+            raise ValueError("session_at is outside the experiment assignment period")
 
-    with conn:
-        cursor = conn.execute(
+        existing = conn.execute(
             """
-            INSERT INTO experiment_sessions(
-              experiment_id, session_key, session_at, arm, arm_probability,
-              selection_probability, candidate_hash, candidates_json,
-              selected_sha256, selected_mode, selected_p_pred,
-              transfer_sha256, transfer_mode, transfer_p_pred, assigned_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT id, session_at, candidate_hash, input_candidate_hash,
+                   candidates_json
+            FROM experiment_sessions
+            WHERE experiment_id = ? AND session_key = ?
             """,
-            (
-                experiment_id, session_key, int(session_at), arm, 0.5,
-                selection_probability, candidate_hash, candidates_json,
-                selected.sha256, selected.mode, selected.p_pred,
-                transfer.sha256, transfer.mode, transfer.p_pred, assigned,
-            ),
-        )
-        session_id = int(cursor.lastrowid)
-        targets = []
-        for interval in INTERVAL_DAYS:
-            due_at = int(session_at) + interval * DAY_SECONDS
-            for kind, candidate in (("retention", selected), ("transfer", transfer)):
-                targets.append(
-                    (
-                        session_id, kind, interval, candidate.sha256, candidate.mode,
-                        due_at, due_at + DAY_SECONDS, candidate.p_pred,
-                    )
+            (experiment_id, session_key),
+        ).fetchone()
+        if existing is not None:
+            if int(existing["session_at"]) != int(session_at):
+                raise ValueError("session_key was already assigned with different inputs")
+            try:
+                stored = _normalise_candidates(
+                    json.loads(str(existing["candidates_json"]))
                 )
-        conn.executemany(
-            """
-            INSERT INTO experiment_targets(
-              session_id, target_kind, interval_days, sha256, mode,
-              due_at, window_closes_at, p_pred
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            targets,
-        )
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise RuntimeError("stored experiment candidates are invalid") from error
+            stored_json = _canonical_candidates(stored)
+            stored_input_hash = str(
+                existing["input_candidate_hash"] or existing["candidate_hash"]
+            )
+            if (
+                input_candidate_hash != stored_input_hash
+                and submitted_json != stored_json
+            ):
+                raise ValueError("session_key was already assigned with different inputs")
+            session_id = int(existing["id"])
+        else:
+            used_rows = conn.execute(
+                """
+                SELECT selected_sha256, selected_mode,
+                       transfer_sha256, transfer_mode
+                FROM experiment_sessions
+                WHERE experiment_id = ?
+                """,
+                (experiment_id,),
+            ).fetchall()
+            reserved = {
+                identity
+                for row in used_rows
+                for identity in (
+                    (str(row["selected_sha256"]), int(row["selected_mode"])),
+                    (str(row["transfer_sha256"]), int(row["transfer_mode"])),
+                )
+            }
+            target_rows = conn.execute(
+                """
+                SELECT target.sha256, target.mode
+                FROM experiment_targets target
+                JOIN experiment_sessions session ON session.id = target.session_id
+                WHERE session.experiment_id = ?
+                """,
+                (experiment_id,),
+            ).fetchall()
+            reserved.update(
+                (str(row["sha256"]), int(row["mode"])) for row in target_rows
+            )
+            candidates = {
+                group: tuple(
+                    item
+                    for item in submitted[group]
+                    if (item.sha256, item.mode) not in reserved
+                )
+                for group in (*ARMS, "transfer")
+            }
+            for group in ARMS:
+                if not candidates[group]:
+                    raise ValueError(
+                        f"candidate set {group!r} has no chart unused by this experiment"
+                    )
+            transfer_candidates = tuple(
+                item
+                for item in candidates["transfer"]
+                if conn.execute(
+                    """
+                    SELECT 1 FROM (
+                      SELECT 1 FROM score_state
+                      WHERE sha256 = ? AND mode = ?
+                        AND (playcount > 0 OR clear > 0)
+                      UNION ALL
+                      SELECT 1 FROM plays
+                      WHERE sha256 = ? AND mode = ? AND is_course = 0
+                        AND (playcount > 0 OR clear > 0 OR completed IS NOT NULL)
+                    )
+                    LIMIT 1
+                    """,
+                    (item.sha256, item.mode, item.sha256, item.mode),
+                ).fetchone()
+                is None
+            )
+            if len(transfer_candidates) < len(INTERVAL_DAYS):
+                raise ValueError(
+                    "transfer candidates must contain four distinct charts "
+                    "unpractised at session start"
+                )
+            candidates["transfer"] = transfer_candidates
+            arm_identities = {
+                (item.sha256, item.mode)
+                for arm in ARMS
+                for item in candidates[arm]
+            }
+            if any(
+                (item.sha256, item.mode) in arm_identities
+                for item in candidates["transfer"]
+            ):
+                raise ValueError(
+                    "transfer candidates must be unpractised charts outside both arms"
+                )
+            candidates_json = _canonical_candidates(candidates)
+            candidate_hash = hashlib.sha256(candidates_json.encode()).hexdigest()
+            arm = ARMS[
+                _draw(str(experiment["seed"]), session_key, "arm") % len(ARMS)
+            ]
+            arm_candidates = candidates[arm]
+            selected = arm_candidates[
+                _draw(str(experiment["seed"]), session_key, "selection")
+                % len(arm_candidates)
+            ]
+            remaining_transfers = list(transfer_candidates)
+            transfers: dict[int, Candidate] = {}
+            for interval in INTERVAL_DAYS:
+                purpose = "transfer" if interval == 1 else f"transfer:{interval}"
+                transfers[interval] = remaining_transfers.pop(
+                    _draw(str(experiment["seed"]), session_key, purpose)
+                    % len(remaining_transfers)
+                )
+            # Schema-v5 columns remain the compatibility alias for day 1;
+            # experiment_targets is authoritative for all four intervals.
+            transfer = transfers[1]
+            assigned = int(time.time()) if assigned_at is None else int(assigned_at)
+            selection_probability = (
+                1.0 / len(ARMS)
+            ) * (1.0 / len(arm_candidates))
+            cursor = conn.execute(
+                """
+                INSERT INTO experiment_sessions(
+                  experiment_id, session_key, session_at, arm, arm_probability,
+                  selection_probability, candidate_hash, candidates_json,
+                  selected_sha256, selected_mode, selected_p_pred,
+                  transfer_sha256, transfer_mode, transfer_p_pred, assigned_at,
+                  input_candidate_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    experiment_id, session_key, int(session_at), arm, 0.5,
+                    selection_probability, candidate_hash, candidates_json,
+                    selected.sha256, selected.mode, selected.p_pred,
+                    transfer.sha256, transfer.mode, transfer.p_pred, assigned,
+                    input_candidate_hash,
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+            targets: list[tuple[Any, ...]] = []
+            for interval in INTERVAL_DAYS:
+                due_at = int(session_at) + interval * DAY_SECONDS
+                for kind, candidate in (
+                    ("retention", selected),
+                    ("transfer", transfers[interval]),
+                ):
+                    targets.append(
+                        (
+                            session_id, kind, interval,
+                            candidate.sha256, candidate.mode,
+                            due_at, due_at + DAY_SECONDS, candidate.p_pred,
+                        )
+                    )
+            conn.executemany(
+                """
+                INSERT INTO experiment_targets(
+                  session_id, target_kind, interval_days, sha256, mode,
+                  due_at, window_closes_at, p_pred
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                targets,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if session_id is None:
+        raise RuntimeError("assignment did not produce a session")
     return _assignment_result(conn, session_id)
 
 
@@ -476,7 +615,8 @@ def resolve_targets(
     resolved_at = int(time.time()) if now is None else int(now)
     targets = conn.execute(
         """
-        SELECT target.* FROM experiment_targets target
+        SELECT target.*, session.session_at AS session_at
+        FROM experiment_targets target
         JOIN experiment_sessions session ON session.id = target.session_id
         WHERE session.experiment_id = ? AND target.status = 'pending'
           AND target.due_at <= ?
@@ -490,46 +630,68 @@ def resolve_targets(
             if resolved_at < int(target["window_closes_at"]):
                 counts["pending"] += 1
                 continue
-            plays = conn.execute(
-                """
-                SELECT id, completed FROM plays
-                WHERE sha256 = ? AND mode = ? AND is_course = 0
-                  AND played_at >= ? AND played_at < ?
-                ORDER BY played_at, id
-                """,
-                (
-                    target["sha256"], target["mode"], target["due_at"],
-                    target["window_closes_at"],
-                ),
-            ).fetchall()
-            scorable = [play for play in plays if play["completed"] is not None]
             status = "pending"
             note: str | None = None
             outcome: int | None = None
             play_id: int | None = None
-            if len(scorable) > 1:
-                status, note = "duplicate", "multiple plays in evaluation window"
-            elif len(scorable) == 1:
-                candidate_play_id = int(scorable[0]["id"])
-                already_used = conn.execute(
+            early_play = None
+            if str(target["target_kind"]) == "transfer":
+                early_play = conn.execute(
                     """
-                    SELECT 1 FROM experiment_targets other
-                    JOIN experiment_sessions session ON session.id = other.session_id
-                    WHERE session.experiment_id = ? AND other.id <> ?
-                      AND other.resolved_play_id = ?
+                    SELECT 1 FROM plays
+                    WHERE sha256 = ? AND mode = ? AND is_course = 0
+                      AND played_at >= ? AND played_at < ?
                     LIMIT 1
                     """,
-                    (experiment_id, int(target["id"]), candidate_play_id),
+                    (
+                        target["sha256"], target["mode"],
+                        target["session_at"], target["due_at"],
+                    ),
                 ).fetchone()
-                if already_used is not None:
-                    status, note = "duplicate", "play already used by another target"
-                else:
-                    status = "resolved"
-                    play_id = candidate_play_id
-                    outcome = int(bool(scorable[0]["completed"]))
+            if early_play is not None:
+                status = "duplicate"
+                note = "transfer chart played before evaluation window"
             else:
-                status = "missing"
-                note = "no scorable play in evaluation window"
+                plays = conn.execute(
+                    """
+                    SELECT id, completed FROM plays
+                    WHERE sha256 = ? AND mode = ? AND is_course = 0
+                      AND played_at >= ? AND played_at < ?
+                    ORDER BY played_at, id
+                    """,
+                    (
+                        target["sha256"], target["mode"], target["due_at"],
+                        target["window_closes_at"],
+                    ),
+                ).fetchall()
+                scorable = [
+                    play for play in plays if play["completed"] is not None
+                ]
+                if len(scorable) > 1:
+                    status, note = "duplicate", "multiple plays in evaluation window"
+                elif len(scorable) == 1:
+                    candidate_play_id = int(scorable[0]["id"])
+                    already_used = conn.execute(
+                        """
+                        SELECT 1 FROM experiment_targets other
+                        JOIN experiment_sessions session
+                          ON session.id = other.session_id
+                        WHERE session.experiment_id = ? AND other.id <> ?
+                          AND other.resolved_play_id = ?
+                        LIMIT 1
+                        """,
+                        (experiment_id, int(target["id"]), candidate_play_id),
+                    ).fetchone()
+                    if already_used is not None:
+                        status = "duplicate"
+                        note = "play already used by another target"
+                    else:
+                        status = "resolved"
+                        play_id = candidate_play_id
+                        outcome = int(bool(scorable[0]["completed"]))
+                else:
+                    status = "missing"
+                    note = "no scorable play in evaluation window"
             if status == "pending":
                 counts[status] += 1
                 continue
@@ -567,7 +729,9 @@ def list_targets(
                target.sha256, target.mode, target.due_at,
                target.window_closes_at, target.p_pred, target.status,
                target.outcome, target.resolution_note,
-               session.session_key, session.arm, chart.title, chart.artist
+               session.id AS session_id, session.session_key, session.arm,
+               session.selection_probability, session.candidates_json,
+               chart.title, chart.artist
         FROM experiment_targets target
         JOIN experiment_sessions session ON session.id = target.session_id
         LEFT JOIN charts chart ON chart.sha256 = target.sha256
@@ -582,6 +746,7 @@ def list_targets(
         "targets": [
             {
                 "target_id": int(row["id"]),
+                "session_id": int(row["session_id"]),
                 "session_key": str(row["session_key"]),
                 "arm": str(row["arm"]),
                 "target_kind": str(row["target_kind"]),
@@ -597,6 +762,13 @@ def list_targets(
                     int(row["window_closes_at"])
                 ),
                 "p_pred": float(row["p_pred"]),
+                "selection_probability": (
+                    float(row["selection_probability"])
+                    if str(row["target_kind"]) == "retention"
+                    else _transfer_selection_probability(
+                        str(row["candidates_json"])
+                    )
+                ),
                 "status": str(row["status"]),
                 "outcome": None if row["outcome"] is None else int(row["outcome"]),
                 "resolution_note": (

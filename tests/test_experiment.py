@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -25,19 +27,25 @@ def _sha(value: int) -> str:
     return f"{value:064x}"
 
 
-def _sets(offset: int = 0) -> dict[str, list[dict[str, object]]]:
+def _sets(
+    offset: int = 0, *, mode: int = 0
+) -> dict[str, list[dict[str, object]]]:
     return {
         "coach": [
-            {"sha256": _sha(offset + 1), "mode": 0, "p_pred": 0.8},
-            {"sha256": _sha(offset + 2), "mode": 0, "p_pred": 0.6},
+            {"sha256": _sha(offset + 1), "mode": mode, "p_pred": 0.8},
+            {"sha256": _sha(offset + 2), "mode": mode, "p_pred": 0.6},
         ],
         "control": [
-            {"sha256": _sha(offset + 3), "mode": 0, "p_pred": 0.5},
-            {"sha256": _sha(offset + 4), "mode": 0, "p_pred": 0.4},
+            {"sha256": _sha(offset + 3), "mode": mode, "p_pred": 0.5},
+            {"sha256": _sha(offset + 4), "mode": mode, "p_pred": 0.4},
         ],
         "transfer": [
-            {"sha256": _sha(offset + 5), "mode": 0, "p_pred": 0.55},
-            {"sha256": _sha(offset + 6), "mode": 0, "p_pred": 0.45},
+            {
+                "sha256": _sha(offset + index),
+                "mode": mode,
+                "p_pred": 0.4 + index / 100,
+            }
+            for index in range(5, 10)
         ],
     }
 
@@ -54,16 +62,24 @@ def _start(conn, *, minimum: int = 2) -> int:
     )["experiment_id"]
 
 
-def _insert_play(conn, *, sha256: str, played_at: int, completed: int, serial: int) -> None:
+def _insert_play(
+    conn,
+    *,
+    sha256: str,
+    played_at: int,
+    completed: int,
+    serial: int,
+    mode: int = 0,
+) -> None:
     conn.execute(
         """
         INSERT INTO plays(
           sha256, mode, played_at, playcount, source_generation, source,
           clear, completed, is_course, payload_hash, ingested_at
-        ) VALUES (?, 0, ?, ?, ?, 'collector', ?, ?, 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 'collector', ?, ?, 0, ?, ?)
         """,
         (
-            sha256, played_at, serial, serial, 4 if completed else 1,
+            sha256, mode, played_at, serial, serial, 4 if completed else 1,
             completed, f"experiment-{serial}", played_at,
         ),
     )
@@ -86,6 +102,22 @@ def test_assignment_is_deterministic_balanced_and_session_level(tmp_path) -> Non
             arms.append(result["arm"])
             assert result["arm_probability"] == 0.5
             assert result["selection_probability"] == 0.25
+            assert result["transfer_selection_probability"] == 0.2
+            assert result["transfer"] == {
+                key: value
+                for key, value in result["transfers"][0].items()
+                if key not in {"interval_days", "selection_probability"}
+            }
+            assert [item["interval_days"] for item in result["transfers"]] == [
+                1, 3, 7, 14
+            ]
+            assert len(
+                {(item["sha256"], item["mode"]) for item in result["transfers"]}
+            ) == 4
+            assert all(
+                item["selection_probability"] == 0.2
+                for item in result["transfers"]
+            )
             assert len(result["candidate_hash"]) == 64
             assert conn.execute(
                 "SELECT count(DISTINCT arm) FROM experiment_sessions WHERE id = ?",
@@ -101,8 +133,65 @@ def test_assignment_is_deterministic_balanced_and_session_level(tmp_path) -> Non
             candidate_sets={key: list(reversed(value)) for key, value in _sets().items()},
         )
         assert first["arm"] == arms[0]
+        assert first["transfers"] == assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="session-0",
+            session_at=BASE,
+            candidate_sets=_sets(),
+        )["transfers"]
         assert conn.execute("SELECT count(*) FROM experiment_sessions").fetchone()[0] == 200
         assert conn.execute("SELECT count(*) FROM experiment_targets").fetchone()[0] == 1600
+    finally:
+        conn.close()
+
+
+def test_assignment_serializes_transfer_reservations_across_connections(tmp_path) -> None:
+    path = tmp_path / "assistant.db"
+    conn = store.init(path)
+    try:
+        experiment_id = _start(conn)
+    finally:
+        conn.close()
+    barrier = threading.Barrier(2)
+
+    def assign(session_key: str) -> dict[str, object] | str:
+        worker = store.init(path)
+        try:
+            barrier.wait()
+            try:
+                return assign_session(
+                    worker,
+                    experiment_id=experiment_id,
+                    session_key=session_key,
+                    session_at=BASE,
+                    candidate_sets=_sets(),
+                    assigned_at=BASE,
+                )
+            except ValueError as error:
+                return str(error)
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(assign, ("concurrent-a", "concurrent-b")))
+
+    successes = [result for result in results if isinstance(result, dict)]
+    failures = [result for result in results if isinstance(result, str)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert "four distinct charts" in failures[0]
+    conn = store.init(path)
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM experiment_sessions"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            """
+            SELECT count(DISTINCT sha256 || ':' || mode)
+            FROM experiment_targets WHERE target_kind = 'transfer'
+            """
+        ).fetchone()[0] == 4
     finally:
         conn.close()
 
@@ -120,10 +209,13 @@ def test_candidate_sets_use_latest_focus_and_same_level_random_pool(tmp_path) ->
                 "source_level": "sl5",
                 "playcount": 0,
                 "clear": 0,
-                "primary_axis": "density",
+                "primary_axis": "scratch" if index == 7 else "density",
                 "p_complete": probability,
             }
-            for index, probability in ((1, 0.8), (2, 0.6), (3, 0.7))
+            for index, probability in (
+                (1, 0.8), (2, 0.6), (3, 0.7), (4, 0.65), (5, 0.62),
+                (6, 0.58), (7, 0.56),
+            )
         ]
         payload = {
             "queue": [
@@ -148,11 +240,12 @@ def test_candidate_sets_use_latest_focus_and_same_level_random_pool(tmp_path) ->
         )
 
         assert [item["sha256"] for item in candidates["coach"]] == [_sha(1)]
+        assert len(candidates["control"]) == 1
+        assert len(candidates["transfer"]) == 5
         assert {
             candidates["control"][0]["sha256"],
-            candidates["transfer"][0]["sha256"],
-        } == {_sha(2), _sha(3)}
-        assert candidates["control"][0]["sha256"] != candidates["transfer"][0]["sha256"]
+            *(item["sha256"] for item in candidates["transfer"]),
+        } == {_sha(index) for index in range(2, 8)}
         assert all(item["title"].startswith("Chart") for values in candidates.values() for item in values)
 
         assignment = assign_session(
@@ -163,6 +256,15 @@ def test_candidate_sets_use_latest_focus_and_same_level_random_pool(tmp_path) ->
             candidate_sets=candidates,
             assigned_at=BASE,
         )
+        assert assignment["transfer_selection_probability"] == 0.2
+        assert len({item["sha256"] for item in assignment["transfers"]}) == 4
+        stored_candidates = json.loads(
+            conn.execute(
+                "SELECT candidates_json FROM experiment_sessions WHERE id = ?",
+                (assignment["session_id"],),
+            ).fetchone()[0]
+        )
+        assert len(stored_candidates["transfer"]) == 5
         retry_candidates = build_candidate_sets(
             conn, experiment_id=experiment_id, session_key="menu-session"
         )
@@ -178,6 +280,96 @@ def test_candidate_sets_use_latest_focus_and_same_level_random_pool(tmp_path) ->
         assert conn.execute(
             "SELECT count(*) FROM experiment_sessions"
         ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_menu_candidates_preserve_mode_one_through_target_resolution(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        experiment_id = _start(conn)
+        personal = [
+            {
+                "sha256": _sha(index),
+                "mode": 1,
+                "title": f"LN Chart {index}",
+                "artist": "Artist",
+                "table_id": "satellite",
+                "source_level": "sl5",
+                "playcount": 0,
+                "clear": 0,
+                "primary_axis": "scratch" if index == 7 else "density",
+                "p_complete": 0.5 + index / 100,
+            }
+            for index in range(1, 8)
+        ]
+        payload = {
+            "queue": [
+                {
+                    "sha256": _sha(1),
+                    "mode": 1,
+                    "category": "02 FOCUS-A",
+                    "attempt": 1,
+                }
+            ],
+            "personal": personal,
+        }
+        with conn:
+            conn.execute(
+                "INSERT INTO sessions(created_at, arm, slots_json) VALUES (?, ?, ?)",
+                (BASE, "model", json.dumps(payload)),
+            )
+
+        candidates = build_candidate_sets(
+            conn, experiment_id=experiment_id, session_key="mode-one"
+        )
+        assert all(
+            item["mode"] == 1
+            for group in candidates.values()
+            for item in group
+        )
+        assignment = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="mode-one",
+            session_at=BASE,
+            candidate_sets=candidates,
+            assigned_at=BASE,
+        )
+        day_one = assignment["transfers"][0]
+        with conn:
+            _insert_play(
+                conn,
+                sha256=day_one["sha256"],
+                mode=0,
+                played_at=BASE + DAY_SECONDS + 10,
+                completed=0,
+                serial=1,
+            )
+            _insert_play(
+                conn,
+                sha256=day_one["sha256"],
+                mode=1,
+                played_at=BASE + DAY_SECONDS + 20,
+                completed=1,
+                serial=2,
+            )
+
+        counts = resolve_targets(
+            conn, experiment_id=experiment_id, now=BASE + 2 * DAY_SECONDS
+        )
+        assert counts == {
+            "resolved": 1,
+            "missing": 1,
+            "duplicate": 0,
+            "pending": 0,
+        }
+        resolved = list_targets(
+            conn, experiment_id=experiment_id, status="resolved"
+        )["targets"]
+        assert [(item["target_kind"], item["mode"], item["outcome"]) for item in resolved] == [
+            ("transfer", 1, 1)
+        ]
     finally:
         conn.close()
 
@@ -202,6 +394,11 @@ def test_resolve_handles_unique_missing_duplicate_and_out_of_window(tmp_path) ->
             1, 3, 7, 14
         }
         assert all(target["status"] == "pending" for target in schedule["targets"])
+        assert {
+            target["selection_probability"]
+            for target in schedule["targets"]
+            if target["target_kind"] == "transfer"
+        } == {0.2}
         assert all(target["due_at_utc"].endswith("+00:00") for target in schedule["targets"])
         assert all(
             target["window_closes_at_utc"].endswith("+00:00")
@@ -224,7 +421,7 @@ def test_resolve_handles_unique_missing_duplicate_and_out_of_window(tmp_path) ->
         counts = resolve_targets(
             conn, experiment_id=experiment_id, now=BASE + 2 * DAY_SECONDS
         )
-        assert counts == {"resolved": 1, "missing": 1, "duplicate": 0, "pending": 0}
+        assert counts == {"resolved": 1, "missing": 0, "duplicate": 1, "pending": 0}
 
         with conn:
             _insert_play(
@@ -242,13 +439,77 @@ def test_resolve_handles_unique_missing_duplicate_and_out_of_window(tmp_path) ->
         assert counts["missing"] == 1
         assert conn.execute(
             "SELECT count(*) FROM experiment_targets WHERE status='missing'"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT outcome FROM experiment_targets WHERE status='resolved'"
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT count(*) FROM experiment_targets WHERE status='duplicate'"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_resolve_excludes_transfer_played_before_its_window(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        experiment_id = _start(conn)
+        assignment = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="early-transfer",
+            session_at=BASE,
+            candidate_sets=_sets(),
+            assigned_at=BASE,
+        )
+        day_fourteen = next(
+            item for item in assignment["transfers"]
+            if item["interval_days"] == 14
+        )
+        with conn:
+            _insert_play(
+                conn,
+                sha256=day_fourteen["sha256"],
+                mode=day_fourteen["mode"],
+                played_at=BASE + 2 * DAY_SECONDS,
+                completed=1,
+                serial=1,
+            )
+            _insert_play(
+                conn,
+                sha256=day_fourteen["sha256"],
+                mode=day_fourteen["mode"],
+                played_at=BASE + 14 * DAY_SECONDS + 10,
+                completed=1,
+                serial=2,
+            )
+
+        resolve_targets(
+            conn, experiment_id=experiment_id, now=BASE + 15 * DAY_SECONDS
+        )
+        target = conn.execute(
+            """
+            SELECT status, outcome, resolved_play_id, resolution_note
+            FROM experiment_targets
+            WHERE session_id = ? AND target_kind = 'transfer'
+              AND interval_days = 14
+            """,
+            (assignment["session_id"],),
+        ).fetchone()
+        assert tuple(target) == (
+            "duplicate",
+            None,
+            None,
+            "transfer chart played before evaluation window",
+        )
+        transfer_day_fourteen = next(
+            result for result in report_experiment(
+                conn, experiment_id=experiment_id
+            )["results"]
+            if result["target_kind"] == "transfer"
+            and result["interval_days"] == 14
+        )
+        assert transfer_day_fourteen["arms"][assignment["arm"]]["n"] == 0
     finally:
         conn.close()
 
@@ -276,11 +537,15 @@ def test_report_detects_synthetic_effect_and_enforces_minimum(tmp_path) -> None:
             for arm, sessions in assignments.items():
                 for session in sessions:
                     for interval in (1, 3, 7, 14):
-                        for key in ("selected", "transfer"):
+                        transfer = next(
+                            item for item in session["transfers"]
+                            if item["interval_days"] == interval
+                        )
+                        for candidate in (session["selected"], transfer):
                             serial += 1
                             _insert_play(
                                 conn,
-                                sha256=session[key]["sha256"],
+                                sha256=candidate["sha256"],
                                 played_at=BASE + interval * DAY_SECONDS + serial,
                                 completed=1 if arm == "coach" else 0,
                                 serial=serial,
@@ -333,11 +598,15 @@ def test_report_detects_no_synthetic_arm_effect(tmp_path) -> None:
             for sessions in assignments.values():
                 for session in sessions:
                     for interval in (1, 3, 7, 14):
-                        for key in ("selected", "transfer"):
+                        transfer = next(
+                            item for item in session["transfers"]
+                            if item["interval_days"] == interval
+                        )
+                        for candidate in (session["selected"], transfer):
                             serial += 1
                             _insert_play(
                                 conn,
-                                sha256=session[key]["sha256"],
+                                sha256=candidate["sha256"],
                                 played_at=BASE + interval * DAY_SECONDS + serial,
                                 completed=1,
                                 serial=serial,
@@ -377,6 +646,11 @@ def test_cli_uses_only_assistant_db_and_candidate_json_is_read_only(tmp_path, ca
             "--session-at", str(BASE), "--candidates-json", str(candidates),
         ]
     ) == 0
+    assignment = json.loads(capsys.readouterr().out)
+    assert [item["interval_days"] for item in assignment["transfers"]] == [
+        1, 3, 7, 14
+    ]
+    assert len({item["sha256"] for item in assignment["transfers"]}) == 4
     assert candidates.read_bytes() == candidate_before
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
 
@@ -407,6 +681,96 @@ def test_assignment_rejects_changed_inputs_for_existing_session(tmp_path) -> Non
                 candidate_sets=expanded,
                 assigned_at=BASE,
             )
+    finally:
+        conn.close()
+
+
+def test_legacy_single_transfer_assignment_remains_idempotent(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        experiment_id = _start(conn)
+        legacy_candidates = _sets()
+        legacy_candidates["transfer"] = legacy_candidates["transfer"][:1]
+        candidates_json = json.dumps(
+            legacy_candidates,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        selected = legacy_candidates["coach"][0]
+        transfer = legacy_candidates["transfer"][0]
+        with conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO experiment_sessions(
+                  experiment_id, session_key, session_at, arm, arm_probability,
+                  selection_probability, candidate_hash, candidates_json,
+                  selected_sha256, selected_mode, selected_p_pred,
+                  transfer_sha256, transfer_mode, transfer_p_pred, assigned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    experiment_id,
+                    "legacy",
+                    BASE,
+                    "coach",
+                    0.5,
+                    0.25,
+                    hashlib.sha256(candidates_json.encode()).hexdigest(),
+                    candidates_json,
+                    selected["sha256"],
+                    selected["mode"],
+                    selected["p_pred"],
+                    transfer["sha256"],
+                    transfer["mode"],
+                    transfer["p_pred"],
+                    BASE,
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+            for interval in (1, 3, 7, 14):
+                due_at = BASE + interval * DAY_SECONDS
+                for kind, candidate in (
+                    ("retention", selected),
+                    ("transfer", transfer),
+                ):
+                    conn.execute(
+                        """
+                        INSERT INTO experiment_targets(
+                          session_id, target_kind, interval_days, sha256, mode,
+                          due_at, window_closes_at, p_pred
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            kind,
+                            interval,
+                            candidate["sha256"],
+                            candidate["mode"],
+                            due_at,
+                            due_at + DAY_SECONDS,
+                            candidate["p_pred"],
+                        ),
+                    )
+
+        retried = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="legacy",
+            session_at=BASE,
+            candidate_sets=legacy_candidates,
+            assigned_at=BASE + 1,
+        )
+        assert retried["session_id"] == session_id
+        assert retried["transfer_selection_probability"] == 1.0
+        assert len({item["sha256"] for item in retried["transfers"]}) == 1
+        assert build_candidate_sets(
+            conn, experiment_id=experiment_id, session_key="legacy"
+        )["transfer"] == legacy_candidates["transfer"]
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute(
+            "SELECT count(*) FROM experiment_sessions"
+        ).fetchone()[0] == 1
     finally:
         conn.close()
 
@@ -449,6 +813,25 @@ def test_assignment_rejects_overlap_between_coach_and_control(tmp_path) -> None:
         conn.close()
 
 
+def test_assignment_requires_one_unused_transfer_chart_per_interval(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        experiment_id = _start(conn)
+        candidates = _sets()
+        candidates["transfer"] = candidates["transfer"][:3]
+        with pytest.raises(ValueError, match="four distinct charts"):
+            assign_session(
+                conn,
+                experiment_id=experiment_id,
+                session_key="too-few-transfer-charts",
+                session_at=BASE,
+                candidate_sets=candidates,
+                assigned_at=BASE,
+            )
+    finally:
+        conn.close()
+
+
 def test_assignment_filters_practised_and_reserved_candidates(tmp_path) -> None:
     conn = store.init(tmp_path / "assistant.db")
     try:
@@ -469,11 +852,28 @@ def test_assignment_filters_practised_and_reserved_candidates(tmp_path) -> None:
             candidate_sets=_sets(),
             assigned_at=BASE,
         )
-        assert first["transfer"]["sha256"] == _sha(6)
+        assert {item["sha256"] for item in first["transfers"]} == {
+            _sha(index) for index in range(6, 10)
+        }
+        retried_first = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="first",
+            session_at=BASE,
+            candidate_sets=_sets(),
+            assigned_at=BASE + 1,
+        )
+        assert retried_first["session_id"] == first["session_id"]
+        assert first["input_candidate_hash"] != first["candidate_hash"]
 
         second_candidates = _sets()
-        second_candidates["transfer"].append(
-            {"sha256": _sha(7), "mode": 0, "p_pred": 0.5}
+        second_candidates["transfer"].extend(
+            {
+                "sha256": _sha(index),
+                "mode": 0,
+                "p_pred": 0.5,
+            }
+            for index in range(10, 15)
         )
         second = assign_session(
             conn,
@@ -483,11 +883,23 @@ def test_assignment_filters_practised_and_reserved_candidates(tmp_path) -> None:
             candidate_sets=second_candidates,
             assigned_at=BASE,
         )
+        retried_second = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="second",
+            session_at=BASE + 1,
+            candidate_sets=second_candidates,
+            assigned_at=BASE + 1,
+        )
+        assert retried_second["session_id"] == second["session_id"]
         first_used = {
             (first["selected"]["sha256"], first["selected"]["mode"]),
-            (first["transfer"]["sha256"], first["transfer"]["mode"]),
+            *((item["sha256"], item["mode"]) for item in first["transfers"]),
         }
         assert (second["selected"]["sha256"], second["selected"]["mode"]) not in first_used
-        assert (second["transfer"]["sha256"], second["transfer"]["mode"]) not in first_used
+        assert all(
+            (item["sha256"], item["mode"]) not in first_used
+            for item in second["transfers"]
+        )
     finally:
         conn.close()
