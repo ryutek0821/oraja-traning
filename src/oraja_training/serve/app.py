@@ -5,9 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
+import ipaddress
 import json
+import os
 from pathlib import Path
 import sqlite3
+import threading
+import time
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -24,6 +29,10 @@ _EXPORT_ROUTES = {
     "/api/session": ("session.json",),
     "/api/review/latest": ("review", "latest.json"),
 }
+
+_MAX_PROGRESS_BODY = 4096
+_TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 
 def _utc_now() -> str:
@@ -52,6 +61,29 @@ def _read_latest_judged(score_db: Path) -> int:
         connection.close()
 
 
+def _validate_progress_bind(host: str, progress_token: str | None) -> None:
+    """Keep the authenticated progress receiver off LAN/wildcard interfaces."""
+
+    if progress_token is None:
+        return
+    if host == "localhost":
+        return
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise ValueError(
+            "progress receiver host must be a loopback or exact Tailscale IP"
+        ) from error
+    if not (
+        address.is_loopback
+        or address in _TAILSCALE_V4
+        or address in _TAILSCALE_V6
+    ):
+        raise ValueError(
+            "progress receiver host must be a loopback or exact Tailscale IP"
+        )
+
+
 class TrainingHTTPServer(ThreadingHTTPServer):
     """HTTP server carrying immutable export configuration and status cache."""
 
@@ -65,6 +97,10 @@ class TrainingHTTPServer(ThreadingHTTPServer):
         score_db: str | Path | None = None,
         *,
         target_judged: int = 100_000,
+        progress_state: str | Path | None = None,
+        progress_token: str | None = None,
+        progress_source_id: str = "RYU-DESKTOP2",
+        progress_stale_after: int = 90,
     ) -> None:
         self.export_dir = Path(export_dir).expanduser().resolve()
         self.score_db = (
@@ -72,7 +108,90 @@ class TrainingHTTPServer(ThreadingHTTPServer):
         )
         self.target_judged = max(1, int(target_judged))
         self.last_current_judged: int | None = None
+        self.progress_state = (
+            Path(progress_state).expanduser().resolve()
+            if progress_state is not None
+            else None
+        )
+        self.progress_token = progress_token
+        self.progress_source_id = progress_source_id
+        self.progress_stale_after = max(1, int(progress_stale_after))
+        self.progress_lock = threading.Lock()
         super().__init__(server_address, TrainingRequestHandler)
+
+    def receive_progress(self, payload: Any) -> tuple[HTTPStatus, dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "JSON object required"}
+        if set(payload) != {"source_id", "current_judged", "observed_at"}:
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid progress payload"}
+        source_id = payload["source_id"]
+        current = payload["current_judged"]
+        observed_at = payload["observed_at"]
+        now = int(time.time())
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or len(source_id) > 64
+            or not all(character.isalnum() or character in "-_" for character in source_id)
+            or source_id != self.progress_source_id
+            or type(current) is not int
+            or type(observed_at) is not int
+            or current < 0
+            or observed_at < 0
+            or observed_at > now + 300
+        ):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid progress payload"}
+        if self.progress_state is None:
+            return HTTPStatus.SERVICE_UNAVAILABLE, {"error": "progress receiver disabled"}
+
+        with self.progress_lock:
+            previous: dict[str, Any] | None = None
+            try:
+                loaded = _read_json(self.progress_state)
+                if isinstance(loaded, dict):
+                    previous = loaded
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, json.JSONDecodeError):
+                return HTTPStatus.SERVICE_UNAVAILABLE, {"error": "progress state unavailable"}
+            if previous is not None:
+                if (
+                    previous.get("source_id") != source_id
+                    or type(previous.get("observed_at")) is not int
+                    or type(previous.get("current_judged")) is not int
+                    or type(previous.get("received_at")) is not int
+                ):
+                    return HTTPStatus.SERVICE_UNAVAILABLE, {
+                        "error": "progress state unavailable"
+                    }
+                old_time = previous["observed_at"]
+                old_current = previous["current_judged"]
+                if observed_at < old_time or current < old_current:
+                    return HTTPStatus.CONFLICT, {"error": "progress moved backwards"}
+                if observed_at == old_time and current != old_current:
+                    return HTTPStatus.CONFLICT, {"error": "conflicting progress snapshot"}
+                if observed_at == old_time and current == old_current:
+                    return HTTPStatus.OK, {"status": "accepted", **previous}
+
+            state = {
+                "source_id": source_id,
+                "current_judged": current,
+                "observed_at": observed_at,
+                "received_at": now,
+            }
+            self.progress_state.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.progress_state.with_name(
+                f".{self.progress_state.name}.{os.getpid()}.tmp"
+            )
+            try:
+                temporary.write_text(
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, self.progress_state)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return HTTPStatus.OK, {"status": "accepted", **state}
 
     def status(self) -> dict[str, Any]:
         stale = False
@@ -86,13 +205,42 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             errors.append("manifestを読み取れません")
 
         current: int | None = None
-        if self.score_db is None:
+        source = "baseline"
+        remote_observed_at: int | None = None
+        remote_received_at: int | None = None
+        if self.progress_state is not None:
+            try:
+                progress = _read_json(self.progress_state)
+                current = max(0, int(progress["current_judged"]))
+                remote_observed_at = int(progress["observed_at"])
+                source = str(progress["source_id"])
+                remote_received_at = int(
+                    progress.get("received_at", remote_observed_at)
+                )
+                freshness_at = min(remote_observed_at, remote_received_at)
+                if int(time.time()) - freshness_at > self.progress_stale_after:
+                    stale = True
+                    errors.append(f"{source}からの進捗が停止しています")
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                stale = True
+                errors.append("受信進捗を読み取れません")
+        if (
+            current is None
+            and self.score_db is None
+            and self.progress_state is not None
+        ):
+            stale = True
+            errors.append(f"{self.progress_source_id}からの進捗をまだ受信していません")
+        elif current is None and self.score_db is None:
             stale = True
             errors.append("score.dbが設定されていません")
-        else:
+        elif current is None:
             try:
                 current = _read_latest_judged(self.score_db)
                 self.last_current_judged = current
+                source = "local-score-db"
             except (OSError, ValueError, RuntimeError, sqlite3.Error):
                 stale = True
                 errors.append("score.dbを読み取れません")
@@ -106,6 +254,9 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             "target_judged": target,
             "baseline_judged": baseline,
             "current_judged": current,
+            "progress_source": source,
+            "progress_observed_at": remote_observed_at,
+            "progress_received_at": remote_received_at,
             "live_judged": live,
             "remaining_judged": max(0, target - live),
             "progress": min(1.0, live / target),
@@ -131,6 +282,35 @@ class TrainingRequestHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._dispatch(send_body=False)
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        try:
+            path = unquote(urlsplit(self.path).path, errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid path"}, True)
+            return
+        if path != "/api/progress":
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"}, True)
+            return
+        expected = self.server.progress_token
+        supplied = self.headers.get("Authorization", "")
+        if not expected or not hmac.compare_digest(supplied, f"Bearer {expected}"):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}, True)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        if length < 0 or length > _MAX_PROGRESS_BODY:
+            self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "invalid body size"}, True)
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid JSON"}, True)
+            return
+        status, response = self.server.receive_progress(payload)
+        self._send_json(status, response, True)
 
     def _dispatch(self, *, send_body: bool) -> None:
         try:
@@ -231,11 +411,22 @@ def make_server(
     host: str = "127.0.0.1",
     port: int = 8765,
     target_judged: int = 100_000,
+    progress_state: str | Path | None = None,
+    progress_token: str | None = None,
+    progress_source_id: str = "RYU-DESKTOP2",
+    progress_stale_after: int = 90,
 ) -> TrainingHTTPServer:
     """Create, but do not start, a local training HTTP server."""
 
+    if (progress_state is None) != (progress_token is None):
+        raise ValueError("progress_state and progress_token must be configured together")
+    _validate_progress_bind(host, progress_token)
+
     return TrainingHTTPServer(
-        (host, int(port)), export_dir, score_db, target_judged=target_judged
+        (host, int(port)), export_dir, score_db, target_judged=target_judged,
+        progress_state=progress_state, progress_token=progress_token,
+        progress_source_id=progress_source_id,
+        progress_stale_after=progress_stale_after,
     )
 
 
@@ -246,11 +437,18 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     target_judged: int = 100_000,
+    progress_state: str | Path | None = None,
+    progress_token: str | None = None,
+    progress_source_id: str = "RYU-DESKTOP2",
+    progress_stale_after: int = 90,
 ) -> None:
     """Serve the cockpit until interrupted."""
 
     server = make_server(
-        export_dir, score_db, host=host, port=port, target_judged=target_judged
+        export_dir, score_db, host=host, port=port, target_judged=target_judged,
+        progress_state=progress_state, progress_token=progress_token,
+        progress_source_id=progress_source_id,
+        progress_stale_after=progress_stale_after,
     )
     try:
         server.serve_forever()
@@ -288,7 +486,7 @@ const pick=(o,...ks)=>{for(const k of ks)if(o&&o[k]!=null)return o[k];return nul
 function charts(s){const q=pick(s,'queue','items','charts','menu');return Array.isArray(q)?q:[]}
 function showSession(s){const q=charts(s),next=pick(s,'next')||q[0]||{};document.querySelector('#next-title').textContent=pick(next,'title','name')||'次の譜面はありません';document.querySelector('#artist').textContent=pick(next,'artist','subtitle')||'—';document.querySelector('#notes').textContent=fmt(pick(next,'notes','judged')||0);document.querySelector('#level').textContent=pick(next,'level','difficulty')||'—';document.querySelector('#target').textContent=pick(next,'target','lamp','goal')||'—';document.querySelector('#slot').textContent=pick(next,'slot','category','phase')||'WARMUP';document.querySelector('#band').textContent=pick(next,'band','recommend_band')||'R1';document.querySelector('#queue-count').textContent=q.length;const box=document.querySelector('#queue');box.innerHTML=q.slice(1,7).map((x,i)=>`<div class="queue-item"><span>${String(i+2).padStart(2,'0')} / ${esc(pick(x,'slot','category','phase')||'NEXT')}</span><b>${esc(pick(x,'title','name')||'名称未設定')}</b></div>`).join('')||'<div class="empty">後続の譜面はありません。</div>'}
 function esc(v){const d=document.createElement('div');d.textContent=String(v);return d.innerHTML}
-function showStatus(s){const live=Number(s.live_judged)||0,target=Number(s.target_judged)||100000,p=Math.min(1,live/target);document.querySelector('#played').textContent=fmt(live);document.querySelector('#remaining').textContent=fmt(s.remaining_judged);document.querySelector('#rate').textContent=Math.floor(p*100)+'%';document.querySelector('#big-count').textContent=fmt(live);document.querySelector('#state').textContent=s.complete?'GOAL':'IN PROGRESS';document.querySelector('#dot').classList.toggle('stale',!!s.stale);document.querySelector('#sync').textContent=s.stale?'STALE':'LIVE';document.querySelector('#checked').textContent=s.stale?(s.message||'前回値を表示中'):'更新 '+new Date(s.checked_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});[...document.querySelectorAll('.segment')].forEach((el,i)=>el.style.setProperty('--fill',Math.max(0,Math.min(1,p*10-i))*100+'%'))}
+function showStatus(s){const live=Number(s.live_judged)||0,target=Number(s.target_judged)||100000,p=Math.min(1,live/target),received=Number(s.progress_received_at)||0,stamp=received?'最終受信 '+new Date(received*1000).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'更新 '+new Date(s.checked_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});document.querySelector('#played').textContent=fmt(live);document.querySelector('#remaining').textContent=fmt(s.remaining_judged);document.querySelector('#rate').textContent=Math.floor(p*100)+'%';document.querySelector('#big-count').textContent=fmt(live);document.querySelector('#state').textContent=s.complete?'GOAL':'IN PROGRESS';document.querySelector('#dot').classList.toggle('stale',!!s.stale);document.querySelector('#sync').textContent=s.stale?'STALE':'LIVE';document.querySelector('#checked').textContent=s.stale?((s.message||'前回値を表示中')+' / '+stamp):stamp;[...document.querySelectorAll('.segment')].forEach((el,i)=>el.style.setProperty('--fill',Math.max(0,Math.min(1,p*10-i))*100+'%'))}
 const rail=document.querySelector('#rail');for(let i=0;i<10;i++){const e=document.createElement('i');e.className='segment';rail.appendChild(e)}
 async function load(){try{const [a,b]=await Promise.all([fetch('/api/session',{cache:'no-store'}),fetch('/api/status',{cache:'no-store'})]);if(a.ok)showSession(await a.json());else document.querySelector('#next-title').textContent='今日のメニューを生成してください';if(b.ok)showStatus(await b.json())}catch(e){document.querySelector('#sync').textContent='OFFLINE';document.querySelector('#dot').classList.add('stale');document.querySelector('#checked').textContent='サーバーへ接続できません'}}load();setInterval(async()=>{try{const r=await fetch('/api/status',{cache:'no-store'});if(r.ok)showStatus(await r.json())}catch(e){}},5000);
 </script></body></html>'''

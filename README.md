@@ -88,6 +88,65 @@ Web画面はライブ`score.db`を読み取り専用で確認し、基準点か�
 難易度表には同一譜面を1回だけ掲載し、focus譜面の2回目と3～5譜面の間隔はWebキューに
 別スロットとして表示します。
 
+### Tailnet経由のWindows進捗送信（α版）
+
+Macを配信先、RYU-DESKTOP2をプレイ端末にする場合、両端末へ同じランダムtokenファイルを
+安全に配置します（リポジトリへ追加しないでください）。MacはTailscale IPだけで待ち受け、
+受信した累積打鍵数を`progress.json`へ原子的に保存します。`runtime/`は`.gitignore`対象です。
+
+Macでtokenを一度だけ生成します。コマンドはtoken値を画面へ出しません。
+
+```console
+oraja-training progress-token-create --output ./runtime/progress-token.txt
+```
+
+```console
+oraja-training serve \
+  --export-dir ./export/current \
+  --host 100.118.150.23 --port 8765 \
+  --progress-state ./runtime/progress.json \
+  --progress-token-file ./runtime/progress-token.txt
+```
+
+RYU-DESKTOP2では、実際に使用しているplayerの`score.db`を指定して送信します。
+
+```powershell
+.\scripts\send-progress-windows.ps1 `
+  -ScoreDb 'D:\path\to\beatoraja\player\PLAYER_NAME\score.db' `
+  -ServerUrl 'http://100.118.150.23:8765'
+```
+
+送信ツールはDBを読み取り専用で5秒ごとに確認し、値が変化した時と30秒ごとのheartbeatで
+送信します。同じ累積値を再送しても二重加算されず、古い観測値やカウンター巻き戻りは
+Mac側で拒否されます。90秒受信がなければTOPページを`STALE`表示にします。
+
+ログオン中に状態を確認する場合はTkinterモニターを使います。`score.db`を省略するとGUIの
+「参照」から選択でき、選択したDB、Mac URL、tokenファイルの**パスだけ**を
+`%LOCALAPPDATA%\oraja-training\progress-monitor.json`へ保存します。token値は保存しません。
+
+```powershell
+.\scripts\start-progress-monitor-windows.ps1 `
+  -ServerUrl 'http://100.118.150.23:8765' `
+  -TokenFile "$env:LOCALAPPDATA\oraja-training\progress-token.txt"
+```
+
+モニターにはLIVE／STALE／ERROR、最終送信、累積・本日打鍵数、次回heartbeat、再試行エラーを
+表示し、「今すぐ送信」と「終了」を操作できます。設定後、ログオン時に自動表示するタスクを
+登録できます。`-LogonType Interactive`（Task SchedulerのInteractiveToken）で現在ユーザーの
+デスクトップだけに起動し、管理者権限は使いません。モニターは多重起動を防止し、異常終了時は
+最大3回再起動します。起動診断は
+`%LOCALAPPDATA%\oraja-training\logs\progress-monitor.log`へ記録します。
+
+```powershell
+.\scripts\install-progress-monitor-task.ps1 -StartNow
+```
+
+解除は同じコマンドへ`-Uninstall`を付けます。登録・解除対象は
+`OrajaTrainingProgressMonitor`だけです。Windowsへtokenを配置した後は、そのファイルのACLを
+現在ユーザーの読取だけに絞ってください。Mac側は`--host`へTailscale IPを明示し、
+`0.0.0.0`やLAN IPでは待ち受けないでください。進捗受信を有効にした場合、サーバーも
+loopbackまたはTailscale IP以外へのbindを拒否します。
+
 `oraja-training review --assistant-db ./assistant.db`で直近日の打鍵、プレー数、ランプ・
 EX・BP更新、日次提出で復元できなかったプレー数を確認できます。
 

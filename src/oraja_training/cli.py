@@ -25,7 +25,7 @@ from oraja_training.plan.experiment import (
     resolve_targets,
     start_experiment,
 )
-from oraja_training.serve import serve
+from oraja_training.serve import create_progress_token, run_sender, send_progress, serve
 from oraja_training.tables import fetch_table, resolve
 
 
@@ -147,6 +147,26 @@ def _parser() -> argparse.ArgumentParser:
     server.add_argument("--score-db", type=Path)
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
+    server.add_argument("--progress-state", type=Path)
+    server.add_argument("--progress-token-file", type=Path)
+    server.add_argument("--progress-source-id", default="RYU-DESKTOP2")
+    server.add_argument("--progress-stale-after", type=int, default=90)
+
+    sender = subcommands.add_parser(
+        "progress-send", help="send live score progress to a training server"
+    )
+    sender.add_argument("--score-db", type=Path, required=True)
+    sender.add_argument("--url", required=True)
+    sender.add_argument("--token-file", type=Path, required=True)
+    sender.add_argument("--source-id", default="RYU-DESKTOP2")
+    sender.add_argument("--poll-interval", type=float, default=5.0)
+    sender.add_argument("--heartbeat", type=float, default=30.0)
+    sender.add_argument("--daemon", action="store_true")
+
+    token = subcommands.add_parser(
+        "progress-token-create", help="create a progress token file"
+    )
+    token.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -478,13 +498,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
 
+    if args.command == "progress-token-create":
+        created = create_progress_token(args.output)
+        print(json.dumps({"created": str(created)}, ensure_ascii=False))
+        return 0
+
+    if args.command == "progress-send":
+        token = args.token_file.read_text(encoding="utf-8").strip()
+        if not token:
+            raise ValueError("progress token file is empty")
+        try:
+            if args.daemon:
+                run_sender(
+                    args.score_db,
+                    args.url,
+                    token,
+                    source_id=args.source_id,
+                    poll_interval=args.poll_interval,
+                    heartbeat=args.heartbeat,
+                )
+            else:
+                result = send_progress(
+                    args.score_db, args.url, token, source_id=args.source_id
+                )
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        except KeyboardInterrupt:
+            return 0
+        return 0
+
     if args.command == "serve":
+        token = None
+        if args.progress_token_file is not None:
+            token = args.progress_token_file.read_text(encoding="utf-8").strip()
+            if not token:
+                raise ValueError("progress token file is empty")
         try:
             serve(
                 args.export_dir,
                 args.score_db,
                 host=args.host,
                 port=args.port,
+                progress_state=args.progress_state,
+                progress_token=token,
+                progress_source_id=args.progress_source_id,
+                progress_stale_after=args.progress_stale_after,
             )
         except KeyboardInterrupt:
             return 0
