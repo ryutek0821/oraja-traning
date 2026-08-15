@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import gzip
 import json
@@ -163,6 +164,30 @@ def test_payload_change_without_playcount_updates_same_event(tmp_path) -> None:
         assert conn.execute("SELECT minbp FROM plays").fetchone()[0] == 9
     finally:
         conn.close()
+
+
+def test_restart_reuses_cursor_without_touching_source_databases(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    assistant = tmp_path / "assistant.db"
+
+    with Poller(source, assistant, clock=lambda: 2_500) as first:
+        assert first.tick(force=True).new_plays == 1
+
+    before = {
+        path.name: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in source.glob("*.db")
+    }
+    with Poller(source, assistant, clock=lambda: 2_501) as restarted:
+        result = restarted.tick(force=True)
+    after = {
+        path.name: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in source.glob("*.db")
+    }
+
+    assert result.new_plays == 0
+    assert result.lost_events == 0
+    assert result.generation_changed is False
+    assert after == before
 
 
 def test_score_change_during_read_retries_snapshot(tmp_path, monkeypatch) -> None:

@@ -16,10 +16,18 @@ def test_windows_collector_launcher_uses_owned_database_and_daemon() -> None:
 def test_windows_task_is_user_scoped_restartable_and_exactly_removable() -> None:
     source = (ROOT / "scripts" / "install-collector-task.ps1").read_text()
     assert 'TaskName = "OrajaTrainingCollector"' in source
+    assert '[string]$DbDir = ""' in source
+    assert "DbDir is required when installing" in source
+    assert "$existingTask = Get-ScheduledTask" in source
+    assert "if ($null -ne $existingTask)" in source
     assert "-AtLogOn" in source
     assert "-RunLevel Limited" in source
     assert "-MultipleInstances IgnoreNew" in source
+    assert "-StartWhenAvailable" in source
     assert "-RestartCount 3" in source
+    assert "-WindowStyle Hidden" in source
+    assert "$resolvedProjectRoot = (Resolve-Path $ProjectRoot).Path" in source
+    assert "GetUnresolvedProviderPathFromPSPath($DataRoot)" in source
     assert "Unregister-ScheduledTask -TaskName $TaskName" in source
 
 
