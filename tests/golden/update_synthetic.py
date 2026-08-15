@@ -91,13 +91,6 @@ def _recommendation(fixture: Path, root: Path) -> dict:
                     ),
                 )
                 conn.execute(
-                    "INSERT OR IGNORE INTO table_entries VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        row["table_id"], row["level"], row["sha256"],
-                        row["md5"], row["title"], FIXED_CLOCK,
-                    ),
-                )
-                conn.execute(
                     """
                     INSERT OR REPLACE INTO chart_features VALUES (
                       ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -118,10 +111,22 @@ def _recommendation(fixture: Path, root: Path) -> dict:
                         f"synthetic-{row['sha256']}",
                     ),
                 )
+            owned_hashes = {row["sha256"] for row in catalog["owned"]}
+            for entry in catalog["table_entries"]:
+                if entry["sha256"] not in owned_hashes:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO table_entries VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        entry["table_id"], entry["level"], entry["sha256"],
+                        entry["md5"], entry["title"], FIXED_CLOCK,
+                    ),
+                )
             params = {
                 "weights": model["weights"],
                 "means": model["means"],
                 "scales": model["scales"],
+                "feature_names": model["feature_names"],
             }
             conn.execute(
                 "INSERT INTO model_state VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

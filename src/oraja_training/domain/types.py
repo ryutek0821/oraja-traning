@@ -205,10 +205,14 @@ class RecommendationInput:
     baseline_judged: int
     candidates: tuple[Mapping[str, Any], ...]
     model: ModelSnapshot | None = None
+    table_sources: tuple[Mapping[str, Any], ...] = ()
+    warmup_adjustment: int = 0
 
     def __post_init__(self) -> None:
         if self.import_id < 0 or self.baseline_judged < 0:
             raise DomainValidationError("recommendation input counters must not be negative")
+        if self.warmup_adjustment not in {-1, 0, 1}:
+            raise DomainValidationError("warmup_adjustment must be -1, 0, or 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +235,9 @@ class RecommendationOutput:
     reserve_expected_judged: int = 0
     weakness_axes: tuple[str, ...] = ()
     model_status: str = "cold_start"
+    table_frontiers: tuple[Mapping[str, Any], ...] = ()
+    table_warnings: tuple[str, ...] = ()
+    warmup_adjustment: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -250,3 +257,5 @@ class RecommendationOutput:
             or self.reserve_expected_judged < 0
         ):
             raise DomainValidationError("recommendation output counters must not be negative")
+        if self.warmup_adjustment not in {-1, 0, 1}:
+            raise DomainValidationError("warmup_adjustment must be -1, 0, or 1")

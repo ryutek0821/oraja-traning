@@ -13,6 +13,7 @@ assistant.db-wal
 .sites/
 export/
 data/
+/runtime/
 cloudflare/node_modules/
 cloudflare/ir/.gradle/
 cloudflare/ir/build/

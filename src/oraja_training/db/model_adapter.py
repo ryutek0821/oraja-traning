@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import math
 import sqlite3
@@ -11,6 +12,7 @@ from oraja_training.model.core import (
     FEATURE_NAMES,
     TARGET,
     FitResult,
+    fit_difficulty_frontier,
     fit_repository,
     numeric_level,
     predict_snapshot,
@@ -18,43 +20,91 @@ from oraja_training.model.core import (
 
 
 def _observations(conn: sqlite3.Connection) -> list[Observation]:
+    lamp_rows = conn.execute(
+        """
+        WITH ranked_state AS (
+          SELECT score_state.*,
+                 row_number() OVER (
+                   PARTITION BY sha256 ORDER BY played_at DESC, mode ASC
+                 ) AS rn
+          FROM score_state WHERE mode IN (0, 1)
+        )
+        SELECT te.table_id, te.sha256, te.level, s.clear
+          FROM table_entries AS te
+          JOIN ranked_state AS s ON s.sha256 = te.sha256 AND s.rn = 1
+         WHERE s.playcount > 0 AND s.played_at > 0
+         ORDER BY te.table_id, te.level, te.rowid
+        """
+    ).fetchall()
+    table_outcomes: dict[str, list[tuple[float, bool]]] = defaultdict(list)
+    seen_lamps: set[tuple[str, str, str]] = set()
+    for table_id, sha256, raw_level, clear in lamp_rows:
+        level = numeric_level(raw_level)
+        key = (str(table_id), str(sha256), str(raw_level))
+        if level is None or key in seen_lamps:
+            continue
+        seen_lamps.add(key)
+        table_outcomes[str(table_id)].append((level, int(clear) >= 4))
+
     rows = conn.execute(
         """
-        SELECT p.played_at, p.completed, te.level,
+        SELECT p.id, p.played_at, p.completed, te.table_id, te.level,
                f.density_p99, f.scratch_rate
           FROM plays AS p
           JOIN chart_features AS f ON f.sha256 = p.sha256
-          JOIN table_entries AS te ON te.rowid = (
-               SELECT candidate.rowid
-                 FROM table_entries AS candidate
-                WHERE candidate.sha256 = p.sha256
-                ORDER BY candidate.table_id, candidate.level, candidate.rowid
-                LIMIT 1
-          )
+          JOIN table_entries AS te ON te.sha256 = p.sha256
          WHERE p.source IN ('collector', 'daily_snapshot')
            AND p.completed IS NOT NULL
            AND p.is_course = 0
            AND f.density_p99 IS NOT NULL
            AND f.scratch_rate IS NOT NULL
-         ORDER BY p.played_at, p.id
+         ORDER BY p.played_at, p.id, te.table_id, te.level, te.rowid
         """
     ).fetchall()
-    result: list[Observation] = []
-    for played_at, completed, raw_level, density, scratch in rows:
+    parsed: list[tuple[int, int, float, str, float, float, float]] = []
+    for play_id, played_at, completed, table_id, raw_level, density, scratch in rows:
         level = numeric_level(raw_level)
-        values = (level, float(density), float(scratch)) if level is not None else None
-        if values is None or not all(math.isfinite(value) for value in values):
+        if level is None:
             continue
-        timestamp = int(played_at)
+        values = (level, float(density), float(scratch))
+        if not all(math.isfinite(value) for value in values):
+            continue
+        parsed.append(
+            (
+                int(play_id), int(played_at), float(bool(completed)),
+                str(table_id), level, values[1], values[2],
+            )
+        )
+
+    frontiers = {
+        table_id: fit_difficulty_frontier(outcomes)
+        for table_id, outcomes in table_outcomes.items()
+    }
+    support = {table_id: len(outcomes) for table_id, outcomes in table_outcomes.items()}
+    by_play: dict[int, list[tuple[int, int, float, str, float, float, float]]] = defaultdict(list)
+    for row in parsed:
+        by_play[row[0]].append(row)
+
+    result: list[Observation] = []
+    for play_rows in by_play.values():
+        supported_rows = [row for row in play_rows if row[3] in frontiers]
+        if not supported_rows:
+            continue
+        selected = min(
+            supported_rows,
+            key=lambda row: (-support[row[3]], row[3], row[4]),
+        )
+        _, timestamp, completed, table_id, level, density, scratch = selected
+        margin = (frontiers[table_id] - level) / 1.5
         result.append(
             Observation(
                 played_at=timestamp,
                 day=timestamp // 86_400,
-                features=values,
-                label=float(bool(completed)),
+                features=(margin, density, scratch),
+                label=completed,
             )
         )
-    return result
+    return sorted(result, key=lambda row: row.played_at)
 
 
 def _snapshot_from_row(row: sqlite3.Row | tuple[object, ...] | None) -> ModelSnapshot | None:
@@ -74,7 +124,10 @@ def _snapshot_from_row(row: sqlite3.Row | tuple[object, ...] | None) -> ModelSna
         means=tuple(float(value) for value in params["means"]),
         scales=tuple(float(value) for value in params["scales"]),
         feature_names=tuple(
-            str(value) for value in params.get("feature_names", FEATURE_NAMES)
+            str(value)
+            for value in params.get(
+                "feature_names", ("level", "density_p99", "scratch_rate")
+            )
         ),
         metrics=metrics,
         description=str(params.get("description", "")),
@@ -171,6 +224,11 @@ def fit_latest(conn: sqlite3.Connection, *, trained_at: int | None = None) -> Fi
 
 
 def predict_latest(
-    conn: sqlite3.Connection, level: float, density: float, scratch: float
+    conn: sqlite3.Connection,
+    table_completion_margin: float,
+    density: float,
+    scratch: float,
 ) -> float | None:
-    return predict_snapshot(latest_model(conn), level, density, scratch)
+    return predict_snapshot(
+        latest_model(conn), table_completion_margin, density, scratch
+    )

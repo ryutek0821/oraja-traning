@@ -230,6 +230,38 @@ def _create_songdata(path: Path) -> None:
             ("1" * 64, "1" * 32, "Synthetic Chart 1", "Synthetic Artist", 100, 0, "synthetic/alternate/chart-1.bms"),
         ]
         conn.executemany("INSERT INTO song VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        conn.execute(
+            """
+            CREATE TABLE bmscf_chart_analysis (
+              sha256 TEXT NOT NULL PRIMARY KEY,
+              rhythm_family INTEGER,
+              avg_chord REAL,
+              chord_ge3 REAL,
+              micro_rate REAL,
+              long_jack_rate REAL,
+              grid_bpm REAL,
+              stream_sec REAL,
+              last_kill REAL,
+              practice_low INTEGER,
+              analysis_version INTEGER,
+              error TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO bmscf_chart_analysis VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "1" * 64, 2, 1.4, 0.12, 0.08, 0.02,
+                    176.0, 14.0, 1.1, 1, 3, None,
+                ),
+                (
+                    "2" * 64, None, None, None, None, None,
+                    None, None, None, None, 3, "parse error",
+                ),
+            ],
+        )
         conn.commit()
     finally:
         conn.close()
@@ -346,7 +378,9 @@ def _build_catalog() -> dict[str, Any]:
             "weights": [0.0, 0.0, 0.0, 0.0],
             "means": [0.0, 0.0, 0.0],
             "scales": [1.0, 1.0, 1.0],
-            "feature_names": ["level", "density_p99", "scratch_rate"],
+            "feature_names": [
+                "table_completion_margin", "density_p99", "scratch_rate"
+            ],
             "metrics": {"logloss": 0.4, "brier": 0.2, "baseline_logloss": 0.5},
             "description": "Synthetic validated model; no player data.",
         },
@@ -364,6 +398,7 @@ def _manifest() -> dict[str, Any]:
             "scoredatalog.scoredatalog": 4,
             "scorelog.scorelog": 1,
             "songdata.song": 5,
+            "songdata.bmscf_chart_analysis": 2,
             "songinfo.information": 4,
         },
         "cases": list(REQUIRED_CASES),

@@ -12,7 +12,6 @@ import math
 import os
 from pathlib import Path
 import random
-import re
 import time
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
@@ -25,7 +24,12 @@ from oraja_training.domain.types import (
     RecommendationInput,
     RecommendationOutput,
 )
-from oraja_training.model.core import predict_snapshot
+from oraja_training.model.core import (
+    FEATURE_NAMES as MODEL_FEATURE_NAMES,
+    fit_difficulty_frontier,
+    numeric_level,
+    predict_snapshot,
+)
 
 
 TARGET_JUDGED = 100_000
@@ -52,6 +56,31 @@ QUOTAS = {
     "08 PROBE": 5_000,
 }
 FEATURE_AXES = ("density", "scratch", "ln", "soflan")
+DIFFICULTY_TABLES = ("genocide", "overjoy", "satellite", "stella")
+MIN_TABLE_MATCH_COVERAGE = 0.80
+CORE_WARMUP_FEATURES = (
+    "density_p90",
+    "end_density",
+    "burst_max",
+    "scratch_rate",
+    "scratch_combo_rate",
+    "ln_rate",
+    "soflan_var",
+    "soflan_changes",
+    "stop_count",
+    "end_density_ratio",
+    "burst_ratio",
+)
+PATTERN_WARMUP_FEATURES = (
+    "micro_rate",
+    "long_jack_rate",
+    "avg_chord",
+    "chord_ge3",
+    "grid_bpm",
+    "stream_sec",
+    "last_kill",
+)
+WARMUP_FEATURES = CORE_WARMUP_FEATURES + PATTERN_WARMUP_FEATURES
 
 
 class MenuBuildError(DomainError):
@@ -63,18 +92,44 @@ class RevisionConflictError(MenuBuildError):
 
 
 @dataclass(frozen=True, slots=True)
+class DifficultyRating:
+    table_id: str
+    source_level: str
+    level_number: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class TableFrontier:
+    table_id: str
+    easy: float
+    normal: float
+    hard: float
+    warmup_anchor: float
+    observations: int
+    hard_clears: int
+
+
+@dataclass(frozen=True, slots=True)
 class Candidate:
     sha256: str
+    mode: int
     md5: str | None
     title: str
     artist: str
     notes: int
     table_id: str
     source_level: str
-    level_number: float
+    level_number: float | None
+    ratings: tuple[DifficultyRating, ...]
     clear: int
     playcount: int
     last_played: int
+    minbp: int | None
+    recent_successes: int
+    recent_failures: int
+    recent_played_at: int
+    recent_second_played_at: int
+    recent_bp_rate: float | None
     p_complete: float
     tier: str
     target: str
@@ -82,12 +137,18 @@ class Candidate:
     primary_axis: str
     high_load: float
     feature_scores: dict[str, float]
+    warmup_features: dict[str, float | None]
+    warmup_feature_scores: dict[str, float]
+    warmup_load: float
+    chart_seconds: float | None
+    practice_low: bool | None
 
 
 @dataclass(frozen=True, slots=True)
 class MenuItem:
     sequence: int
     sha256: str
+    mode: int
     md5: str | None
     title: str
     artist: str
@@ -120,6 +181,9 @@ class Session:
     import_id: int
     model_version: int
     model_status: str
+    table_frontiers: tuple[TableFrontier, ...]
+    table_warnings: tuple[str, ...]
+    warmup_adjustment: int
     queue: tuple[MenuItem, ...]
     personal: tuple[Candidate, ...]
     profile: ProfileContext = field(default_factory=ProfileContext)
@@ -161,11 +225,6 @@ def next_training_date(moment: float | datetime, profile: ProfileContext) -> dat
     return training_day(moment, profile.timezone) + timedelta(days=1)
 
 
-def _number(level: str) -> float:
-    match = re.search(r"-?\d+(?:\.\d+)?", level)
-    return float(match.group()) if match else 0.0
-
-
 def _logistic(value: float) -> float:
     if value >= 0:
         z = math.exp(-value)
@@ -202,63 +261,167 @@ def _percentile_ranks(values: list[float]) -> list[float]:
     ordered = sorted((value, index) for index, value in enumerate(values))
     result = [0.0] * len(values)
     denominator = max(1, len(values) - 1)
-    for rank, (_, index) in enumerate(ordered):
-        result[index] = rank / denominator
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        while end < len(ordered) and ordered[end][0] == ordered[start][0]:
+            end += 1
+        rank = (start + end - 1) / 2 / denominator
+        for _, index in ordered[start:end]:
+            result[index] = rank
+        start = end
     return result
 
 
 def _frontier(rows: list[tuple[float, bool]]) -> float:
-    if not rows:
+    return fit_difficulty_frontier(rows)
+
+
+def _optional_number(row: Mapping[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        rendered = float(value)
+    except (TypeError, ValueError):
+        return None
+    return rendered if math.isfinite(rendered) else None
+
+
+def _warmup_feature_value(
+    row: Mapping[str, Any], feature: str
+) -> float | None:
+    """Return a stored warmup metric or a conservative density-shape ratio."""
+
+    numerator_key = {
+        "end_density_ratio": "end_density",
+        "burst_ratio": "burst_max",
+    }.get(feature)
+    if numerator_key is None:
+        return _optional_number(row, feature)
+    numerator = _optional_number(row, numerator_key)
+    baseline = _optional_number(row, "density_p90")
+    if numerator is None or baseline is None:
+        return None
+    if baseline <= 0.0:
+        return 0.0 if numerator <= 0.0 else None
+    return numerator / baseline
+
+
+def _optional_percentile_ranks(values: Sequence[float | None]) -> list[float]:
+    known = [(value, index) for index, value in enumerate(values) if value is not None]
+    result = [0.0] * len(values)
+    denominator = max(1, len(known) - 1)
+    ordered = sorted(known)
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        while end < len(ordered) and ordered[end][0] == ordered[start][0]:
+            end += 1
+        rank = (start + end - 1) / 2 / denominator
+        for _, index in ordered[start:end]:
+            result[index] = rank
+        start = end
+    return result
+
+
+def _quantile(values: Sequence[float], fraction: float) -> float:
+    if not values:
         return 0.0
-    low = min(level for level, _ in rows) - 3.0
-    high = max(level for level, _ in rows) + 3.0
-    best = low
-    best_loss = float("inf")
-    for step in range(241):
-        ability = low + (high - low) * step / 240
-        loss = 0.0
-        for level, cleared in rows:
-            p = min(0.999, max(0.001, _logistic((ability - level) / 1.5)))
-            loss -= math.log(p if cleared else 1.0 - p)
-        if loss < best_loss:
-            best, best_loss = ability, loss
-    return best
+    ordered = sorted(values)
+    index = round((len(ordered) - 1) * max(0.0, min(1.0, fraction)))
+    return ordered[index]
 
 
 def _load_candidates(
     records: Sequence[Mapping[str, Any]],
     model: ModelSnapshot | None,
-) -> tuple[list[Candidate], tuple[str, str], int]:
+) -> tuple[
+    list[Candidate], tuple[str, str], int, tuple[TableFrontier, ...]
+]:
     rows = list(records)
     if not rows:
         raise MenuBuildError(
             "no owned 7key table entries; refresh and match difficulty tables first"
         )
-    model_version = 0 if model is None else model.version
-    # One chart is recommended once even when multiple independent scales contain it.
-    deduped: list[Mapping[str, Any]] = []
-    seen: set[str] = set()
+    compatible_model = (
+        model is not None and tuple(model.feature_names) == MODEL_FEATURE_NAMES
+    )
+    model_version = model.version if compatible_model else 0
+    # Keep every independent table rating while scoring each chart only once.
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
         sha256 = str(row["sha256"])
-        if sha256 not in seen:
-            seen.add(sha256)
-            deduped.append(row)
+        grouped.setdefault(sha256, []).append(row)
+    deduped = [memberships[0] for memberships in grouped.values()]
 
     feature_ranks: dict[str, list[float]] = {}
     for axis in FEATURE_AXES:
         feature_ranks[axis] = _percentile_ranks(
             [float(row[axis] or 0.0) for row in deduped]
         )
-    table_outcomes: dict[str, list[tuple[float, bool]]] = defaultdict(list)
-    for row in deduped:
-        if int(row["playcount"]) > 0:
-            table_outcomes[str(row["table_id"])].append(
-                (_number(str(row["level"])), int(row["clear"]) >= 4)
-            )
-    frontiers = {
-        table_id: _frontier(outcomes)
-        for table_id, outcomes in table_outcomes.items()
+    warmup_feature_ranks = {
+        feature: _optional_percentile_ranks(
+            [_warmup_feature_value(row, feature) for row in deduped]
+        )
+        for feature in WARMUP_FEATURES
     }
+
+    table_outcomes: dict[str, dict[int, list[tuple[float, bool]]]] = defaultdict(
+        lambda: {4: [], 5: [], 6: []}
+    )
+    for sha256, memberships in grouped.items():
+        base = memberships[0]
+        if int(base["playcount"]) <= 0 or int(base["last_played"]) <= 0:
+            continue
+        clear = int(base["clear"])
+        seen_ratings: set[tuple[str, str]] = set()
+        for row in memberships:
+            table_id = str(row["table_id"])
+            source_level = str(row["level"])
+            if (table_id, source_level) in seen_ratings:
+                continue
+            seen_ratings.add((table_id, source_level))
+            level = numeric_level(source_level)
+            if level is None:
+                continue
+            for threshold in (4, 5, 6):
+                table_outcomes[table_id][threshold].append(
+                    (level, clear >= threshold)
+                )
+
+    present_tables = {
+        str(row["table_id"]) for memberships in grouped.values() for row in memberships
+    }
+    table_frontiers = tuple(
+        TableFrontier(
+            table_id=table_id,
+            easy=_frontier(table_outcomes[table_id][4]),
+            normal=_frontier(table_outcomes[table_id][5]),
+            hard=_frontier(table_outcomes[table_id][6]),
+            warmup_anchor=min(
+                math.floor(_frontier(table_outcomes[table_id][6])),
+                _quantile(
+                    [
+                        level for level, cleared in table_outcomes[table_id][6]
+                        if cleared
+                    ],
+                    0.90,
+                ),
+            ),
+            observations=len(table_outcomes[table_id][4]),
+            hard_clears=sum(cleared for _, cleared in table_outcomes[table_id][6]),
+        )
+        for table_id in sorted(
+            present_tables,
+            key=lambda value: (
+                DIFFICULTY_TABLES.index(value)
+                if value in DIFFICULTY_TABLES else len(DIFFICULTY_TABLES),
+                value,
+            ),
+        )
+    )
+    frontier_by_table = {frontier.table_id: frontier for frontier in table_frontiers}
 
     weakness_raw: dict[str, float] = {}
     for axis in FEATURE_AXES:
@@ -283,12 +446,56 @@ def _load_candidates(
 
     candidates: list[Candidate] = []
     for index, row in enumerate(deduped):
-        table_id = str(row["table_id"])
-        level = _number(str(row["level"]))
-        frontier = frontiers.get(table_id, level)
-        probability = _logistic((frontier - level) / 1.5)
+        memberships = grouped[str(row["sha256"])]
+        ratings = tuple(
+            DifficultyRating(
+                table_id=str(membership["table_id"]),
+                source_level=str(membership["level"]),
+                level_number=numeric_level(str(membership["level"])),
+            )
+            for membership in sorted(
+                memberships,
+                key=lambda value: (
+                    DIFFICULTY_TABLES.index(str(value["table_id"]))
+                    if str(value["table_id"]) in DIFFICULTY_TABLES
+                    else len(DIFFICULTY_TABLES),
+                    str(value["table_id"]),
+                    numeric_level(str(value["level"])) is None,
+                    numeric_level(str(value["level"])) or 0.0,
+                ),
+            )
+        )
+        primary_rating = min(
+            ratings,
+            key=lambda rating: (
+                -frontier_by_table.get(
+                    rating.table_id,
+                    TableFrontier(rating.table_id, 0, 0, 0, 0, 0, 0),
+                ).observations,
+                DIFFICULTY_TABLES.index(rating.table_id)
+                if rating.table_id in DIFFICULTY_TABLES else len(DIFFICULTY_TABLES),
+                rating.table_id,
+                rating.level_number is None,
+                rating.level_number or 0.0,
+            ),
+        )
+        primary_frontier = frontier_by_table.get(primary_rating.table_id)
+        if primary_rating.level_number is None:
+            completion_margin = 0.0
+            probability = 0.5
+        else:
+            easy_frontier = (
+                primary_rating.level_number
+                if primary_frontier is None or primary_frontier.observations == 0
+                else primary_frontier.easy
+            )
+            completion_margin = (easy_frontier - primary_rating.level_number) / 1.5
+            probability = _logistic(completion_margin)
         model_probability = predict_snapshot(
-            model, level, float(row["density"]), float(row["model_scratch"])
+            model if compatible_model else None,
+            completion_margin,
+            float(row["density"]),
+            float(row["model_scratch"]),
         )
         if model_probability is not None:
             probability = model_probability
@@ -297,27 +504,62 @@ def _load_candidates(
             probability = max(probability, 0.99)
         elif clear >= 6:
             probability = max(probability, 0.97)
-        elif clear >= 4:
+        elif clear >= 5:
             probability = max(probability, 0.90)
+        elif (
+            clear >= 4
+            and int(row.get("recent_successes") or 0) >= 2
+            and int(row.get("recent_failures") or 0) == 0
+        ):
+            probability = max(probability, 0.88)
         elif int(row["playcount"]) > 2:
             probability = max(0.03, probability - 0.05)
         scores = {axis: feature_ranks[axis][index] for axis in FEATURE_AXES}
+        warmup_scores = {
+            feature: warmup_feature_ranks[feature][index]
+            for feature in WARMUP_FEATURES
+        }
+        warmup_features = {
+            feature: _warmup_feature_value(row, feature)
+            for feature in WARMUP_FEATURES
+        }
+        # Optional constellator pattern rows must not make a chart look safer
+        # than an analyzed chart merely because their percentile was absent.
+        warmup_values = [
+            warmup_scores[feature]
+            if warmup_features[feature] is not None else 0.55
+            for feature in WARMUP_FEATURES
+        ]
+        warmup_load = (
+            0.65 * max(warmup_values, default=0.0)
+            + 0.35 * (sum(warmup_values) / len(warmup_values) if warmup_values else 0.0)
+        )
         primary = max(axes, key=lambda axis: scores[axis] * weakness_raw[axis])
         weakness = sum(scores[axis] * weakness_raw[axis] for axis in axes)
         weakness /= sum(weakness_raw[axis] for axis in axes)
         candidates.append(
             Candidate(
                 sha256=str(row["sha256"]),
+                mode=int(row.get("mode") or 0),
                 md5=None if row["md5"] is None else str(row["md5"]),
                 title=str(row["title"] or "UNKNOWN"),
                 artist=str(row["artist"] or "UNKNOWN"),
                 notes=int(row["notes"]),
-                table_id=table_id,
-                source_level=str(row["level"]),
-                level_number=level,
+                table_id=primary_rating.table_id,
+                source_level=primary_rating.source_level,
+                level_number=primary_rating.level_number,
+                ratings=ratings,
                 clear=clear,
                 playcount=int(row["playcount"]),
                 last_played=int(row["last_played"]),
+                minbp=(None if row.get("minbp") is None else int(row["minbp"])),
+                recent_successes=int(row.get("recent_successes") or 0),
+                recent_failures=int(row.get("recent_failures") or 0),
+                recent_played_at=int(row.get("recent_played_at") or 0),
+                recent_second_played_at=int(
+                    row.get("recent_second_played_at") or 0
+                ),
+                recent_bp_rate=_optional_number(row, "recent_bp_rate"),
                 p_complete=probability,
                 tier=_tier(probability),
                 target=_target(clear, probability),
@@ -325,9 +567,17 @@ def _load_candidates(
                 primary_axis=primary,
                 high_load=max(scores["density"], scores["scratch"]),
                 feature_scores=scores,
+                warmup_features=warmup_features,
+                warmup_feature_scores=warmup_scores,
+                warmup_load=max(0.0, min(1.0, warmup_load)),
+                chart_seconds=_optional_number(row, "chart_seconds"),
+                practice_low=(
+                    None if row.get("practice_low") is None
+                    else bool(row.get("practice_low"))
+                ),
             )
         )
-    return candidates, (axes[0], axes[1]), model_version
+    return candidates, (axes[0], axes[1]), model_version, table_frontiers
 
 
 def _expected(candidate: Candidate) -> int:
@@ -344,7 +594,7 @@ def _utility(
     readiness: str,
 ) -> float:
     challenge = 1.0 - min(1.0, abs(candidate.p_complete - target_p) / 0.55)
-    days = max(0.0, (now - candidate.last_played) / 86_400) if candidate.last_played else 30.0
+    days = max(0.0, (now - candidate.last_played) / 86_400) if candidate.last_played else 0.0
     review = min(1.0, days / 14.0)
     information = 4.0 * candidate.p_complete * (1.0 - candidate.p_complete)
     novelty = 1.0 / (1.0 + candidate.playcount)
@@ -370,26 +620,192 @@ def _to_item(
     attempt: int = 1,
     optional: bool = False,
     is_exploration: bool = False,
+    rating: DifficultyRating | None = None,
+    target: str | None = None,
+    band: str | None = None,
 ) -> MenuItem:
+    displayed_rating = rating or DifficultyRating(
+        candidate.table_id, candidate.source_level, candidate.level_number
+    )
     return MenuItem(
         sequence=0,
         sha256=candidate.sha256,
+        mode=candidate.mode,
         md5=candidate.md5,
         title=candidate.title,
         artist=candidate.artist,
         notes=candidate.notes,
         expected_judged=_expected(candidate),
         category=category,
-        table_id=candidate.table_id,
-        source_level=candidate.source_level,
-        band=candidate.tier.split()[0],
+        table_id=displayed_rating.table_id,
+        source_level=displayed_rating.source_level,
+        band=band or candidate.tier.split()[0],
         p_complete=round(candidate.p_complete, 4),
-        target=candidate.target,
+        target=target or candidate.target,
         reason=reason,
         attempt=attempt,
         optional=optional,
         is_exploration=is_exploration,
     )
+
+
+def _has_warmup_evidence(candidate: Candidate, *, now: int) -> bool:
+    if candidate.clear >= 6 and candidate.last_played > 0:
+        return True
+    return (
+        candidate.clear >= 4
+        and candidate.recent_successes >= 2
+        and candidate.recent_failures == 0
+        and candidate.recent_played_at > 0
+        and candidate.recent_second_played_at > 0
+        and now - candidate.recent_second_played_at <= 30 * 86_400
+        and candidate.recent_bp_rate is not None
+        and candidate.recent_bp_rate <= 0.05
+    )
+
+
+def _warmup_features_are_safe(candidate: Candidate, *, readiness: str) -> bool:
+    raw = candidate.warmup_features
+    ranks = candidate.warmup_feature_scores
+    if any(raw.get(feature) is None for feature in CORE_WARMUP_FEATURES):
+        return False
+    if (raw.get("stop_count") or 0.0) > 0.0:
+        return False
+    if (raw.get("soflan_changes") or 0.0) > 4.0:
+        return False
+    if (raw.get("end_density_ratio") or 0.0) > 1.5:
+        return False
+    if (raw.get("burst_ratio") or 0.0) > 1.8:
+        return False
+    # constellator has no direct two-lane trill metric.  Extreme rhythmic
+    # speed is therefore a fail-closed proxy, never presented as a diagnosis.
+    if (raw.get("grid_bpm") or 0.0) > 225.0:
+        return False
+    if (raw.get("stream_sec") or 0.0) > 30.0:
+        return False
+    if (raw.get("last_kill") or 0.0) > 1.3:
+        return False
+    if candidate.chart_seconds is not None and candidate.chart_seconds > 240.0:
+        return False
+    thresholds = {
+        "density_p90": 0.82,
+        "end_density": 0.85,
+        "burst_max": 0.88,
+        "scratch_rate": 0.88,
+        "scratch_combo_rate": 0.85,
+        "ln_rate": 0.90,
+        "soflan_var": 0.85,
+        "soflan_changes": 0.85,
+        "end_density_ratio": 0.85,
+        "burst_ratio": 0.88,
+        "micro_rate": 0.85,
+        "long_jack_rate": 0.85,
+        "avg_chord": 0.90,
+        "chord_ge3": 0.88,
+        "grid_bpm": 0.88,
+        "stream_sec": 0.90,
+        "last_kill": 0.85,
+    }
+    if any(ranks.get(feature, 0.0) >= limit for feature, limit in thresholds.items()):
+        return False
+    return candidate.warmup_load <= (0.55 if readiness == "tired" else 0.68)
+
+
+def _select_warmup(
+    candidates: list[Candidate],
+    used: set[str],
+    *,
+    quota: int,
+    frontiers: Sequence[TableFrontier],
+    now: int,
+    rng: random.Random,
+    readiness: str,
+    adjustment: int,
+) -> list[MenuItem]:
+    """Select familiar, low-load charts inside each table's own HARD band."""
+
+    frontier_by_table = {frontier.table_id: frontier for frontier in frontiers}
+    effective_shift = adjustment - (1 if readiness == "tired" else 0)
+    eligible: list[tuple[Candidate, DifficultyRating, float]] = []
+    for candidate in candidates:
+        if candidate.sha256 in used or not _has_warmup_evidence(candidate, now=now):
+            continue
+        if not _warmup_features_are_safe(candidate, readiness=readiness):
+            continue
+        allowed: list[tuple[DifficultyRating, TableFrontier, float]] = []
+        for rating in candidate.ratings:
+            if rating.table_id not in DIFFICULTY_TABLES:
+                continue
+            frontier = frontier_by_table.get(rating.table_id)
+            if (
+                rating.level_number is None
+                or frontier is None
+                or frontier.observations < 8
+                or frontier.hard_clears < 3
+            ):
+                continue
+            anchor = frontier.warmup_anchor + effective_shift
+            lower, upper = anchor - 2.0, anchor
+            assert rating.level_number is not None
+            if lower <= rating.level_number <= upper:
+                progress = max(0.0, min(1.0, (rating.level_number - lower) / 2.0))
+                allowed.append((rating, frontier, progress))
+        if not allowed:
+            continue
+        rating, _, progress = min(
+            allowed,
+            key=lambda value: (
+                -value[1].observations,
+                abs(value[2] - 0.5),
+                value[0].table_id,
+            ),
+        )
+        eligible.append((candidate, rating, progress))
+
+    selected: list[tuple[Candidate, DifficultyRating, float]] = []
+    total = 0
+    while eligible and len(selected) < 4 and total < quota:
+        target_progress = len(selected) / 3.0
+        choice = min(
+            eligible,
+            key=lambda value: (
+                0.50 * abs(value[2] - target_progress)
+                + 0.35 * value[0].warmup_load
+                + 0.10 * min(1.0, (value[0].chart_seconds or 120.0) / 240.0)
+                - (0.08 if value[0].practice_low else 0.0)
+                - min(0.05, value[0].playcount / 200.0)
+                + rng.random() * 0.01,
+                value[0].sha256,
+            ),
+        )
+        selected.append(choice)
+        total += _expected(choice[0])
+        chosen_sha = choice[0].sha256
+        eligible = [value for value in eligible if value[0].sha256 != chosen_sha]
+
+    selected.sort(
+        key=lambda value: (
+            0.75 * value[2] + 0.25 * value[0].warmup_load,
+            value[0].sha256,
+        )
+    )
+    items: list[MenuItem] = []
+    for candidate, rating, _ in selected:
+        used.add(candidate.sha256)
+        items.append(
+            _to_item(
+                candidate,
+                "01 WARMUP",
+                rating=rating,
+                target="COMFORT",
+                band="WARMUP",
+                reason=(
+                    f"{rating.table_id} {rating.source_level} / "
+                    f"familiar low-load"
+                ),
+            )
+        )
+    return items
 
 
 def _select(
@@ -474,17 +890,85 @@ def _order(core: dict[str, list[MenuItem]]) -> list[MenuItem]:
         "08 PROBE",
     ):
         fillers.extend(core[category])
-    # Each focus chart gets exactly three intervening attempts before retry.
-    for focus in first_focus:
-        ordered.append(focus)
-        for _ in range(3):
+    # Groups of four focus charts space one another.  The final partial group
+    # consumes only the number of fillers needed to preserve the same gap.
+    for start in range(0, len(first_focus), 4):
+        group = first_focus[start : start + 4]
+        ordered.extend(group)
+        for _ in range(4 - len(group)):
             if fillers:
                 ordered.append(fillers.pop(0))
-        repeat = repeats.get(focus.sha256)
-        if repeat is not None:
-            ordered.append(repeat)
+        ordered.extend(
+            repeats[focus.sha256]
+            for focus in group
+            if focus.sha256 in repeats
+        )
     ordered.extend(fillers)
     return ordered
+
+
+def _table_warnings(
+    sources: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Candidate],
+    frontiers: Sequence[TableFrontier],
+) -> tuple[str, ...]:
+    """Describe missing or failed table coverage without hiding it behind fallback."""
+
+    by_id = {str(source.get("table_id")): source for source in sources}
+    matched = {
+        rating.table_id for candidate in candidates for rating in candidate.ratings
+    }
+    frontier_by_id = {frontier.table_id: frontier for frontier in frontiers}
+    warnings: list[str] = []
+    missing_analysis = sum(
+        any(
+            candidate.warmup_features.get(feature) is None
+            for feature in PATTERN_WARMUP_FEATURES
+        )
+        for candidate in candidates
+    )
+    if missing_analysis:
+        warnings.append(
+            "warmup: optional pattern analysis missing for "
+            f"{missing_analysis} owned charts; conservative load penalty applied"
+        )
+    for table_id in DIFFICULTY_TABLES:
+        source = by_id.get(table_id)
+        if source is None:
+            warnings.append(f"{table_id}: difficulty table has not been refreshed")
+            continue
+        error = source.get("last_error")
+        if error:
+            warnings.append(f"{table_id}: refresh failed ({error})")
+        else:
+            total = int(source.get("entry_count") or 0)
+            source_matched = source.get("matched_count")
+            matched_count = int(source_matched or 0)
+            if table_id not in matched and matched_count == 0:
+                suffix = f" (0/{total})" if total else ""
+                warnings.append(f"{table_id}: no owned charts matched{suffix}")
+                continue
+            if total > 0 and source_matched is not None and (
+                matched_count < 8
+                or matched_count / total < MIN_TABLE_MATCH_COVERAGE
+            ):
+                warnings.append(
+                    f"{table_id}: low owned-chart match coverage "
+                    f"({matched_count}/{total})"
+                )
+            frontier = frontier_by_id.get(table_id)
+            if (
+                frontier is None
+                or frontier.observations < 8
+                or frontier.hard_clears < 3
+            ):
+                observations = 0 if frontier is None else frontier.observations
+                hard_clears = 0 if frontier is None else frontier.hard_clears
+                warnings.append(
+                    f"{table_id}: insufficient lamp evidence for warmup "
+                    f"({observations} observations, {hard_clears} HARD+)"
+                )
+    return tuple(warnings)
 
 
 def build_session_from_input(
@@ -532,23 +1016,36 @@ def build_session_from_input(
         raise MenuBuildError("ingest a daily score/scoredatalog snapshot first")
     import_id = recommendation_input.import_id
     baseline_judged = recommendation_input.baseline_judged
-    candidates, axes, model_version = _load_candidates(
+    candidates, axes, model_version, table_frontiers = _load_candidates(
         recommendation_input.candidates, recommendation_input.model
+    )
+    table_warnings = _table_warnings(
+        recommendation_input.table_sources, candidates, table_frontiers
     )
     seed = hashlib.sha256(
         f"{effective_profile.deterministic_namespace}:"
         f"{rendered_date}:{import_id}:{model_version}:{effective_settings.readiness}:"
-        f"{effective_settings.target_judged}:{effective_settings.reserve_judged}".encode("utf-8")
+        f"{effective_settings.target_judged}:{effective_settings.reserve_judged}:"
+        f"{recommendation_input.warmup_adjustment}".encode("utf-8")
     ).hexdigest()[:16]
     rng = random.Random(seed)
     used: set[str] = set()
     tired_shift = 0.08 if effective_settings.readiness == "tired" else 0.0
     core: dict[str, list[MenuItem]] = {}
-    core["01 WARMUP"] = _select(
-        candidates, used, category="01 WARMUP", quota=QUOTAS["01 WARMUP"],
-        target_p=0.96, predicate=lambda c: c.p_complete >= 0.90 and c.clear >= 4,
-        now=now, rng=rng, readiness=effective_settings.readiness,
+    core["01 WARMUP"] = _select_warmup(
+        candidates,
+        used,
+        quota=QUOTAS["01 WARMUP"],
+        frontiers=table_frontiers,
+        now=now,
+        rng=rng,
+        readiness=effective_settings.readiness,
+        adjustment=recommendation_input.warmup_adjustment,
     )
+    if not core["01 WARMUP"]:
+        table_warnings += (
+            "warmup: no chart met safe lamp-evidence and feature criteria",
+        )
     for category, axis in (("02 FOCUS-A", axes[0]), ("04 FOCUS-B", axes[1])):
         core[category] = _select(
             candidates, used, category=category, quota=QUOTAS[category],
@@ -580,8 +1077,9 @@ def build_session_from_input(
     core["07 REVIEW"] = _select(
         candidates, used, category="07 REVIEW", quota=QUOTAS["07 REVIEW"],
         target_p=0.85 + tired_shift,
-        predicate=lambda c: c.last_played == 0 or now - c.last_played >= 3 * 86_400,
+        predicate=lambda c: c.last_played > 0 and now - c.last_played >= 3 * 86_400,
         now=now, rng=rng, readiness=effective_settings.readiness,
+        allow_fallback=False,
     )
     core["08 PROBE"] = _select(
         candidates, used, category="08 PROBE", quota=QUOTAS["08 PROBE"],
@@ -608,22 +1106,25 @@ def build_session_from_input(
     queue = [replace(item, sequence=index) for index, item in enumerate(queue, 1)]
     reserve_total = sum(item.expected_judged for item in reserve)
     return Session(
-        rendered_date,
-        now,
-        seed,
-        effective_settings.readiness,
-        effective_settings.target_judged,
-        effective_settings.reserve_judged,
-        core_total,
-        reserve_total,
-        axes,
-        baseline_judged,
-        import_id,
-        model_version,
-        "validated_model" if model_version else "cold_start",
-        tuple(queue),
-        tuple(sorted(candidates, key=lambda c: (-c.p_complete, c.title))),
-        effective_profile,
+        menu_date=rendered_date,
+        generated_at=now,
+        seed=seed,
+        readiness=effective_settings.readiness,
+        target_judged=effective_settings.target_judged,
+        reserve_target=effective_settings.reserve_judged,
+        core_expected_judged=core_total,
+        reserve_expected_judged=reserve_total,
+        weakness_axes=axes,
+        baseline_judged=baseline_judged,
+        import_id=import_id,
+        model_version=model_version,
+        model_status="validated_model" if model_version else "cold_start",
+        table_frontiers=table_frontiers,
+        table_warnings=table_warnings,
+        warmup_adjustment=recommendation_input.warmup_adjustment,
+        queue=tuple(queue),
+        personal=tuple(sorted(candidates, key=lambda c: (-c.p_complete, c.title))),
+        profile=effective_profile,
     )
 
 
@@ -701,6 +1202,9 @@ def recommendation_output(session: Session) -> RecommendationOutput:
         reserve_expected_judged=session.reserve_expected_judged,
         weakness_axes=session.weakness_axes,
         model_status=session.model_status,
+        table_frontiers=tuple(asdict(value) for value in session.table_frontiers),
+        table_warnings=session.table_warnings,
+        warmup_adjustment=session.warmup_adjustment,
     )
 
 
@@ -763,7 +1267,13 @@ def table_payloads(session: Session) -> dict[str, Any]:
             "level": candidate.tier,
             "title": candidate.title,
             "artist": candidate.artist,
-            "comment": f"{candidate.table_id} {candidate.source_level} / target {candidate.target}",
+            "comment": (
+                " + ".join(
+                    f"{rating.table_id} {rating.source_level}"
+                    for rating in candidate.ratings
+                )
+                + f" / target {candidate.target}"
+            ),
         }
         for candidate in session.personal
     ]
@@ -893,6 +1403,9 @@ def write_export(
         "import_id": session.import_id,
         "model_version": session.model_version,
         "model_status": session.model_status,
+        "table_frontiers": [asdict(value) for value in session.table_frontiers],
+        "table_warnings": list(session.table_warnings),
+        "warmup_adjustment": session.warmup_adjustment,
         "revision": candidate_revision,
         "content_hash": content_hash,
         "timezone": session.profile.timezone,
@@ -907,6 +1420,8 @@ def write_export(
             else "学習効果はヒューリスティックです。確率モデルは検証ゲート通過後に有効化します。"
         ),
         "weakness_axes": session.weakness_axes,
+        "table_warnings": list(session.table_warnings),
+        "warmup_adjustment": session.warmup_adjustment,
     }
     files = {
         **payloads,

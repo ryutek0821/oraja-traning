@@ -33,17 +33,17 @@ oraja-training initialize \
 
 ```console
 oraja-training tables refresh \
-  --assistant-db ./assistant.db \
-  --table satellite=https://stellabms.xyz/sl/table.html \
-  --table genocide=https://your-current-genocide-table.example/table.html
+  --assistant-db ./assistant.db
 ```
 
 取得結果はETag/Last-Modified付きで`.cache/tables/`へ保存され、通信失敗時は最後の正常な
-キャッシュを使います。GENOCIDEの公開URLは移転することがあるため、beatorajaで現在
-使用している表URLを指定してください。
+キャッシュを使います。既定ではGENOCIDE（発狂難易度表）、Overjoy、Satellite、Stellaの
+4表を取得し、各表の尺度を混ぜずにクリアランプから適正帯を推定します。GENOCIDEは公式の
+Shift_JIS/JavaScript旧形式をコード実行せず解析し、hashがない項目は正規化titleがローカルで
+一意な場合だけ照合します。照合数/全項目数は保存され、低照合率をメニュー警告へ出します。
 
 schema version 1の既存`assistant.db`は正しい値へ復元できないため、in-place移行しません。
-version 2は履歴を保持してversion 3へ移行します。現行schema versionは3です。
+version 2以降は履歴を保持して段階的に移行します。現行schema versionは10です。
 
 ## 毎日の更新
 
@@ -65,6 +65,30 @@ oraja-training daily-update \
 日次更新のたびに完走確率モデルも再評価します。200結果・10日へ達するまではcold-start、
 到達後も時間順holdoutと日単位bootstrapの改善ゲートを通った版だけを推薦へ使用します。
 これは普段の設定下での観測完走確率であり、開始ゲージ別のクリア確率ではありません。
+
+### ウォームアップ選定
+
+BMS固有の対照研究は見当たらないため、一般的なウォームアップ研究と鍵盤演奏の疲労研究を
+プレーデータへ保守的に当てはめます。短時間で段階的に強度を上げるというレビュー知見と、
+反復鍵盤動作による前腕疲労が打鍵精度を下げるという実験結果を根拠にしています
+（[McGowan et al., 2018](https://pubmed.ncbi.nlm.nih.gov/29968230/)、
+[Goubault et al., 2021](https://pmc.ncbi.nlm.nih.gov/articles/PMC8047012/)、
+[Drinkwater et al., 2010](https://pubmed.ncbi.nlm.nih.gov/20795334/)）。
+
+- 発狂・Overjoy・Satellite・Stellaを別尺度のまま扱い、各表のHARDクリア前線を推定
+- HARD/EXHARD、または直近30日で2回以上完走かつBP 5%以下の譜面だけを採用
+- 前線の2段階下から前線までを4曲以内で並べ、目標は更新ではなく`COMFORT`
+- 終盤密度比、瞬間密度比、皿、LN、ソフラン/停止、微縦連、長いジャック、同時押し、
+  最長発狂、曲長の極端値を除外
+- 疲労日や前回ウォームアップ不調時は帯を1段階下げ、条件を満たす曲がなければ空欄と警告
+
+微縦連・長いジャック・同時押しに加え、高速交互の危険度proxyとして`grid_bpm`、
+持続発狂と終盤発狂に`stream_sec` / `last_kill`を、`songdata.db`内の任意テーブル
+`bmscf_chart_analysis`（oraja-constellator出力）から使います。`grid_bpm`はレーン列を見ないため
+トリルそのものの判定ではありません。解析値がない譜面は安全と推測せず
+保守的な負荷ペナルティを与えて件数を警告し、基本の密度・皿・LN・ソフラン解析まで欠ける
+譜面はWARMUPから除外します。解析後に`initialize`/backfillを再実行すると
+`chart_pattern_features`へコピーされます。tokenや打鍵列そのものは保存しません。
 
 実打鍵は`player`テーブルのPGREAT～POORの10判定列の累積差分です。空POORは含めません。
 日替わり本編は期待判定10万以上、失敗時の補填として約1万のRESERVEを追加します。
@@ -88,6 +112,87 @@ Web画面はライブ`score.db`を読み取り専用で確認し、基準点か�
 難易度表には同一譜面を1回だけ掲載し、focus譜面の2回目と3～5譜面の間隔はWebキューに
 別スロットとして表示します。
 
+### Tailnet経由のWindows進捗送信（α版）
+
+Macを配信先、RYU-DESKTOP2をプレイ端末にする場合、両端末へ同じランダムtokenファイルを
+安全に配置します（リポジトリへ追加しないでください）。MacはTailscale IPだけで待ち受け、
+受信した累積打鍵数を`progress.json`へ原子的に保存します。`runtime/`は`.gitignore`対象です。
+
+Macでtokenを一度だけ生成します。コマンドはtoken値を画面へ出しません。
+
+```console
+oraja-training progress-token-create --output ./runtime/progress-token.txt
+```
+
+```console
+oraja-training serve \
+  --export-dir ./export/current \
+  --host 100.64.0.1 --port 8765 \
+  --progress-state ./runtime/progress.json \
+  --progress-token-file ./runtime/progress-token.txt
+```
+
+`100.64.0.1`は説明用です。実行時は`tailscale ip -4`または`tailscale ip -6`で表示された
+このMac自身のTailnet IPへ置き換えてください。
+
+Macへのログイン後もサーバーを常駐・自動復旧させる場合は、ユーザーLaunchAgentを登録します。
+installerは設定hostがこのMacの`tailscale ip -4`または`tailscale ip -6`と一致しない場合、
+tokenファイルが現在ユーザー所有かつgroup/otherから読めない状態でない場合に登録を拒否します。
+plistにはtokenのパスだけを保存し、token値は保存しません。
+
+```console
+./scripts/install-progress-server-launch-agent.sh --host 100.64.0.1
+```
+
+このLaunchAgentはログイン時に起動し、異常終了後は30秒以上の間隔を置いて再起動します。
+ログは`runtime/progress-server.log`です。以前に同じlabelを`launchctl submit`で起動していた
+場合は、このprogress serverだと確認できたジョブだけを停止して置き換えます。解除対象も
+`com.ryutek.oraja-training.progress-server`だけです。
+
+```console
+./scripts/install-progress-server-launch-agent.sh --uninstall
+```
+
+RYU-DESKTOP2では、実際に使用しているplayerの`score.db`を指定して送信します。
+
+```powershell
+.\scripts\send-progress-windows.ps1 `
+  -ScoreDb 'D:\path\to\beatoraja\player\PLAYER_NAME\score.db' `
+  -ServerUrl 'http://100.64.0.1:8765'
+```
+
+送信ツールはDBを読み取り専用で5秒ごとに確認し、値が変化した時と30秒ごとのheartbeatで
+送信します。同じ累積値を再送しても二重加算されず、古い観測値やカウンター巻き戻りは
+Mac側で拒否されます。90秒受信がなければTOPページを`STALE`表示にします。WindowsとMacの
+時計が90秒を超えてずれていても受信が続く間は`STALE`にせず、時刻ずれを`WARN`表示します。
+
+ログオン中に状態を確認する場合はTkinterモニターを使います。`score.db`を省略するとGUIの
+「参照」から選択でき、選択したDB、Mac URL、tokenファイルの**パスだけ**を
+`%LOCALAPPDATA%\oraja-training\progress-monitor.json`へ保存します。token値は保存しません。
+
+```powershell
+.\scripts\start-progress-monitor-windows.ps1 `
+  -ServerUrl 'http://100.64.0.1:8765' `
+  -TokenFile "$env:LOCALAPPDATA\oraja-training\progress-token.txt"
+```
+
+モニターにはLIVE／STALE／ERROR、最終送信、累積・本日打鍵数、次回heartbeat、再試行エラーを
+表示し、「今すぐ送信」と「終了」を操作できます。設定後、ログオン時に自動表示するタスクを
+登録できます。`-LogonType Interactive`（Task SchedulerのInteractiveToken）で現在ユーザーの
+デスクトップだけに起動し、管理者権限は使いません。モニターは多重起動を防止し、異常終了時は
+最大3回再起動します。起動診断は
+`%LOCALAPPDATA%\oraja-training\logs\progress-monitor.log`へ記録します。
+
+```powershell
+.\scripts\install-progress-monitor-task.ps1 -StartNow
+```
+
+解除は同じコマンドへ`-Uninstall`を付けます。登録・解除対象は
+`OrajaTrainingProgressMonitor`だけです。Windowsへtokenを配置した後は、そのファイルのACLを
+現在ユーザーの読取だけに絞ってください。Mac側は`--host`へTailscale IPを明示し、
+`0.0.0.0`やLAN IPでは待ち受けないでください。進捗受信を有効にした場合、サーバーも
+loopbackまたはTailscale IP以外へのbindを拒否します。
+
 `oraja-training review --assistant-db ./assistant.db`で直近日の打鍵、プレー数、ランプ・
 EX・BP更新、日次提出で復元できなかったプレー数を確認できます。
 
@@ -99,21 +204,39 @@ coach推薦と同レベルrandom controlは、session単位で決定的に割り
 ```console
 oraja-training experiment start --assistant-db ./assistant.db \
   --name p6-two-week --seed PRIVATE_FIXED_SEED --starts-at 1800000000
+oraja-training experiment candidates --assistant-db ./assistant.db \
+  --experiment-id 1 --session-key 2026-08-15-am
 oraja-training experiment assign --assistant-db ./assistant.db \
-  --experiment-id 1 --session-key 2026-08-15-am --session-at 1800000000 \
-  --candidates-json ./candidates.json
+  --experiment-id 1 --session-key 2026-08-15-am --session-at 1800000000
+oraja-training experiment targets --assistant-db ./assistant.db \
+  --experiment-id 1 --status pending
 oraja-training experiment resolve --assistant-db ./assistant.db \
   --experiment-id 1
 oraja-training experiment report --assistant-db ./assistant.db \
   --experiment-id 1
 ```
 
-`candidates.json`は`coach`、`control`、`transfer`の各配列を持ち、要素は
-`{"sha256":"…","mode":0,"p_pred":0.7}`です。候補集合hash、arm確率、譜面の
-selection probabilityを保存し、同じsession keyの再実行は同じ割付を返します。選曲した譜面の
-保持と未練習類似譜面への転移を1/3/7/14日後に評価します。期限内のplayが一意な場合だけ解決し、
-複数は`duplicate`、未観測は`missing`として除外します。各armの事前最小標本数に達するまでは
+候補は最新Daily MenuのFOCUSと、同じ表・レベル・既プレイ状態のrandom controlから自動生成します。
+同傾向・同レベルの未練習譜面をtransfer候補poolとし、`candidates`サブコマンドで割付前に確認できます。
+手動指定する場合の`candidates.json`は重複しない`coach`、`control`、`transfer`の各配列を持ち、要素は
+`{"sha256":"…","mode":0,"p_pred":0.7}`です。`transfer`には最低4曲が必要です。候補集合hash、
+元入力hash、arm確率、譜面のselection probabilityを保存し、既プレイ・予約済み候補が入力に含まれても
+同じsession keyと元JSONの再実行は同じ割付を返します。割付時にpool全M曲から4曲を非復元抽出し、
+各intervalで特定の1曲が選ばれる周辺selection probabilityは`1/M`です。
+`assign`のJSONは互換用のday 1 `transfer`に加え、`transfers`へ1/3/7/14日と対応する4曲、mode、
+予測値、周辺selection probabilityを出します。選曲した譜面の保持と未練習類似譜面への転移を
+1/3/7/14日後に評価します。各transfer評価には別の未練習譜面を固定するため、day 1で初めて
+演奏した譜面をday 3以降の「未練習への転移」として再利用しません。過去playまたは同じ実験で予約済みの
+transfer候補は自動除外し、予約中のtransfer譜面は以後の通常Daily Menuにも出しません。
+24時間の評価窓が閉じた時点でplayが一意な場合だけ解決し、
+複数または別targetとの再利用は`duplicate`、未観測は`missing`として除外します。各armの事前最小標本数に達するまでは
 arm差とBrier差を`inconclusive`として出しません。書込み先は`assistant.db`だけです。
+
+割付セッションでは`selected`だけを練習し、各`transfers`譜面は割り当てられた評価窓まで演奏しません。
+以後は`experiment targets`に表示された各24時間窓で、retentionとその日のtransferをそれぞれ**1回だけ**
+演奏します。transferを指定窓より前に演奏した場合や同じ窓で2回以上演奏した場合、そのtargetは
+`duplicate`として解析から除外されるため、早取りや再挑戦はしません。`due_at_utc`から`window_closes_at_utc`までが
+対象期間です。既存schema v5の単一transfer割付は書き換えず、同じsession keyの再実行でも元のtargetを返します。
 
 ### Codexでの日次・定期レビュー
 
@@ -166,9 +289,12 @@ collectorは `replay/*.brd` のGZIP JSONから、開始ゲージ・seed・実配
 allowlist済みmetadataだけを読みます。`keyinput` は復号・保存しません。圧縮/展開サイズを
 制限し、読取前後でファイルが同一の場合だけ採用します。
 
-Replayは `sha256 + mode + date` がただ1件のplayに完全一致した場合だけ
+beatoraja本体はReplay日時を結果確定時、score日時をその直後のDB保存時に別々に採番します。
+そのためReplay日時から30秒以内の `sha256 + mode` がただ1件のplayに対応した場合だけ
 `selected_gauge_kind` を更新します。未一致・曖昧一致・破損・読取中の上書きはplayを
 変更せず、tickの `replay_*` カウンタと `replay_metadata` のslot履歴で監査できます。
+ReplayのLNモードと完全一致するplayを優先し、完全一致がなくReplay modeが1/2の場合だけ、
+未定義LNを含まない譜面でscore側が正規化する`mode=0`を照合します。
 
 停止は `Ctrl-C` です。入力側の `.brd`、`score.db` / `scoredatalog.db` / `scorelog.db` /
 `songdata.db` / `songinfo.db` には書き込みません。

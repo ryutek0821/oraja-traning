@@ -21,17 +21,24 @@ from oraja_training.model import fit_latest
 from oraja_training.plan import build_session, recommendation_output, write_export
 from oraja_training.plan.experiment import (
     assign_session,
+    build_candidate_sets,
+    list_targets,
     report_experiment,
     resolve_targets,
     start_experiment,
 )
-from oraja_training.serve import serve
+from oraja_training.serve import create_progress_token, run_sender, send_progress, serve
 from oraja_training.tables import fetch_table, resolve
 
 
 DEFAULT_TABLES = (
+    (
+        "genocide",
+        "https://nekokan.dyndns.info/~lobsak/genocide/insane.html",
+    ),
+    ("overjoy", "https://lr2.sakura.ne.jp/data/header.json"),
     ("satellite", "https://stellabms.xyz/sl/table.html"),
-    ("genocide", "https://nekokan.dyndns.info/~lobsak/genocide/"),
+    ("stella", "https://stellabms.xyz/st/table.html"),
 )
 
 
@@ -88,7 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     refresh.add_argument("--cache-dir", type=Path, default=Path(".cache/tables"))
     refresh.add_argument(
         "--table", action="append", default=[], metavar="ID=URL",
-        help="source table page/header; defaults to Satellite and GENOCIDE",
+        help="source table page/header; defaults to GENOCIDE, Overjoy, Satellite and Stella",
     )
 
     features = subcommands.add_parser("features", help="songinfo feature operations")
@@ -123,20 +130,45 @@ def _parser() -> argparse.ArgumentParser:
     experiment_start.add_argument("--days", type=int, default=14)
     experiment_start.add_argument("--min-samples-per-arm", type=int, default=20)
 
-    experiment_assign = experiment_commands.add_parser("assign")
+    experiment_assign = experiment_commands.add_parser(
+        "assign",
+        help="assign one arm and reserve a distinct transfer chart per interval",
+    )
     experiment_assign.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
     experiment_assign.add_argument("--experiment-id", type=int, required=True)
     experiment_assign.add_argument("--session-key", required=True)
     experiment_assign.add_argument("--session-at", type=int, default=None)
     experiment_assign.add_argument(
-        "--candidates-json", type=Path, required=True,
-        help="JSON object with non-empty coach, control and transfer candidate arrays",
+        "--candidates-json", type=Path,
+        help="optional JSON candidate sets; defaults to the latest Daily Menu",
     )
+
+    experiment_candidates = experiment_commands.add_parser(
+        "candidates", help="show the auditable arm and eligible transfer pools"
+    )
+    experiment_candidates.add_argument(
+        "--assistant-db", type=Path, default=Path("assistant.db")
+    )
+    experiment_candidates.add_argument("--experiment-id", type=int, required=True)
+    experiment_candidates.add_argument("--session-key", required=True)
 
     experiment_resolve = experiment_commands.add_parser("resolve")
     experiment_resolve.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
     experiment_resolve.add_argument("--experiment-id", type=int, required=True)
     experiment_resolve.add_argument("--now", type=int, default=None)
+
+    experiment_targets = experiment_commands.add_parser(
+        "targets", help="show exact chart modes, probabilities, and play windows"
+    )
+    experiment_targets.add_argument(
+        "--assistant-db", type=Path, default=Path("assistant.db")
+    )
+    experiment_targets.add_argument("--experiment-id", type=int, required=True)
+    experiment_targets.add_argument(
+        "--status",
+        choices=("pending", "resolved", "missing", "duplicate", "all"),
+        default="pending",
+    )
 
     experiment_report = experiment_commands.add_parser("report")
     experiment_report.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
@@ -147,6 +179,26 @@ def _parser() -> argparse.ArgumentParser:
     server.add_argument("--score-db", type=Path)
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
+    server.add_argument("--progress-state", type=Path)
+    server.add_argument("--progress-token-file", type=Path)
+    server.add_argument("--progress-source-id", default="RYU-DESKTOP2")
+    server.add_argument("--progress-stale-after", type=int, default=90)
+
+    sender = subcommands.add_parser(
+        "progress-send", help="send live score progress to a training server"
+    )
+    sender.add_argument("--score-db", type=Path, required=True)
+    sender.add_argument("--url", required=True)
+    sender.add_argument("--token-file", type=Path, required=True)
+    sender.add_argument("--source-id", default="RYU-DESKTOP2")
+    sender.add_argument("--poll-interval", type=float, default=5.0)
+    sender.add_argument("--heartbeat", type=float, default=30.0)
+    sender.add_argument("--daemon", action="store_true")
+
+    token = subcommands.add_parser(
+        "progress-token-create", help="create a progress token file"
+    )
+    token.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -212,14 +264,26 @@ def _refresh_tables(
                     conn.execute(
                         """
                         INSERT INTO table_sources(
-                          table_id, page_url, header_url, data_url, fetched_at, last_error
-                        ) VALUES (?, ?, ?, ?, ?, NULL)
+                          table_id, page_url, header_url, data_url, fetched_at,
+                          last_error, entry_count, matched_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(table_id) DO UPDATE SET
                           page_url=excluded.page_url, header_url=excluded.header_url,
                           data_url=excluded.data_url, fetched_at=excluded.fetched_at,
-                          last_error=NULL
+                          last_error=excluded.last_error,
+                          entry_count=excluded.entry_count,
+                          matched_count=excluded.matched_count
                         """,
-                        (table_id, url, table.header_url, table.data_url, table.fetched_at),
+                        (
+                            table_id,
+                            url,
+                            table.header_url,
+                            table.data_url,
+                            table.fetched_at,
+                            "stale cache used after refresh failure" if table.stale else None,
+                            len(table.entries),
+                            report.matched,
+                        ),
                     )
                 summary = report.for_table(table_id)
                 summaries.append(
@@ -383,6 +447,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "seed": session.seed,
                         "model_status": session.model_status,
                         "model_version": session.model_version,
+                        "table_warnings": list(session.table_warnings),
+                        "warmup_adjustment": session.warmup_adjustment,
                         "queue_items": len(session.queue),
                         "personal_charts": len(session.personal),
                         "core_expected_judged": session.core_expected_judged,
@@ -426,6 +492,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "menu_date": session.menu_date,
                     "seed": session.seed,
+                    "table_warnings": list(session.table_warnings),
+                    "warmup_adjustment": session.warmup_adjustment,
                     "queue_items": len(session.queue),
                     "personal_charts": len(session.personal),
                     "core_expected_judged": session.core_expected_judged,
@@ -457,9 +525,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             elif args.experiment_command == "assign":
                 session_at = int(time.time()) if args.session_at is None else args.session_at
-                candidate_sets = json.loads(args.candidates_json.read_text(encoding="utf-8"))
-                if not isinstance(candidate_sets, dict):
-                    raise ValueError("--candidates-json must contain a JSON object")
+                if args.candidates_json is None:
+                    candidate_sets = build_candidate_sets(
+                        conn,
+                        experiment_id=args.experiment_id,
+                        session_key=args.session_key,
+                    )
+                else:
+                    candidate_sets = json.loads(
+                        args.candidates_json.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(candidate_sets, dict):
+                        raise ValueError("--candidates-json must contain a JSON object")
                 result = assign_session(
                     conn,
                     experiment_id=args.experiment_id,
@@ -467,9 +544,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     session_at=session_at,
                     candidate_sets=candidate_sets,
                 )
+            elif args.experiment_command == "candidates":
+                result = build_candidate_sets(
+                    conn,
+                    experiment_id=args.experiment_id,
+                    session_key=args.session_key,
+                )
             elif args.experiment_command == "resolve":
                 result = resolve_targets(
                     conn, experiment_id=args.experiment_id, now=args.now
+                )
+            elif args.experiment_command == "targets":
+                result = list_targets(
+                    conn,
+                    experiment_id=args.experiment_id,
+                    status=None if args.status == "all" else args.status,
                 )
             else:
                 result = report_experiment(conn, experiment_id=args.experiment_id)
@@ -478,13 +567,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
 
+    if args.command == "progress-token-create":
+        created = create_progress_token(args.output)
+        print(json.dumps({"created": str(created)}, ensure_ascii=False))
+        return 0
+
+    if args.command == "progress-send":
+        token = args.token_file.read_text(encoding="utf-8").strip()
+        if not token:
+            raise ValueError("progress token file is empty")
+        try:
+            if args.daemon:
+                run_sender(
+                    args.score_db,
+                    args.url,
+                    token,
+                    source_id=args.source_id,
+                    poll_interval=args.poll_interval,
+                    heartbeat=args.heartbeat,
+                )
+            else:
+                result = send_progress(
+                    args.score_db, args.url, token, source_id=args.source_id
+                )
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        except KeyboardInterrupt:
+            return 0
+        return 0
+
     if args.command == "serve":
+        token = None
+        if args.progress_token_file is not None:
+            token = args.progress_token_file.read_text(encoding="utf-8").strip()
+            if not token:
+                raise ValueError("progress token file is empty")
         try:
             serve(
                 args.export_dir,
                 args.score_db,
                 host=args.host,
                 port=args.port,
+                progress_state=args.progress_state,
+                progress_token=token,
+                progress_source_id=args.progress_source_id,
+                progress_stale_after=args.progress_stale_after,
             )
         except KeyboardInterrupt:
             return 0

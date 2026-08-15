@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 10
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -17,6 +17,8 @@ BEATORAJA_DB_NAMES = {
     "songdata.db",
     "songinfo.db",
 }
+REPLAY_MATCH_TOLERANCE_SECONDS = 30
+REPLAY_LN_MODES = frozenset({1, 2})
 
 
 SCHEMA_V2 = """
@@ -335,6 +337,54 @@ CREATE INDEX idx_experiment_targets_resolution
 """
 
 
+SCHEMA_V6 = """
+CREATE TABLE chart_pattern_features (
+  sha256          TEXT PRIMARY KEY,
+  rhythm_family   INTEGER,
+  avg_chord       REAL,
+  chord_ge3       REAL,
+  micro_rate      REAL,
+  long_jack_rate  REAL,
+  practice_low    INTEGER,
+  analysis_version INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+SCHEMA_V7 = """
+ALTER TABLE table_sources ADD COLUMN entry_count INTEGER;
+ALTER TABLE table_sources ADD COLUMN matched_count INTEGER;
+"""
+
+
+SCHEMA_V8 = """
+ALTER TABLE chart_pattern_features ADD COLUMN grid_bpm REAL;
+ALTER TABLE chart_pattern_features ADD COLUMN stream_sec REAL;
+ALTER TABLE chart_pattern_features ADD COLUMN last_kill REAL;
+"""
+
+
+SCHEMA_V9 = """
+CREATE TABLE replay_scan_state (
+  path             TEXT PRIMARY KEY,
+  device           INTEGER NOT NULL,
+  inode            INTEGER NOT NULL,
+  mtime_ns         INTEGER NOT NULL,
+  compressed_size  INTEGER NOT NULL,
+  outcome          TEXT NOT NULL,
+  checked_at       INTEGER NOT NULL,
+  CHECK(outcome IN ('valid', 'invalid', 'unstable'))
+);
+"""
+
+
+SCHEMA_V10 = """
+ALTER TABLE experiment_sessions
+  ADD COLUMN input_candidate_hash TEXT NOT NULL DEFAULT '';
+UPDATE experiment_sessions SET input_candidate_hash = candidate_hash;
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -397,7 +447,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     if current == 0:
         try:
             conn.executescript(
-                "BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
+                "BEGIN IMMEDIATE;\n"
+                + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
             )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
@@ -410,7 +462,10 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 2:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
+                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -420,7 +475,10 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 3:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -430,7 +488,68 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 4:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V5)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6 + SCHEMA_V7
+                + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 5:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
+                + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 6:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 7:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 8:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V9 + SCHEMA_V10)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 9:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V10)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -439,6 +558,79 @@ def migrate(conn: sqlite3.Connection) -> None:
         return
 
     raise RuntimeError(f"unsupported assistant DB schema_version {current}")
+
+
+def load_replay_scan_states(
+    conn: sqlite3.Connection,
+) -> dict[str, tuple[int, int, int, int, str]]:
+    """Return the last durably checked filesystem identity for each replay path."""
+
+    rows = conn.execute(
+        """
+        SELECT path, device, inode, mtime_ns, compressed_size, outcome
+        FROM replay_scan_state
+        """
+    )
+    return {
+        str(row[0]): (
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            int(row[4]),
+            str(row[5]),
+        )
+        for row in rows
+    }
+
+
+def upsert_replay_scan_states(
+    conn: sqlite3.Connection, observations: Iterable[Mapping[str, Any]]
+) -> None:
+    """Persist checked replay identities, including fail-closed outcomes."""
+
+    conn.executemany(
+        """
+        INSERT INTO replay_scan_state(
+          path, device, inode, mtime_ns, compressed_size, outcome, checked_at
+        ) VALUES (
+          :path, :device, :inode, :mtime_ns, :compressed_size, :outcome,
+          :checked_at
+        )
+        ON CONFLICT(path) DO UPDATE SET
+          device = excluded.device,
+          inode = excluded.inode,
+          mtime_ns = excluded.mtime_ns,
+          compressed_size = excluded.compressed_size,
+          outcome = excluded.outcome,
+          checked_at = excluded.checked_at
+        """,
+        observations,
+    )
+
+
+def delete_replay_scan_states(conn: sqlite3.Connection, paths: Iterable[str]) -> None:
+    """Forget scan state for replay slots that no longer exist."""
+
+    conn.executemany(
+        "DELETE FROM replay_scan_state WHERE path = ?",
+        ((path,) for path in paths),
+    )
+
+
+def replay_scan_error_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Return current persisted invalid and unstable slot counts."""
+
+    counts = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            """
+            SELECT outcome, count(*) FROM replay_scan_state
+            WHERE outcome != 'valid'
+            GROUP BY outcome
+            """
+        )
+    }
+    return counts.get("invalid", 0), counts.get("unstable", 0)
 
 
 def ingest_replay_metadata(
@@ -451,33 +643,78 @@ def ingest_replay_metadata(
     its score event arrives.
     """
 
+    def refresh_play_gauge(play_id: int) -> None:
+        replacement = conn.execute(
+            """
+            SELECT selected_gauge_kind FROM replay_metadata
+            WHERE match_status = 'matched' AND matched_play_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (play_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
+            (None if replacement is None else str(replacement[0]), play_id),
+        )
+
     path = str(metadata.path)
     existing = conn.execute(
-        "SELECT id, match_status FROM replay_metadata WHERE path = ? AND content_hash = ?",
+        """
+        SELECT id, match_status, matched_play_id FROM replay_metadata
+        WHERE path = ? AND content_hash = ?
+        """,
         (path, metadata.content_hash),
     ).fetchone()
-    matches = conn.execute(
-        """
-        SELECT id FROM plays
-        WHERE sha256 = ? AND mode = ? AND played_at = ? AND is_course = 0
-        ORDER BY id
-        LIMIT 2
-        """,
-        (metadata.sha256, metadata.mode, metadata.played_at),
-    ).fetchall()
+    def play_matches(mode: int) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT id FROM plays
+            WHERE sha256 = ? AND mode = ?
+              AND played_at >= ? AND played_at <= ? AND is_course = 0
+            ORDER BY id
+            LIMIT 2
+            """,
+            (
+                metadata.sha256,
+                mode,
+                metadata.played_at,
+                metadata.played_at + REPLAY_MATCH_TOLERANCE_SECONDS,
+            ),
+        ).fetchall()
+
+    matches = play_matches(metadata.mode)
+    if not matches and metadata.mode in REPLAY_LN_MODES:
+        # ReplayData always stores the configured LN mode. ScoreData stores 0
+        # for charts without undefined LN, so use that normalization only when
+        # there is no exact-mode candidate.
+        matches = play_matches(0)
     if existing is not None:
         previous_status = str(existing[1])
-        if previous_status != "matched" and len(matches) == 1:
+        previous_play_id = None if existing[2] is None else int(existing[2])
+        if len(matches) == 1:
             matched_play_id = int(matches[0][0])
+            if previous_status == "matched" and previous_play_id == matched_play_id:
+                return previous_status, False, False
             conn.execute(
                 "UPDATE replay_metadata SET match_status = 'matched', matched_play_id = ? WHERE id = ?",
                 (matched_play_id, int(existing[0])),
             )
-            conn.execute(
-                "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
-                (metadata.selected_gauge_kind, matched_play_id),
-            )
+            if previous_play_id is not None and previous_play_id != matched_play_id:
+                refresh_play_gauge(previous_play_id)
+            refresh_play_gauge(matched_play_id)
             return "matched", False, True
+        if len(matches) > 1 and previous_status != "ambiguous":
+            conn.execute(
+                """
+                UPDATE replay_metadata
+                SET match_status = 'ambiguous', matched_play_id = NULL
+                WHERE id = ?
+                """,
+                (int(existing[0]),),
+            )
+            if previous_play_id is not None:
+                refresh_play_gauge(previous_play_id)
+            return "ambiguous", False, True
         return previous_status, False, False
 
     previous = conn.execute(
@@ -519,10 +756,7 @@ def ingest_replay_metadata(
         ),
     )
     if matched_play_id is not None:
-        conn.execute(
-            "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
-            (metadata.selected_gauge_kind, matched_play_id),
-        )
+        refresh_play_gauge(matched_play_id)
     return status, previous_hash is not None, True
 
 
@@ -672,6 +906,38 @@ def upsert_charts(
           updated_at = excluded.updated_at
         """,
         charts,
+    )
+
+
+def upsert_chart_pattern_features(
+    conn: sqlite3.Connection, features: Iterable[Mapping[str, Any]]
+) -> None:
+    """Copy optional oraja-constellator analysis into the assistant store."""
+
+    conn.executemany(
+        """
+        INSERT INTO chart_pattern_features(
+          sha256, rhythm_family, avg_chord, chord_ge3, micro_rate,
+          long_jack_rate, practice_low, analysis_version, grid_bpm,
+          stream_sec, last_kill
+        ) VALUES (
+          :sha256, :rhythm_family, :avg_chord, :chord_ge3, :micro_rate,
+          :long_jack_rate, :practice_low, :analysis_version, :grid_bpm,
+          :stream_sec, :last_kill
+        )
+        ON CONFLICT(sha256) DO UPDATE SET
+          rhythm_family=excluded.rhythm_family,
+          avg_chord=excluded.avg_chord,
+          chord_ge3=excluded.chord_ge3,
+          micro_rate=excluded.micro_rate,
+          long_jack_rate=excluded.long_jack_rate,
+          practice_low=excluded.practice_low,
+          analysis_version=excluded.analysis_version,
+          grid_bpm=excluded.grid_bpm,
+          stream_sec=excluded.stream_sec,
+          last_kill=excluded.last_kill
+        """,
+        features,
     )
 
 

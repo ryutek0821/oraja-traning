@@ -6,7 +6,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import shutil
 import sqlite3
+import tempfile
 import time
 
 from oraja_training.collect.normalize import derive_play, payload_hash
@@ -77,7 +79,6 @@ class Poller:
         self.max_retries = max(1, int(max_retries))
         self.clock = clock
         self._last_signature: SourceSignature | None = None
-        self._last_replay_signature: tuple[tuple[str, int, int, int, int], ...] | None = None
         self._owns_connection = not isinstance(assistant_db, sqlite3.Connection)
 
         if isinstance(assistant_db, sqlite3.Connection):
@@ -137,40 +138,52 @@ class Poller:
         for _attempt in range(self.max_retries):
             scoredatalog_before = source_signature(self.scoredatalog_path)
             score_before = source_signature(self.score_path)
-            scoredatalog_conn = readers.open_live(
-                self.scoredatalog_path, busy_timeout_ms=self.busy_timeout_ms
-            )
-            try:
-                score_conn = readers.open_live(
-                    self.score_path, busy_timeout_ms=self.busy_timeout_ms
+
+            # Even a mode=ro SQLite connection writes reader marks into a live
+            # WAL's shared-memory file.  Read short-lived private copies so the
+            # beatoraja-owned DB, WAL, SHM and rollback journal remain byte-for-
+            # byte untouched.  SHM is intentionally not copied: SQLite safely
+            # rebuilds this non-durable WAL index beside the private copy.
+            with tempfile.TemporaryDirectory(prefix="oraja-collector-") as temporary:
+                temporary_dir = Path(temporary)
+                scoredatalog_copy = self._copy_live_database(
+                    self.scoredatalog_path, temporary_dir
+                )
+                score_copy = self._copy_live_database(self.score_path, temporary_dir)
+
+                scoredatalog_conn = readers.open_private_copy(
+                    scoredatalog_copy, busy_timeout_ms=self.busy_timeout_ms
                 )
                 try:
-                    scoredatalog_version_before = int(
-                        scoredatalog_conn.execute(
-                            "PRAGMA data_version"
-                        ).fetchone()[0]
+                    score_conn = readers.open_private_copy(
+                        score_copy, busy_timeout_ms=self.busy_timeout_ms
                     )
-                    score_version_before = int(
-                        score_conn.execute("PRAGMA data_version").fetchone()[0]
-                    )
-                    rows = readers.read_scoredatalog(scoredatalog_conn)
-                    aggregate_rows = readers.read_score(score_conn)
-                    scoredatalog_version_after = int(
-                        scoredatalog_conn.execute(
-                            "PRAGMA data_version"
-                        ).fetchone()[0]
-                    )
-                    score_version_after = int(
-                        score_conn.execute("PRAGMA data_version").fetchone()[0]
-                    )
-                    scoredatalog_after = source_signature(
-                        self.scoredatalog_path
-                    )
-                    score_after = source_signature(self.score_path)
+                    try:
+                        scoredatalog_version_before = int(
+                            scoredatalog_conn.execute(
+                                "PRAGMA data_version"
+                            ).fetchone()[0]
+                        )
+                        score_version_before = int(
+                            score_conn.execute("PRAGMA data_version").fetchone()[0]
+                        )
+                        rows = readers.read_scoredatalog(scoredatalog_conn)
+                        aggregate_rows = readers.read_score(score_conn)
+                        scoredatalog_version_after = int(
+                            scoredatalog_conn.execute(
+                                "PRAGMA data_version"
+                            ).fetchone()[0]
+                        )
+                        score_version_after = int(
+                            score_conn.execute("PRAGMA data_version").fetchone()[0]
+                        )
+                    finally:
+                        score_conn.close()
                 finally:
-                    score_conn.close()
-            finally:
-                scoredatalog_conn.close()
+                    scoredatalog_conn.close()
+
+            scoredatalog_after = source_signature(self.scoredatalog_path)
+            score_after = source_signature(self.score_path)
 
             if (
                 scoredatalog_before == scoredatalog_after
@@ -188,6 +201,18 @@ class Poller:
             "scoredatalog.db or score.db changed during "
             f"{self.max_retries} consecutive reads"
         )
+
+    @staticmethod
+    def _copy_live_database(source: Path, destination_dir: Path) -> Path:
+        destination = destination_dir / source.name
+        shutil.copyfile(source, destination)
+        for suffix in ("-wal", "-journal"):
+            sidecar = Path(f"{source}{suffix}")
+            try:
+                shutil.copyfile(sidecar, Path(f"{destination}{suffix}"))
+            except FileNotFoundError:
+                continue
+        return destination
 
     def _record_error(self, error: Exception, signature: SourceSignature | None) -> None:
         state = self._state()
@@ -213,18 +238,42 @@ class Poller:
             except FileNotFoundError:
                 continue
             signals.append(
-                (path.name, stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                (str(path), stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
             )
         return tuple(signals)
 
     def _collect_replays(self, *, now: int, force: bool = False) -> TickResult:
         signature = self._replay_signature()
-        if not force and signature == self._last_replay_signature:
+        signals = {item[0]: item[1:] for item in signature}
+        states = store.load_replay_scan_states(self.conn)
+        unseen = [item for item in signature if item[0] not in states]
+        changed = [
+            item
+            for item in signature
+            if item[0] in states and states[item[0]][:4] != item[1:]
+        ]
+        candidates = unseen + changed
+        selected = candidates[:replay.MAX_REPLAY_FILES]
+        if force and len(selected) < replay.MAX_REPLAY_FILES:
+            selected_paths = {item[0] for item in selected}
+            unchanged = [
+                item for item in signature if item[0] not in selected_paths
+            ]
+            selected.extend(
+                unchanged[: replay.MAX_REPLAY_FILES - len(selected)]
+            )
+
+        stale_paths = sorted(set(states).difference(signals))
+        if not selected and not stale_paths:
             return TickResult(0, 0, False, scanned=False)
 
-        report = replay.scan_report(self.replay_dir)
+        report = replay.scan_report(
+            self.replay_dir,
+            candidates=(item[0] for item in selected),
+        )
         matched = unmatched = ambiguous = overwritten = 0
         with self.conn:
+            store.delete_replay_scan_states(self.conn, stale_paths)
             for metadata in report.metadata:
                 status, was_overwritten, inserted = store.ingest_replay_metadata(
                     self.conn, metadata, observed_at=now
@@ -239,6 +288,44 @@ class Poller:
                     unmatched += 1
                 overwritten += int(was_overwritten)
 
+            observations: list[dict[str, int | str]] = []
+            for metadata in report.metadata:
+                observations.append(
+                    {
+                        "path": str(metadata.path),
+                        "device": metadata.device,
+                        "inode": metadata.inode,
+                        "mtime_ns": metadata.mtime_ns,
+                        "compressed_size": metadata.compressed_size,
+                        "outcome": "valid",
+                        "checked_at": now,
+                    }
+                )
+            for paths, outcome in (
+                (report.invalid_paths, "invalid"),
+                (report.unstable_paths, "unstable"),
+            ):
+                for path in paths:
+                    signal = signals.get(str(path))
+                    if signal is None:
+                        continue
+                    observations.append(
+                        {
+                            "path": str(path),
+                            "device": signal[0],
+                            "inode": signal[1],
+                            "mtime_ns": signal[2],
+                            "compressed_size": signal[3],
+                            "outcome": outcome,
+                            "checked_at": now,
+                        }
+                    )
+            store.upsert_replay_scan_states(self.conn, observations)
+            persisted_invalid, persisted_unstable = store.replay_scan_error_counts(
+                self.conn
+            )
+            audit_invalid = max(persisted_invalid, report.invalid)
+            audit_unstable = max(persisted_unstable, report.unstable)
             last_mtime = (
                 max(item[3] for item in signature) / 1_000_000_000
                 if signature else None
@@ -252,14 +339,13 @@ class Poller:
                 last_run_at=now,
                 last_error=(
                     None
-                    if not report.invalid and not report.unstable
-                    else f"invalid={report.invalid}, unstable={report.unstable}"
+                    if not audit_invalid and not audit_unstable
+                    else f"invalid={audit_invalid}, unstable={audit_unstable}"
                 ),
             )
-        self._last_replay_signature = signature
         return TickResult(
             0, 0, False,
-            scanned=bool(signature) or bool(report.invalid or report.unstable),
+            scanned=bool(selected) or bool(report.invalid or report.unstable),
             replay_scanned=len(report.metadata) + report.invalid + report.unstable,
             replay_matched=matched,
             replay_unmatched=unmatched,

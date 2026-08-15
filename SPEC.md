@@ -140,6 +140,10 @@ gzip圧縮JSON。`keyinput` は URL-safe Base64 + GZIP（1イベント = 符号�
 
 `ReplayData.gauge` は `BMSPlayer` が `config.getGauge()` を保存するため、**開始時に選択したゲージ**である。
 一方、`clear` はアシスト、フルコンボ、Gauge Auto Shift 後の状態を反映した**結果ランプ**であり、同義ではない。
+Replay日時は結果確定時、score日時はその直後のDB保存時に採番されるため、突合はReplay日時以降30秒以内の
+`sha256 + mode`が一意な場合だけ許可する。複数候補は曖昧としてplayを変更しない。
+Replayの設定LNモードに完全一致する候補がないmode 1/2だけ、score側の非未定義LN譜面正規化に合わせて
+mode 0を照合する。完全mode一致がある場合はmode 0へフォールバックしない。
 
 ⚠️ Step 0（Windows実機確認）で生成条件・上書き条件を検証してから Step 3 に着手すること。
 
@@ -317,7 +321,7 @@ CREATE TABLE experiment_sessions (...); -- session arm、候補hash、選択確�
 CREATE TABLE experiment_targets (...);  -- retention/transfer × 1/3/7/14日
 ```
 
-**`schema_version` は 5**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブルを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 10**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxy、version 9でReplay走査状態、version 10で実験の元候補hashを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POORを含めており、`ems`/`lms`を保存していないため**正しい値を復元できない**。version 1の`assistant.db`を開いたら、黙って読まずに「削除してbackfillをやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 
@@ -462,9 +466,9 @@ RESERVE 10k を別に提示する。focus譜面は3枠離して再試行し、�
 ### A-8.1 自己実験
 
 - `seed + session_key`のSHA-256からarmを50/50で決め、session内でarmを混在させない。
-- coach/control各候補から一様抽出し、正規化候補JSONのSHA-256、arm確率、周辺selection probabilityを保存する。
-- 選曲譜面をretention、別指定の未練習類似譜面をtransferとして、session時刻の1/3/7/14日後から24時間を評価窓にする。
-- 窓内で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は期限後`missing`、複数件は`duplicate`とし、期限外playは採用しない。
+- coach/controlは重複しない候補集合から一様抽出し、元入力hash、予約除外後の正規化候補JSONとSHA-256、arm確率、周辺selection probabilityを保存する。予約確認からtarget INSERTまでは単一writer transactionとし、同じ実験で既に選曲・予約した譜面は以後の候補と通常Daily Menuから除外する。
+- 選曲譜面をretentionとし、session開始前に未練習かつ別指定の類似譜面pool全M曲を保存する。そこから4曲を非復元抽出して1/3/7/14日後の各24時間窓へ別々に固定し、各intervalの周辺selection probabilityを`1/M`として再現可能にする。先の窓で演奏済みになった譜面を後の未練習transferへ再利用しない。
+- 評価窓が閉じるまでは確定せず、窓全体で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は`missing`、複数件、同じplayの再利用、またはtransferの指定窓より前のplayは`duplicate`として解析から除外する。
 - arm別の成功率とBrierをtarget種別・間隔ごとに出す。両armが事前設定した最小標本数へ達するまで差は`inconclusive`とする。
 - すべての実験書込みはassistant-owned schema v5だけへ行い、beatoraja入力DBへ書かない。
 
@@ -484,4 +488,4 @@ v1が推定するのは `P(今クリアできる)` であって `E(この譜面�
 
 - UI・README に「**学習効果はヒューリスティック、成功確率のみ統計モデル**」と明記する
 - v1は「表別レベル＋粗い負荷特性による多様化推薦」。**「多次元弱点推定」を名乗るのは A-7 のゲートを通った軸が増えてから**
-- 1秒集計では「16分乱打と高密度同時押し」「隣接トリルと左右交互」「微縦連と通常乱打」を区別できない。乱打・縦連・トリルの軸は oraja-constellator の `bmscf_chart_analysis`（`micro_rate` / `long_jack_rate` / `avg_chord` / `rhythm_family`）を A-7 のゲートで評価して取り込む
+- 1秒集計では「16分乱打と高密度同時押し」「隣接トリルと左右交互」「微縦連と通常乱打」を区別できない。WARMUP安全判定では oraja-constellator の `bmscf_chart_analysis`（`micro_rate` / `long_jack_rate` / `avg_chord` / `grid_bpm` / `stream_sec` / `last_kill`）を取り込む。`grid_bpm`は高速交互の保守的proxyであり、レーン列を見たトリル判定とは名乗らない

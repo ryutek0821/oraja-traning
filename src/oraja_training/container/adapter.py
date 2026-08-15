@@ -893,6 +893,7 @@ class ContainerAdapter:
                         clock=self.clock,
                     )
                     recommendation = recommendation_output(session)
+                    recommendation_repository.save_output(recommendation)
             if recommendation is None or session is None:
                 raise ContainerError(
                     "table catalog and profile settings are required",
