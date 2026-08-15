@@ -21,6 +21,7 @@ import {
 } from "./auth";
 import {
   ApiError,
+  IR_READ_PATHS,
   authErrorResponse as irErrorResponse,
   authenticateDeviceToken,
   bearerToken,
@@ -29,6 +30,7 @@ import {
   issueDeviceToken,
   listDevices,
   readJsonBody,
+  readIrMethod,
   renameDevice,
   revokeAllDevices,
   revokeDevice,
@@ -68,6 +70,7 @@ import {
   runPurgeTask,
 } from "./privacy";
 import { processExportSnapshots } from "./privacy-export";
+import { unwrapExportKey } from "./privacy-crypto";
 import { D1UploadSessionStore } from "./upload-store";
 import { EnvelopeCrypto, UploadService, handleUploadRequest } from "./upload-protocol";
 import {
@@ -78,13 +81,14 @@ import {
   dispatchSchedule,
   type JobEnvelope,
 } from "./job-ledger";
-import { SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
+import { regenerationInputDigest, SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
 import { handleCapabilityTable } from "./tables";
 import {
   listTableCapabilities,
   readProfileSettings,
   revokeTableCapability,
   rotateTableCapability,
+  tableRegenerationSource,
   updateProfileSettings,
 } from "./profile-settings";
 export { GenerateWorkflow } from "./workflow";
@@ -112,6 +116,7 @@ export interface Env {
   AUTH_HASH_PEPPER?: string;
   DEVICE_TOKEN_PEPPER?: string;
   ENVELOPE_MASTER_KEY?: string;
+  EXPORT_KEK?: string;
   OAUTH_DCR_INITIAL_ACCESS_TOKEN?: string;
 }
 
@@ -536,12 +541,22 @@ async function handlePrivacyRoutes(request: Request, env: Env, origin?: string):
         ).bind(downloadMatch[1], accountId, profile.id, now).run();
         throw new ApiError("export_temporarily_unavailable", 503);
       }
+      const userKey = await unwrapExportKey(
+        claimed.wrappedKey, claimed.wrapIv, downloadMatch[1], env.EXPORT_KEK,
+      );
       return new Response(object.body, {
         status: 200,
         headers: {
-          "content-type": "application/json; charset=utf-8",
-          "content-disposition": `attachment; filename="oraja-profile-export-${downloadMatch[1]}.json"`,
+          "content-type": "application/vnd.oraja.profile-export+encrypted",
+          "content-disposition": `attachment; filename="oraja-profile-export-${downloadMatch[1]}.oraenc"`,
           "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-oraja-export-schema": claimed.schemaVersion,
+          "x-oraja-export-cipher": claimed.algorithm,
+          "x-oraja-export-iv": claimed.contentIv,
+          "x-oraja-export-key": userKey,
+          "x-oraja-export-plaintext-sha256": claimed.plaintextSha256,
+          "x-oraja-export-ciphertext-sha256": claimed.ciphertextSha256,
         },
       });
     }
@@ -696,6 +711,27 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
   }
 }
 
+async function handleIrReadRoute(request: Request, env: Env, origin?: string): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (!IR_READ_PATHS.has(url.pathname)) return null;
+  const requestIdValue = requestId(request);
+  try {
+    if (request.method !== "GET") throw new ApiError("method_not_allowed", 405);
+    const pepper = requireDevicePepper(env);
+    const now = Math.floor(Date.now() / 1000);
+    await enforceIrRateLimit(env.CONTROL_DB, "ip", clientIp(request), pepper, now);
+    const identity = await authenticateDeviceToken(env.CONTROL_DB, bearerToken(request), pepper, { now });
+    await enforceIrRateLimit(env.CONTROL_DB, "token", identity.tokenHash, pepper, now);
+    return json(await readIrMethod(url, identity, {
+      db: env.CONTROL_DB,
+      profileDo: env.PROFILE_DO,
+      buildVersion: env.BUILD_VERSION,
+    }), 200, origin);
+  } catch (error) {
+    return irErrorResponse(error, requestIdValue, origin);
+  }
+}
+
 async function handleUploadRoute(request: Request, env: Env): Promise<Response | null> {
   if (!new URL(request.url).pathname.startsWith("/v1/uploads")) return null;
   if (!env.ENVELOPE_MASTER_KEY) return json({ error: { code: "upload_not_configured" } }, 503);
@@ -780,7 +816,39 @@ async function handleProfileSettingsRoutes(request: Request, env: Env, origin?: 
     }
     if (settingsRoute && request.method === "PATCH") {
       const body = await readJsonBody(request, 8 * 1024);
-      return json({ settings: await updateProfileSettings(env.CONTROL_DB, accountId, body) }, 200, origin);
+      const settings = await updateProfileSettings(env.CONTROL_DB, accountId, body);
+      const source = await tableRegenerationSource(env.CONTROL_DB, accountId);
+      let regeneration: Record<string, unknown> = { enqueued: false, reason: "table_artifact_unavailable" };
+      if (source) {
+        const [recommend, recommendScore, today, todayScore] = await Promise.all([
+          env.ARTIFACT_BUCKET.head(source.recommendObjectKey),
+          env.ARTIFACT_BUCKET.head(source.recommendScoreObjectKey),
+          env.ARTIFACT_BUCKET.head(source.todayObjectKey),
+          env.ARTIFACT_BUCKET.head(source.todayScoreObjectKey),
+        ]);
+        if (recommend && recommendScore && today && todayScore) {
+          const inputDigest = await regenerationInputDigest(
+            source.profileId,
+            source.sourceManifestSha256,
+            source.settingsRevision,
+          );
+          const accepted = await new JobDispatcher(
+            new D1JobLedger(env.CONTROL_DB),
+            env.JOB_QUEUE,
+          ).acceptAndEnqueue({
+            accountId,
+            profileId: source.profileId,
+            jobKind: "regenerate",
+            eventId: `settings:${source.profileId}:${source.settingsRevision}`,
+            requestId: requestId(request),
+            correlationId: `settings:${source.profileId}:${source.settingsRevision}`,
+            inputDigest,
+            inputKey: source.inputKey,
+          });
+          regeneration = { enqueued: true, job_id: accepted.job.jobId, job_status: accepted.status };
+        }
+      }
+      return json({ settings, regeneration }, 200, origin);
     }
     if (capabilitiesRoute && request.method === "GET") {
       return json({ capabilities: await listTableCapabilities(env.CONTROL_DB, accountId) }, 200, origin);
@@ -855,6 +923,8 @@ export default {
     if (deviceResponse) return deviceResponse;
     const playResponse = await handlePlayRoute(request, env, origin);
     if (playResponse) return playResponse;
+    const irReadResponse = await handleIrReadRoute(request, env, origin);
+    if (irReadResponse) return irReadResponse;
     const uploadResponse = await handleUploadRoute(request, env);
     if (uploadResponse) return uploadResponse;
     const settingsResponse = await handleProfileSettingsRoutes(request, env, origin);

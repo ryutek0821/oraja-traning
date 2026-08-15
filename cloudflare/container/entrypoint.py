@@ -37,7 +37,9 @@ except ImportError:  # pragma: no cover - package/module execution fallback
 MAX_MANIFEST_HEADER_BYTES = 64 * 1024
 SAFE_BUNDLE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 FRAMED_MAGIC = b"ORAJA5DB1\n"
+FRAMED_MAGIC_V2 = b"ORAJA5DB2\n"
 DATABASE_NAMES = {"score.db", "scoredatalog.db", "scorelog.db", "songdata.db", "songinfo.db"}
+MAX_TABLE_CONTEXT_BYTES = 16 * 1024 * 1024
 
 
 class _BoundedBody:
@@ -72,8 +74,9 @@ def _read_exact(source: _BoundedBody, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _materialize_framed_input(source: _BoundedBody, root: Path) -> None:
-    if _read_exact(source, len(FRAMED_MAGIC)) != FRAMED_MAGIC:
+def _materialize_framed_input(source: _BoundedBody, root: Path) -> Mapping[str, Any] | None:
+    magic = _read_exact(source, len(FRAMED_MAGIC))
+    if magic not in {FRAMED_MAGIC, FRAMED_MAGIC_V2}:
         raise ManifestError("framed input magic is invalid", code="invalid_input")
     seen: set[str] = set()
     for _ in range(len(DATABASE_NAMES)):
@@ -106,8 +109,37 @@ def _materialize_framed_input(source: _BoundedBody, root: Path) -> None:
         if hasher.hexdigest() != digest:
             raise ManifestError("framed file digest does not match", code="invalid_input")
         seen.add(name)
-    if seen != DATABASE_NAMES or source.remaining != 0:
+    if seen != DATABASE_NAMES:
         raise ManifestError("framed input file set is invalid", code="invalid_input")
+    if magic == FRAMED_MAGIC:
+        if source.remaining != 0:
+            raise ManifestError("framed input file set is invalid", code="invalid_input")
+        return None
+    header_size = struct.unpack(">I", _read_exact(source, 4))[0]
+    if header_size < 1 or header_size > 4096:
+        raise ManifestError("table context header is invalid", code="invalid_input")
+    try:
+        header = json.loads(_read_exact(source, header_size))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManifestError("table context header is invalid", code="invalid_input") from exc
+    if not isinstance(header, dict) or set(header) != {"file_name", "sha256", "size_bytes"}:
+        raise ManifestError("table context header is invalid", code="invalid_input")
+    size = header["size_bytes"]
+    digest = header["sha256"]
+    if (
+        header["file_name"] != "table-context.json"
+        or not isinstance(size, int) or not 1 <= size <= MAX_TABLE_CONTEXT_BYTES
+        or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or source.remaining != size
+    ):
+        raise ManifestError("table context header is invalid", code="invalid_input")
+    payload = _read_exact(source, size)
+    if hashlib.sha256(payload).hexdigest() != digest or source.remaining != 0:
+        raise ManifestError("table context digest does not match", code="invalid_input")
+    value = parse_json(payload)
+    if not isinstance(value, Mapping):
+        raise ManifestError("table context must contain an object", code="invalid_contract")
+    return value
 
 
 def _error_payload(error: ContainerError | ManifestError) -> dict[str, Any]:
@@ -123,6 +155,7 @@ def _error_payload(error: ContainerError | ManifestError) -> dict[str, Any]:
         "job_cancelled": "job cancelled",
         "temporary_unavailable": "processor is temporarily unavailable",
         "idempotency_conflict": "immutable job output conflicts with an existing object",
+        "table_input_unavailable": "owned table catalog input is unavailable",
     }
     return {
         "error": {
@@ -194,17 +227,18 @@ class ProcessorHandler(HealthHandler):
                 except ValueError as exc:
                     raise ManifestError("content length is invalid", code="invalid_contract") from exc
                 revision = int(self.headers.get("X-Container-Output-Revision") or "1")
-                if self.headers.get("X-Container-Transport") == "five-db-framed-v1":
+                if self.headers.get("X-Container-Transport") in {"five-db-framed-v1", "five-db-framed-v2"}:
                     if content_length < len(FRAMED_MAGIC):
                         raise ManifestError("content length is invalid", code="invalid_contract")
                     with tempfile.TemporaryDirectory(prefix="oraja-framed-") as temporary:
                         source_dir = Path(temporary)
-                        _materialize_framed_input(_BoundedBody(self.rfile, content_length), source_dir)
+                        table_context = _materialize_framed_input(_BoundedBody(self.rfile, content_length), source_dir)
                         result = self.adapter.run(
                             manifest,
                             bundle=source_dir,
                             revision=revision,
                             generated_at=str(manifest.get("requested_at")),
+                            table_context=table_context,
                         )
                 else:
                     input_bundle = manifest.get("input_bundle")
@@ -228,6 +262,7 @@ class ProcessorHandler(HealthHandler):
                 result = self.adapter.run(
                     manifest,
                     bundle=_safe_fixture_path(self.input_root, bundle_name),
+                    table_context=request.get("table_context") if isinstance(request.get("table_context"), Mapping) else None,
                 )
             artifact_store = self.adapter.artifact_store
             if not isinstance(artifact_store, MemoryArtifactStore):

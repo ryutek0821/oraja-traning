@@ -31,6 +31,13 @@ npm test
 npm run schema:check
 npm run check
 npm run typecheck
+```
+
+`container/Dockerfile` and `web/public` are supplied by their owning feature
+issues. Until those paths exist, CI reports the Container build and preview
+deploy dry-run as deferred. Once present, also run:
+
+```sh
 npm run container:build
 npm run deploy:preview:dry
 ```

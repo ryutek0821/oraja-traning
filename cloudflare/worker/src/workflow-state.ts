@@ -132,6 +132,26 @@ export function canonicalJson(value: unknown): string {
   throw new TypeError("canonical_json_unsupported_value");
 }
 
+export async function regenerationInputDigest(
+  profileId: string,
+  sourceManifestSha256: string,
+  settingsRevision: number,
+): Promise<string> {
+  if (!/^[0-9a-f]{64}$/.test(sourceManifestSha256)
+    || !Number.isSafeInteger(settingsRevision)
+    || settingsRevision < 1) {
+    throw new TypeError("invalid_regeneration_input");
+  }
+  const bytes = new TextEncoder().encode(canonicalJson({
+    contract: "settings-regeneration-input",
+    profile_id: profileId,
+    settings_revision: settingsRevision,
+    source_manifest_sha256: sourceManifestSha256,
+  }));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export function makeIdempotencyKey(profileId: string, inputDigest: string): string {
   return `job:${profileId}:${inputDigest}`;
 }

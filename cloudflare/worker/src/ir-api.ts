@@ -175,6 +175,22 @@ export type PlayAck = {
   enqueue_required: boolean;
 };
 
+export const IR_READ_PATHS = new Set([
+  "/v1/ir/player",
+  "/v1/ir/rivals",
+  "/v1/ir/tables",
+  "/v1/ir/play-data",
+  "/v1/ir/course-play-data",
+  "/v1/ir/version",
+  "/v1/ir/illegal-songs",
+]);
+
+type IrReadDependencies = {
+  db: D1Database;
+  profileDo: DurableObjectNamespace;
+  buildVersion: string;
+};
+
 type ProfileRow = {
   id: string;
   public_id: string;
@@ -603,6 +619,86 @@ export function bearerToken(request: Request): string | null {
   if (!header) return null;
   const match = /^Bearer\s+(.+)$/i.exec(header);
   return match?.[1]?.trim() ?? null;
+}
+
+function boundedIrQuery(value: string | null, maximum: number, code = "invalid_ir_query"): string | undefined {
+  if (value === null) return undefined;
+  if (value.length < 1 || value.length > maximum || [...value].some((character) => /\p{Cc}/u.test(character))) {
+    throw new ApiError(code, 400);
+  }
+  return value;
+}
+
+function requireOwnedIrPlayer(url: URL, identity: DeviceIdentity): void {
+  const requestedPlayer = boundedIrQuery(url.searchParams.get("player_id"), 64);
+  if (requestedPlayer !== undefined && requestedPlayer !== identity.profilePublicId) {
+    throw new ApiError("forbidden", 403);
+  }
+}
+
+async function irProfile(db: D1Database, identity: DeviceIdentity): Promise<{ public_id: string; display_name: string }> {
+  const profile = await db.prepare(
+    `SELECT public_id, display_name FROM profiles
+      WHERE id = ?1 AND account_id = ?2 AND public_id = ?3 AND status = 'active'`,
+  ).bind(identity.profileId, identity.accountId, identity.profilePublicId).first<{ public_id: string; display_name: string }>();
+  if (!profile) throw new ApiError("not_found", 404);
+  return profile;
+}
+
+async function ownerScoreProjection(url: URL, identity: DeviceIdentity, dependencies: IrReadDependencies): Promise<Record<string, unknown>> {
+  requireOwnedIrPlayer(url, identity);
+  const sha256 = boundedIrQuery(url.searchParams.get("sha256"), 64);
+  if (sha256 !== undefined && !SHA256_PATTERN.test(sha256)) throw new ApiError("invalid_ir_query", 400);
+  const rawLnMode = url.searchParams.get("ln_mode");
+  const lnMode = rawLnMode === null ? undefined : Number(rawLnMode);
+  if (lnMode !== undefined && (!Number.isInteger(lnMode) || lnMode < -1 || lnMode > 2)) {
+    throw new ApiError("invalid_ir_query", 400);
+  }
+  const query = new URLSearchParams({ profile_id: identity.profilePublicId });
+  if (sha256 !== undefined) query.set("sha256", sha256);
+  if (lnMode !== undefined && lnMode >= 0) query.set("ln_mode", String(lnMode));
+  const stub = dependencies.profileDo.get(dependencies.profileDo.idFromName(identity.profileId));
+  const response = await stub.fetch(`https://profile.internal/internal/ir/scores?${query}`);
+  if (!response.ok) throw new ApiError(response.status === 410 ? "profile_deleted" : "temporary_unavailable", response.status === 410 ? 410 : 503, response.status !== 410, 5);
+  const result = await response.json<unknown>();
+  if (!isRecord(result) || result.contract !== "ir-read.v1" || !Array.isArray(result.scores)
+    || result.scores.length > 1000 || typeof result.truncated !== "boolean") {
+    throw new ApiError("temporary_unavailable", 503, true, 5);
+  }
+  return result;
+}
+
+export async function readIrMethod(
+  url: URL,
+  identity: DeviceIdentity,
+  dependencies: IrReadDependencies,
+): Promise<Record<string, unknown>> {
+  if (!IR_READ_PATHS.has(url.pathname)) throw new ApiError("not_found", 404);
+  if (url.pathname === "/v1/ir/player") {
+    const profile = await irProfile(dependencies.db, identity);
+    return { contract: "ir-read.v1", player: { id: profile.public_id, name: profile.display_name, rank: "" } };
+  }
+  if (url.pathname === "/v1/ir/play-data") return ownerScoreProjection(url, identity, dependencies);
+  if (url.pathname === "/v1/ir/course-play-data") {
+    requireOwnedIrPlayer(url, identity);
+    return { contract: "ir-read.v1", scores: [], truncated: false, unsupported: "course_ranking_v1" };
+  }
+  if (url.pathname === "/v1/ir/rivals") {
+    return { contract: "ir-read.v1", players: [], unsupported: "rival_federation_v1" };
+  }
+  if (url.pathname === "/v1/ir/tables") {
+    return { contract: "ir-read.v1", tables: [], unsupported: "ir_tables_v1" };
+  }
+  if (url.pathname === "/v1/ir/illegal-songs") {
+    return { contract: "ir-read.v1", sha256: [] };
+  }
+  const currentVersion = boundedIrQuery(url.searchParams.get("current_version"), 64) ?? "";
+  const serverBuild = typeof dependencies.buildVersion === "string" && dependencies.buildVersion.length <= 120
+    ? dependencies.buildVersion : "unknown";
+  return {
+    contract: "ir-read.v1",
+    version: { version: currentVersion, message: "", download_url: null, server_build: serverBuild },
+  };
 }
 
 export async function readJsonBody(

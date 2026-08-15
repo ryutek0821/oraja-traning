@@ -9,6 +9,10 @@ const settingsMigration = await readFile(new URL("migrations/0013_profile_settin
 const settings = await readFile(new URL("worker/src/profile-settings.ts", root), "utf8");
 const worker = await readFile(new URL("worker/src/index.ts", root), "utf8");
 const dashboard = await readFile(new URL("worker/src/dashboard.ts", root), "utf8");
+const bridge = await readFile(new URL("worker/src/container-bridge.ts", root), "utf8");
+const workflow = await readFile(new URL("worker/src/workflow.ts", root), "utf8");
+const ledger = await readFile(new URL("worker/src/job-ledger.ts", root), "utf8");
+const catalogMigration = await readFile(new URL("migrations/0014_catalog_levels.sql", root), "utf8");
 
 test("capability table route hashes the secret and never returns object keys", () => {
   assert.match(tables, /crypto\.subtle\.digest\("SHA-256"/);
@@ -39,6 +43,23 @@ test("profile settings are owner scoped, bounded, and CSRF protected", () => {
   assert.match(settings, /settings_revision = profile_settings\.settings_revision \+ 1/);
   assert.match(worker, /requireWebAccount\(request, env, mutation\)/);
   assert.match(worker, /request\.method === "PATCH"/);
+  assert.match(settings, /JOIN artifact_latest recommend/);
+  assert.match(settings, /JOIN artifact_latest today/);
+  assert.match(worker, /ARTIFACT_BUCKET\.head\(source\.recommendObjectKey\)/);
+  assert.match(worker, /eventId: `settings:\$\{source\.profileId\}:\$\{source\.settingsRevision\}`/);
+  assert.match(worker, /jobKind: "regenerate"/);
+});
+
+test("table generation consumes a versioned catalog and publishes immutable owner-scoped parts with CAS", () => {
+  assert.match(catalogMigration, /ADD COLUMN level TEXT/);
+  assert.match(bridge, /v\.status = 'active'/);
+  assert.match(bridge, /e\.level IS NOT NULL AND e\.song_mode = 7/);
+  assert.match(bridge, /catalog_manifest_sha256/);
+  assert.match(workflow, /table\("recommend"\), table\("today"\)/);
+  assert.match(workflow, /canonicalJson\(\{ kind: item\.kind, parts: item\.parts \}\)/);
+  assert.match(ledger, /INSERT OR IGNORE INTO artifact_revisions/);
+  assert.match(ledger, /excluded\.revision > artifact_latest\.revision/);
+  assert.match(ledger, /artifact_immutable_conflict/);
 });
 
 test("table capability plaintext is returned once and never listed or persisted", () => {

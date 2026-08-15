@@ -4,8 +4,8 @@ This public client is licensed **GPL-3.0-only**. The private service and other
 repository components remain AGPL-3.0-only; see [PUBLICATION.md](PUBLICATION.md)
 for the deny-by-default release boundary.
 
-> **Implementation status:** the source includes the write-only
-> `IRConnection`, durable profile-partitioned spool, bounded HTTPS transport,
+> **Implementation status:** the source includes the owner-only
+> `IRConnection`, durable profile-partitioned write spool, bounded HTTPS transport,
 > compatibility stubs, composite adapter, and dependency-free contract smoke
 > tests. Release compatibility must still be verified with the pinned real
 > beatoraja JAR before publishing.
@@ -110,10 +110,17 @@ The Worker API contract for the eventual client is:
   `POST /v1/profiles/{profile_id}/devices`; they are not created by the JAR.
 * `POST /v1/plays` — validates the Bearer device token, accepts an event, and returns
   `{"event_id":"...","status":"accepted|duplicate"}`.
+* `GET /v1/ir/player` — returns only the device token's profile identity.
+* `GET /v1/ir/play-data` — returns at most 1,000 best-score projections from
+  the token-owned Profile Durable Object, optionally filtered by SHA-256/LN mode.
+* `GET /v1/ir/rivals`, `/v1/ir/tables`, and `/v1/ir/course-play-data` — return
+  typed empty arrays in v1; they do not imply rival federation or server tables.
+* `GET /v1/ir/version` and `/v1/ir/illegal-songs` — return bounded typed metadata.
 
-No profile score-read endpoint is currently implemented.  Rivals, tables,
-and course rankings must remain disabled until an allowlisted endpoint and
-its authorization tests exist.
+All read routes require the same profile/device-bound Bearer credential. A
+different `player_id` is rejected before a Durable Object request, and the
+client also short-circuits cross-player calls without network access. Score
+reads never mutate or acknowledge the durable submission spool.
 
 ## Offline and existing IR coexistence
 

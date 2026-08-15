@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import time
+from datetime import datetime
 
 import pytest
 
@@ -15,7 +16,9 @@ from oraja_training.plan.menu import (
     _select_warmup,
     build_session,
     build_session_from_input,
+    next_training_date,
     recommendation_output,
+    training_day,
     write_export,
 )
 
@@ -102,6 +105,16 @@ def _warmup_records() -> tuple[dict[str, object], ...]:
         )
     )
     return tuple(rows)
+def test_training_day_uses_local_0400_across_dst_and_month_boundaries() -> None:
+    assert training_day(datetime.fromisoformat("2026-08-14T03:59:59+09:00"), "Asia/Tokyo").isoformat() == "2026-08-13"
+    assert training_day(datetime.fromisoformat("2026-08-14T04:00:00+09:00"), "Asia/Tokyo").isoformat() == "2026-08-14"
+    assert training_day(datetime.fromisoformat("2026-09-01T03:59:59+09:00"), "Asia/Tokyo").isoformat() == "2026-08-31"
+
+    profile = ProfileContext("profile-a", "Alice", "America/New_York")
+    assert next_training_date(datetime.fromisoformat("2026-03-08T03:59:59-04:00"), profile).isoformat() == "2026-03-08"
+    assert next_training_date(datetime.fromisoformat("2026-03-08T04:00:00-04:00"), profile).isoformat() == "2026-03-09"
+    assert next_training_date(datetime.fromisoformat("2026-11-01T03:59:59-05:00"), profile).isoformat() == "2026-11-01"
+    assert next_training_date(datetime.fromisoformat("2026-11-01T04:00:00-05:00"), profile).isoformat() == "2026-11-02"
 
 
 def _assistant(tmp_path):

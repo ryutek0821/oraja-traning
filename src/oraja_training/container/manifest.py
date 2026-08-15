@@ -425,7 +425,7 @@ def build_output_manifest(
     for index, item in enumerate(artifacts):
         artifact = _object(item, f"artifacts[{index}]")
         _exact_keys(artifact, {"kind", "object_key", "sha256", "size_bytes", "content_type"}, f"artifacts[{index}]")
-        if artifact["kind"] not in {"normalized_events", "feature_input", "model_input"}:
+        if artifact["kind"] not in {"normalized_events", "feature_input", "model_input", "recommend_header", "recommend_score", "daily_menu_header", "daily_menu_score"}:
             raise ManifestError("output artifact kind is not allowed")
         key = _validate_object_key(artifact["object_key"], f"artifacts[{index}].object_key")
         _validate_profile_prefix(key, validated.profile_id, f"artifacts[{index}].object_key")
@@ -494,7 +494,7 @@ def validate_output_manifest(
     for index, item in enumerate(artifacts):
         artifact = _object(item, f"artifacts[{index}]")
         _exact_keys(artifact, {"kind", "object_key", "sha256", "size_bytes", "content_type"}, f"artifacts[{index}]")
-        if artifact["kind"] not in {"normalized_events", "feature_input", "model_input"}:
+        if artifact["kind"] not in {"normalized_events", "feature_input", "model_input", "recommend_header", "recommend_score", "daily_menu_header", "daily_menu_score"}:
             raise ManifestError("output artifact kind is not allowed")
         key = _validate_object_key(artifact["object_key"], f"artifacts[{index}].object_key")
         _validate_profile_prefix(key, profile_id, f"artifacts[{index}].object_key")

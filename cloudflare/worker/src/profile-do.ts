@@ -10,7 +10,7 @@ const JSON_HEADERS = {
 type ProfileStorage = {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
-  list<T>(options?: { prefix?: string; start?: string; limit?: number }): Promise<Map<string, T>>;
+  list<T>(options?: { prefix?: string; start?: string; limit?: number; reverse?: boolean }): Promise<Map<string, T>>;
   deleteAll(): Promise<void>;
   transaction?<T>(callback: (storage: ProfileStorage) => Promise<T>): Promise<T>;
 };
@@ -34,6 +34,8 @@ type AcceptInput = {
   request_id: string;
   event: NormalizedIrEvent;
 };
+
+const MAX_PRIVACY_EXPORT_PAGE_BYTES = 4 * 1024 * 1024;
 
 function response(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value) + "\n", { status, headers: JSON_HEADERS });
@@ -69,6 +71,14 @@ function isStoredPlayEvent(value: unknown): value is StoredPlayEvent {
   );
 }
 
+function portableState(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(portableState);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !["profile_internal_id", "device_internal_id"].includes(key))
+    .map(([key, item]) => [key, portableState(item)]));
+}
+
 function publicPlay(record: StoredPlayEvent): Record<string, unknown> {
   return {
     event_id: record.event.event_id,
@@ -89,6 +99,117 @@ function publicPlay(record: StoredPlayEvent): Record<string, unknown> {
     },
     accepted_at: record.accepted_at,
   };
+}
+
+type IrScoreProjection = {
+  sha256: string;
+  lntype: number;
+  id: string;
+  player: string;
+  clear: number;
+  date: number;
+  epg: number;
+  lpg: number;
+  egr: number;
+  lgr: number;
+  egd: number;
+  lgd: number;
+  ebd: number;
+  lbd: number;
+  epr: number;
+  lpr: number;
+  ems: number;
+  lms: number;
+  avgjudge: number;
+  maxcombo: number;
+  notes: number;
+  passnotes: number;
+  minbp: number;
+  option: number;
+  seed: number;
+  assist: number;
+  gauge: number;
+  device_type: null;
+  judge_algorithm: null;
+  rule: null;
+  skin: string;
+};
+
+function encodedOption(options: string[]): number {
+  const values = ["NORMAL", "MIRROR", "RANDOM", "R-RANDOM", "S-RANDOM", "H-RANDOM", "SPIRAL", "ALL-SCR", "EX-RANDOM", "EX-S-RANDOM"];
+  const primary = values.indexOf(options[0] ?? "NORMAL");
+  const secondary = options.length > 1 ? values.indexOf(options[1]) : -1;
+  const battle = options.includes("BATTLE-ASSIST") ? 300 : options.includes("BATTLE") ? 200 : 0;
+  return battle + (secondary >= 0 ? secondary * 10 : 0) + Math.max(0, primary);
+}
+
+function irScore(record: StoredPlayEvent, profilePublicId: string): IrScoreProjection {
+  const play = record.event.play;
+  const judgements = play.judgements;
+  const gauges = ["ASSIST_EASY", "EASY", "NORMAL", "HARD", "EXHARD", "HAZARD"];
+  const gauge = Math.max(0, gauges.indexOf(play.gauge_kind));
+  const assist = play.assist_kind === "NONE" ? 0 : play.assist_kind === "LIGHT_ASSIST_EASY" ? 1 : 2;
+  return {
+    sha256: record.event.chart.sha256,
+    lntype: record.event.chart.ln_mode ?? 0,
+    id: profilePublicId,
+    player: "",
+    clear: play.clear,
+    date: Math.floor(Date.parse(record.event.occurred_at) / 1000),
+    epg: judgements.epg,
+    lpg: judgements.lpg,
+    egr: judgements.egr,
+    lgr: judgements.lgr,
+    egd: judgements.egd,
+    lgd: judgements.lgd,
+    ebd: judgements.ebd,
+    lbd: judgements.lbd,
+    epr: judgements.epr,
+    lpr: judgements.lpr,
+    ems: judgements.ems,
+    lms: judgements.lms,
+    avgjudge: 0,
+    maxcombo: play.combo,
+    notes: play.notes,
+    passnotes: play.passnotes,
+    minbp: play.minbp,
+    option: encodedOption(play.options),
+    seed: play.seed,
+    assist,
+    gauge,
+    device_type: null,
+    judge_algorithm: null,
+    rule: null,
+    skin: "",
+  };
+}
+
+function betterIrScore(candidate: IrScoreProjection, current: IrScoreProjection): boolean {
+  const candidateEx = (candidate.epg + candidate.lpg) * 2 + candidate.egr + candidate.lgr;
+  const currentEx = (current.epg + current.lpg) * 2 + current.egr + current.lgr;
+  return candidateEx > currentEx
+    || (candidateEx === currentEx && candidate.clear > current.clear)
+    || (candidateEx === currentEx && candidate.clear === current.clear && candidate.minbp < current.minbp)
+    || (candidateEx === currentEx && candidate.clear === current.clear && candidate.minbp === current.minbp && candidate.date > current.date);
+}
+
+export function projectIrScores(
+  values: Iterable<unknown>,
+  profilePublicId: string,
+  sha256?: string,
+  lnMode?: number,
+): IrScoreProjection[] {
+  const best = new Map<string, IrScoreProjection>();
+  for (const value of values) {
+    if (!isStoredPlayEvent(value) || value.event.is_course) continue;
+    if (sha256 !== undefined && value.event.chart.sha256 !== sha256) continue;
+    const projected = irScore(value, profilePublicId);
+    if (lnMode !== undefined && projected.lntype !== lnMode) continue;
+    const key = `${projected.sha256}:${projected.lntype}`;
+    const current = best.get(key);
+    if (!current || betterIrScore(projected, current)) best.set(key, projected);
+  }
+  return [...best.values()].sort((left, right) => left.sha256.localeCompare(right.sha256) || left.lntype - right.lntype);
 }
 
 function exportPlay(record: StoredPlayEvent): Record<string, unknown> {
@@ -144,6 +265,9 @@ export class ProfileDurableObject extends DurableObject {
     }
     if (request.method === "GET" && url.pathname === "/internal/plays") {
       return this.listPlays(url);
+    }
+    if (request.method === "GET" && url.pathname === "/internal/ir/scores") {
+      return this.irScores(url);
     }
     if (request.method === "GET" && url.pathname === "/internal/privacy/export") {
       return this.exportPlays(url);
@@ -340,23 +464,56 @@ export class ProfileDurableObject extends DurableObject {
     }
   }
 
+  private async irScores(url: URL): Promise<Response> {
+    const profilePublicId = url.searchParams.get("profile_id") ?? "";
+    const sha256 = url.searchParams.get("sha256") ?? undefined;
+    const rawLnMode = url.searchParams.get("ln_mode");
+    const lnMode = rawLnMode === null ? undefined : Number(rawLnMode);
+    if (!/^[0-9a-f-]{36}$/.test(profilePublicId)
+      || (sha256 !== undefined && !/^[0-9a-f]{64}$/.test(sha256))
+      || (lnMode !== undefined && (!Number.isInteger(lnMode) || lnMode < 0 || lnMode > 2))) {
+      return response({ error: { code: "invalid_ir_query" } }, 400);
+    }
+    try {
+      if (await this.storage().get<unknown>("privacy:tombstone") !== undefined) {
+        return response({ error: { code: "profile_deleted" } }, 410);
+      }
+      const values = await this.storage().list<unknown>({ prefix: "play:", limit: 1001, reverse: true });
+      return response({
+        contract: "ir-read.v1",
+        scores: projectIrScores([...values.values()].slice(0, 1000), profilePublicId, sha256, lnMode),
+        truncated: values.size > 1000,
+        scanned_limit: 1000,
+      });
+    } catch {
+      return response({ error: { code: "temporary_unavailable" } }, 503);
+    }
+  }
+
   private async exportPlays(url: URL): Promise<Response> {
     const limit = Number(url.searchParams.get("limit") ?? "500");
     const cursor = url.searchParams.get("cursor") ?? undefined;
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500 || (cursor !== undefined && !cursor.startsWith("play:"))) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500 || (cursor !== undefined && cursor.length > 512)) {
       return response({ error: { code: "invalid_pagination" } }, 400);
     }
     try {
       if (await this.storage().get<unknown>("privacy:tombstone") !== undefined) {
         return response({ error: { code: "profile_deleted" } }, 410);
       }
-      const values = await this.storage().list<unknown>({ prefix: "play:", start: cursor ? `${cursor}\0` : undefined, limit: limit + 1 });
-      const entries = [...values.entries()].filter((entry): entry is [string, StoredPlayEvent] => isStoredPlayEvent(entry[1]));
+      const values = await this.storage().list<unknown>({ start: cursor ? `${cursor}\0` : undefined, limit: limit + 1 });
+      const entries = [...values.entries()].filter(([key]) => key !== "profile:internal_id" && key !== "privacy:tombstone");
       const page = entries.slice(0, limit);
-      return response({
-        plays: page.map(([, record]) => exportPlay(record)),
+      const payload = {
+        entries: page.map(([key, value]) => ({
+          key: key.startsWith("play:") ? `plays/${key.slice("play:".length)}` : key,
+          value: isStoredPlayEvent(value) ? exportPlay(value) : portableState(value),
+        })),
         next_cursor: entries.length > limit ? page.at(-1)?.[0] ?? null : null,
-      });
+      };
+      if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > MAX_PRIVACY_EXPORT_PAGE_BYTES) {
+        return response({ error: { code: "profile_export_page_too_large" } }, 413);
+      }
+      return response(payload);
     } catch {
       return response({ error: { code: "temporary_unavailable" } }, 503);
     }

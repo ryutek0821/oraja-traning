@@ -12,7 +12,8 @@ const worker = await readFile(new URL("worker/src/index.ts", root), "utf8");
 test("bridge resolves an owner-scoped completed upload and verifies every encrypted frame", () => {
   assert.match(bridge, /upload-session:/);
   assert.match(bridge, /profileScope\(job\.profileId\)/);
-  assert.match(bridge, /session\.manifestSha256 !== job\.inputDigest/);
+  assert.match(bridge, /expectedInputDigest !== job\.inputDigest/);
+  assert.match(bridge, /regenerationInputDigest\(job\.profileId, session\.manifestSha256, tableContext\.settingsRevision\)/);
   assert.match(bridge, /decryptCompletedUploadObject/);
   assert.match(upload, /partHasher\.digest\(\) !== part\.sha256/);
   assert.match(upload, /totalHasher\.digest\(\) !== file\.sha256/);
@@ -22,10 +23,13 @@ test("bridge resolves an owner-scoped completed upload and verifies every encryp
 });
 
 test("framed transport is bounded and the container rechecks the exact five files", () => {
-  assert.match(bridge, /five-db-framed-v1/);
+  assert.match(bridge, /five-db-framed-v2/);
   assert.match(bridge, /content-length/);
-  assert.match(entrypoint, /FRAMED_MAGIC = b"ORAJA5DB1/);
-  assert.match(entrypoint, /seen != DATABASE_NAMES or source\.remaining != 0/);
+  assert.match(bridge, /MAX_TABLE_CONTEXT_BYTES/);
+  assert.match(entrypoint, /FRAMED_MAGIC_V2 = b"ORAJA5DB2/);
+  assert.match(entrypoint, /table-context\.json/);
+  assert.match(entrypoint, /seen != DATABASE_NAMES/);
+  assert.match(entrypoint, /source\.remaining != 0/);
   assert.match(entrypoint, /hasher\.hexdigest\(\) != digest/);
 });
 
@@ -37,6 +41,7 @@ test("Worker validates output ownership and digest before immutable R2 publicati
   assert.match(bridge, /await immutablePut\(env\.ARTIFACT_BUCKET, artifactKey/);
   assert.match(bridge, /MAX_CONTAINER_RESPONSE_BYTES/);
   assert.match(bridge, /boundedContainerResponse/);
+  assert.match(bridge, /tableArtifacts\.length !== 4/);
 });
 
 test("completed uploads enqueue one immutable owner-scoped workflow input", () => {

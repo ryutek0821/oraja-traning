@@ -9,6 +9,7 @@ import struct
 import sys
 import tempfile
 import zipfile
+import sqlite3
 
 import pytest
 
@@ -23,7 +24,7 @@ from oraja_training.container import (
     validate_output_manifest,
 )
 from oraja_training.container.manifest import ManifestError
-from tests.fixtures.synthetic_beatoraja import build_synthetic_fixture
+from tests.fixtures.synthetic_beatoraja import build_synthetic_fixture, load_catalog
 
 
 PROFILE_ID = "018f0f0f-0f01-7f0f-8f0f-0f0f0f0f0f0f"
@@ -75,6 +76,35 @@ def _bundle(root: Path) -> Path:
     return bundle
 
 
+def _table_context(source: Path) -> dict[str, object]:
+    catalog = load_catalog(source)
+    connection = sqlite3.connect(source / "songdata.db")
+    try:
+        with connection:
+            for row in catalog["owned"]:
+                connection.execute(
+                    "INSERT INTO song VALUES (?, ?, ?, ?, ?, 7, ?)",
+                    (row["sha256"], row["md5"], row["title"], row["artist"], row["notes"], f"synthetic/{row['sha256']}.bms"),
+                )
+    finally:
+        connection.close()
+    entries = [row for row in catalog["table_entries"] if row["sha256"] is not None]
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "profile_id": PROFILE_ID,
+        "display_name": "Synthetic",
+        "settings_revision": 3,
+        "settings": {
+            "timezone": "Asia/Tokyo",
+            "target_judged": 100_000,
+            "reserve_judged": 10_000,
+            "readiness": "normal",
+        },
+        "catalog_manifest_sha256": hashlib.sha256(encoded).hexdigest(),
+        "catalog_entries": entries,
+    }
+
+
 def test_input_manifest_enforces_profile_partition_and_official_trust_domain() -> None:
     valid = {
         "contract": "container-input-manifest",
@@ -121,6 +151,7 @@ def test_container_pipeline_uses_core_and_replays_immutable_artifacts() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         build_synthetic_fixture(root / "source")
+        table_context = _table_context(root / "source")
         bundle = _bundle(root)
         manifest = _manifest(bundle)
         artifacts = MemoryArtifactStore()
@@ -130,8 +161,8 @@ def test_container_pipeline_uses_core_and_replays_immutable_artifacts() -> None:
             clock=lambda: 1_786_400_000,
         )
 
-        first = adapter.run(manifest, bundle=bundle, revision=1)
-        second = adapter.run(manifest, bundle=bundle, revision=1)
+        first = adapter.run(manifest, bundle=bundle, revision=1, table_context=table_context)
+        second = adapter.run(manifest, bundle=bundle, revision=1, table_context=table_context)
 
         assert first.output_manifest == second.output_manifest
         assert first.output_manifest_sha256 == second.output_manifest_sha256
@@ -144,13 +175,44 @@ def test_container_pipeline_uses_core_and_replays_immutable_artifacts() -> None:
             "normalized_events",
             "feature_input",
             "model_input",
+            "recommend_header",
+            "recommend_score",
+            "daily_menu_header",
+            "daily_menu_score",
         }
-        assert len(artifacts.objects) == 3
+        assert len(artifacts.objects) == 7
+        table_documents = [
+            json.loads(content)
+            for key, content in artifacts.objects.items()
+            if "/table/" in key
+        ]
+        assert len(table_documents) == 4
+        assert all(PROFILE_ID not in json.dumps(document) for document in table_documents)
         validate_output_manifest(
             first.output_manifest,
             input_manifest=validate_input_manifest(manifest),
         )
         assert first.output_manifest["raw_db_exported"] is False
+
+
+def test_container_refuses_to_publish_tables_without_owned_catalog_input(tmp_path: Path) -> None:
+    build_synthetic_fixture(tmp_path / "source")
+    bundle = _bundle(tmp_path)
+    with pytest.raises(ContainerError) as failure:
+        ContainerAdapter(decryptor=PassthroughDecryptor()).run(_manifest(bundle), bundle=bundle)
+    assert failure.value.code == "table_input_unavailable"
+
+
+def test_container_rejects_table_context_with_mismatched_catalog_digest(tmp_path: Path) -> None:
+    build_synthetic_fixture(tmp_path / "source")
+    bundle = _bundle(tmp_path)
+    context = _table_context(tmp_path / "source")
+    context["catalog_entries"][0]["level"] = "tampered"
+    with pytest.raises(ContainerError) as failure:
+        ContainerAdapter(decryptor=PassthroughDecryptor()).run(
+            _manifest(bundle), bundle=bundle, table_context=context
+        )
+    assert failure.value.code == "invalid_contract"
 
 
 def test_container_rejects_cancelled_or_tampered_input() -> None:
@@ -242,6 +304,27 @@ def test_worker_framed_transport_materializes_exact_verified_five_db(tmp_path: P
     assert source_body.remaining == 0
     assert {path.name for path in destination.iterdir()} == module.DATABASE_NAMES
     assert all((destination / name).read_bytes() == (source / name).read_bytes() for name in module.DATABASE_NAMES)
+
+    context = json.dumps(_table_context(source), separators=(",", ":"), sort_keys=True).encode()
+    framed_v2 = bytearray(module.FRAMED_MAGIC_V2)
+    framed_v2.extend(framed[len(module.FRAMED_MAGIC):])
+    context_header = json.dumps(
+        {
+            "file_name": "table-context.json",
+            "sha256": hashlib.sha256(context).hexdigest(),
+            "size_bytes": len(context),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    framed_v2.extend(struct.pack(">I", len(context_header)))
+    framed_v2.extend(context_header)
+    framed_v2.extend(context)
+    destination_v2 = tmp_path / "materialized-v2"
+    destination_v2.mkdir()
+    source_v2 = module._BoundedBody(io.BytesIO(framed_v2), len(framed_v2))
+    assert module._materialize_framed_input(source_v2, destination_v2) == _table_context(source)
+    assert source_v2.remaining == 0
 
     framed[-1] ^= 1
     corrupt = module._BoundedBody(io.BytesIO(framed), len(framed))
