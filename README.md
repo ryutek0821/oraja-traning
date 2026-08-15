@@ -38,10 +38,12 @@ oraja-training tables refresh \
 
 取得結果はETag/Last-Modified付きで`.cache/tables/`へ保存され、通信失敗時は最後の正常な
 キャッシュを使います。既定ではGENOCIDE（発狂難易度表）、Overjoy、Satellite、Stellaの
-4表を取得し、各表の尺度を混ぜずにクリアランプから適正帯を推定します。
+4表を取得し、各表の尺度を混ぜずにクリアランプから適正帯を推定します。GENOCIDEは公式の
+Shift_JIS/JavaScript旧形式をコード実行せず解析し、hashがない項目は正規化titleがローカルで
+一意な場合だけ照合します。照合数/全項目数は保存され、低照合率をメニュー警告へ出します。
 
 schema version 1の既存`assistant.db`は正しい値へ復元できないため、in-place移行しません。
-version 2以降は履歴を保持して段階的に移行します。現行schema versionは6です。
+version 2以降は履歴を保持して段階的に移行します。現行schema versionは8です。
 
 ## 毎日の更新
 
@@ -76,9 +78,17 @@ BMS固有の対照研究は見当たらないため、一般的なウォーム�
 - 発狂・Overjoy・Satellite・Stellaを別尺度のまま扱い、各表のHARDクリア前線を推定
 - HARD/EXHARD、または直近30日で2回以上完走かつBP 5%以下の譜面だけを採用
 - 前線の2段階下から前線までを4曲以内で並べ、目標は更新ではなく`COMFORT`
-- 終盤密度、瞬間発狂、皿、LN、ソフラン/停止、微縦連、長いジャック、同時押し、曲長の
-  極端値を除外
+- 終盤密度比、瞬間密度比、皿、LN、ソフラン/停止、微縦連、長いジャック、同時押し、
+  最長発狂、曲長の極端値を除外
 - 疲労日や前回ウォームアップ不調時は帯を1段階下げ、条件を満たす曲がなければ空欄と警告
+
+微縦連・長いジャック・同時押しに加え、高速交互の危険度proxyとして`grid_bpm`、
+持続発狂と終盤発狂に`stream_sec` / `last_kill`を、`songdata.db`内の任意テーブル
+`bmscf_chart_analysis`（oraja-constellator出力）から使います。`grid_bpm`はレーン列を見ないため
+トリルそのものの判定ではありません。解析値がない譜面は安全と推測せず
+保守的な負荷ペナルティを与えて件数を警告し、基本の密度・皿・LN・ソフラン解析まで欠ける
+譜面はWARMUPから除外します。解析後に`initialize`/backfillを再実行すると
+`chart_pattern_features`へコピーされます。tokenや打鍵列そのものは保存しません。
 
 実打鍵は`player`テーブルのPGREAT～POORの10判定列の累積差分です。空POORは含めません。
 日替わり本編は期待判定10万以上、失敗時の補填として約1万のRESERVEを追加します。

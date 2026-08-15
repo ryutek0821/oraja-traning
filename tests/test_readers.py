@@ -54,6 +54,7 @@ def test_score_and_song_readers(synthetic_db_dir) -> None:
         patterns = readers.read_chart_patterns(conn)
         assert len(patterns) == 2
         assert patterns[0]["analysis_version"] == 3
+        assert patterns[0]["grid_bpm"] == 176.0
 
     with closing(readers.open_snapshot(synthetic_db_dir / "songinfo.db")) as conn:
         assert len(readers.read_songinfo(conn)) == 4

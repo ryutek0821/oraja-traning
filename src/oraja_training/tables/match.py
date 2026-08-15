@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import re
 from typing import Any
+import unicodedata
 
 from .fetch import TableEntry
 
@@ -36,6 +37,7 @@ class TableMatchSummary:
     unmatched: int
     sha256_matches: int
     md5_matches: int
+    title_matches: int = 0
 
     @property
     def match_rate(self) -> float:
@@ -83,6 +85,13 @@ def _hash(value: Any, pattern: re.Pattern[str]) -> str | None:
     return normalized if pattern.fullmatch(normalized) else None
 
 
+def _title(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+    return normalized or None
+
+
 def _entry(value: TableEntry | Mapping[str, Any]) -> TableEntry:
     if isinstance(value, TableEntry):
         return value
@@ -113,6 +122,7 @@ def resolve(
 
     sha_index: dict[str, list[Any]] = defaultdict(list)
     md5_index: dict[str, list[Any]] = defaultdict(list)
+    title_index: dict[str, list[Any]] = defaultdict(list)
     for chart in charts:
         sha256 = _hash(_get(chart, "sha256"), _HEX_64)
         md5 = _hash(_get(chart, "md5"), _HEX_32)
@@ -120,12 +130,21 @@ def resolve(
             sha_index[sha256].append(chart)
         if md5 is not None:
             md5_index[md5].append(chart)
+        title = _title(_get(chart, "title"))
+        if title is not None:
+            title_index[title].append(chart)
 
     normalized_entries = tuple(_entry(entry) for entry in entries)
+    legacy_title_counts = Counter(
+        title
+        for entry in normalized_entries
+        if entry.data.get("_match") == "unique_title"
+        if (title := _title(entry.title)) is not None
+    )
     matches: list[MatchedEntry] = []
     misses: list[UnmatchedEntry] = []
     counts: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"total": 0, "matched": 0, "sha256": 0, "md5": 0}
+        lambda: {"total": 0, "matched": 0, "sha256": 0, "md5": 0, "title": 0}
     )
     for entry in normalized_entries:
         count = counts[entry.table_id]
@@ -140,6 +159,24 @@ def resolve(
             elif len(candidates) > 1 or len(md5_candidates) > 1:
                 misses.append(UnmatchedEntry(entry, "ambiguous_local_hash"))
                 continue
+            elif entry.data.get("_match") == "unique_title":
+                normalized_title = _title(entry.title)
+                if (
+                    normalized_title is None
+                    or legacy_title_counts[normalized_title] != 1
+                ):
+                    misses.append(UnmatchedEntry(entry, "ambiguous_table_title"))
+                    continue
+                title_candidates = title_index.get(normalized_title, [])
+                if len(title_candidates) == 1:
+                    candidates = title_candidates
+                    matched_by = "title"
+                elif len(title_candidates) > 1:
+                    misses.append(UnmatchedEntry(entry, "ambiguous_local_title"))
+                    continue
+                else:
+                    misses.append(UnmatchedEntry(entry, "not_owned"))
+                    continue
             else:
                 misses.append(UnmatchedEntry(entry, "not_owned"))
                 continue
@@ -155,6 +192,7 @@ def resolve(
             unmatched=count["total"] - count["matched"],
             sha256_matches=count["sha256"],
             md5_matches=count["md5"],
+            title_matches=count["title"],
         )
         for table_id, count in sorted(counts.items())
     )

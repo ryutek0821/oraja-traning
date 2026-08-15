@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 import json
 import sqlite3
 import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from oraja_training.domain.types import (
     ProfileContext,
@@ -34,9 +36,13 @@ WITH ranked_state AS (
     AND p.source IN ('collector', 'daily_snapshot')
 ), recent_summary AS (
   SELECT sha256,
-         SUM(CASE WHEN completed = 1 THEN 1 ELSE 0 END) recent_successes,
-         SUM(CASE WHEN completed = 0 THEN 1 ELSE 0 END) recent_failures,
+         SUM(CASE WHEN completed = 1 AND clear >= 4 THEN 1 ELSE 0 END)
+           recent_successes,
+         SUM(CASE WHEN COALESCE(completed, 0) != 1 OR COALESCE(clear, 0) < 4
+                  THEN 1 ELSE 0 END) recent_failures,
          MAX(played_at) recent_played_at,
+         MAX(CASE WHEN recent_rank = 2 THEN played_at ELSE 0 END)
+           recent_second_played_at,
          MAX(bp_rate) recent_bp_rate
   FROM recent_ranked WHERE recent_rank <= 3
   GROUP BY sha256
@@ -50,6 +56,7 @@ SELECT c.sha256, c.md5, c.title, c.artist, c.notes,
        COALESCE(r.recent_successes, 0) recent_successes,
        COALESCE(r.recent_failures, 0) recent_failures,
        COALESCE(r.recent_played_at, 0) recent_played_at,
+       COALESCE(r.recent_second_played_at, 0) recent_second_played_at,
        r.recent_bp_rate,
        COALESCE(f.density_p99, 0) density,
        COALESCE(f.scratch_p90, 0) scratch,
@@ -60,7 +67,8 @@ SELECT c.sha256, c.md5, c.title, c.artist, c.notes,
        f.scratch_rate, f.scratch_combo_rate, f.ln_rate,
        f.soflan_var, f.soflan_changes, f.stop_count, f.chart_seconds,
        pf.rhythm_family, pf.avg_chord, pf.chord_ge3,
-       pf.micro_rate, pf.long_jack_rate, pf.practice_low
+       pf.micro_rate, pf.long_jack_rate, pf.practice_low,
+       pf.grid_bpm, pf.stream_sec, pf.last_kill
 FROM charts c
 JOIN table_entries te ON te.sha256 = c.sha256
 LEFT JOIN ranked_state s ON s.sha256 = c.sha256 AND s.rn = 1
@@ -84,6 +92,27 @@ def _row_mapping(cursor: sqlite3.Cursor, row: object) -> dict[str, object]:
     return dict(zip(columns, row if isinstance(row, tuple) else tuple(row)))
 
 
+def _warmup_play_window(payload: object) -> tuple[int, int] | None:
+    """Return the selected menu's logical 04:00-to-04:00 play window."""
+
+    if not isinstance(payload, dict):
+        return None
+    menu_date = payload.get("menu_date")
+    profile = payload.get("profile")
+    timezone_name = profile.get("timezone") if isinstance(profile, dict) else None
+    if not isinstance(menu_date, str) or not isinstance(timezone_name, str):
+        return None
+    try:
+        day = datetime.strptime(menu_date, "%Y-%m-%d").date()
+        zone = ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    next_day = day + timedelta(days=1)
+    start = datetime(day.year, day.month, day.day, 4, tzinfo=zone)
+    end = datetime(next_day.year, next_day.month, next_day.day, 4, tzinfo=zone)
+    return int(start.timestamp()), int(end.timestamp())
+
+
 def _warmup_adjustment(conn: sqlite3.Connection) -> int:
     """Return a bounded shift from the latest observed WARMUP results."""
 
@@ -96,6 +125,11 @@ def _warmup_adjustment(conn: sqlite3.Connection) -> int:
         payload = json.loads(str(session[1]))
     except (TypeError, ValueError):
         return 0
+    play_window = _warmup_play_window(payload)
+    if play_window is None:
+        return 0
+    window_start, window_end = play_window
+    observation_start = max(int(session[0]), window_start)
     queue = payload.get("queue", ()) if isinstance(payload, dict) else payload
     if not isinstance(queue, list):
         return 0
@@ -103,42 +137,53 @@ def _warmup_adjustment(conn: sqlite3.Connection) -> int:
         item for item in queue
         if isinstance(item, dict) and item.get("category") == "01 WARMUP"
     ]
-    observations: list[tuple[bool, float | None]] = []
+    observations: list[tuple[int, bool, float | None] | None] = []
     for item in warmup:
         sha256 = item.get("sha256")
         if not isinstance(sha256, str):
             continue
         play = conn.execute(
             """
-            SELECT completed, bp_rate
+            SELECT clear, completed, bp_rate
             FROM plays
-            WHERE sha256 = ? AND played_at >= ? AND played_at > 0
+            WHERE sha256 = ? AND played_at >= ? AND played_at < ?
               AND is_course = 0
               AND source IN ('collector', 'daily_snapshot')
               AND completed IS NOT NULL
             ORDER BY played_at, id LIMIT 1
             """,
-            (sha256, int(session[0])),
+            (sha256, observation_start, window_end),
         ).fetchone()
-        if play is not None:
-            observations.append(
-                (bool(play[0]), None if play[1] is None else float(play[1]))
+        observations.append(
+            None if play is None else (
+                int(play[0]),
+                bool(play[1]),
+                None if play[2] is None else float(play[2]),
             )
-    if len(observations) < 2:
+        )
+    played = [observation for observation in observations if observation is not None]
+    if len(played) < 2:
         return 0
-    poor = [not completed or (bp_rate is not None and bp_rate >= 0.10)
-            for completed, bp_rate in observations]
-    rates = [rate for _, rate in observations if rate is not None]
+    poor = [
+        not completed or clear < 4 or (bp_rate is not None and bp_rate >= 0.10)
+        for clear, completed, bp_rate in played
+    ]
+    rates = [rate for _, _, rate in played if rate is not None]
     bp_worsened = (
         len(rates) >= 2 and rates[-1] >= 0.06 and rates[-1] - rates[0] >= 0.03
     )
-    if sum(poor) >= 2 or poor[-1] or bp_worsened:
+    trailing_skips = 0
+    for observation in reversed(observations):
+        if observation is not None:
+            break
+        trailing_skips += 1
+    if sum(poor) >= 2 or poor[-1] or bp_worsened or trailing_skips >= 2:
         return -1
     comfortable = [
-        completed and bp_rate is not None and bp_rate <= 0.05
-        for completed, bp_rate in observations
+        completed and clear >= 4 and bp_rate is not None and bp_rate <= 0.05
+        for clear, completed, bp_rate in played
     ]
-    return 1 if len(comfortable) >= 3 and all(comfortable) else 0
+    return 1 if len(comfortable) >= 3 and all(comfortable) and not trailing_skips else 0
 
 
 class SQLiteRecommendationRepository:
@@ -155,7 +200,8 @@ class SQLiteRecommendationRepository:
         ).fetchone()
         source_cursor = self.conn.execute(
             """
-            SELECT table_id, page_url, header_url, data_url, fetched_at, last_error
+            SELECT table_id, page_url, header_url, data_url, fetched_at, last_error,
+                   entry_count, matched_count
             FROM table_sources ORDER BY table_id
             """
         )

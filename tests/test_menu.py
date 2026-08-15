@@ -10,6 +10,7 @@ from oraja_training.db import store
 from oraja_training.db.recommendation_adapter import SQLiteRecommendationRepository
 from oraja_training.domain import ProfileContext, RecommendationInput
 from oraja_training.plan.menu import (
+    WARMUP_FEATURES,
     _load_candidates,
     _select_warmup,
     build_session,
@@ -50,6 +51,7 @@ def _record(
         "recent_successes": recent_successes,
         "recent_failures": recent_failures,
         "recent_played_at": NOW - 60 if recent_successes or recent_failures else 0,
+        "recent_second_played_at": NOW - 120 if recent_successes >= 2 else 0,
         "recent_bp_rate": recent_bp_rate,
         "density": 20.0,
         "scratch": 5.0,
@@ -71,6 +73,9 @@ def _record(
         "chord_ge3": 0.08,
         "micro_rate": 0.04,
         "long_jack_rate": 0.01,
+        "grid_bpm": 160.0,
+        "stream_sec": 8.0,
+        "last_kill": 1.0,
         "practice_low": 1,
     }
 
@@ -261,6 +266,137 @@ def test_warmup_requires_evidence_and_rejects_unsafe_or_unknown_charts() -> None
     assert all(item.band == "WARMUP" for item in items)
 
 
+def test_warmup_requires_two_successes_inside_the_recent_window() -> None:
+    rows = list(_warmup_records())
+    old_evidence = {
+        **_record(
+            105,
+            level=4,
+            clear=4,
+            recent_successes=2,
+            recent_bp_rate=0.02,
+        ),
+        "recent_second_played_at": NOW - 31 * 86_400,
+    }
+    rows.append(old_evidence)
+    candidates, _, _, frontiers = _load_candidates(tuple(rows), None)
+
+    items = _select_warmup(
+        candidates,
+        set(),
+        quota=100_000,
+        frontiers=frontiers,
+        now=NOW,
+        rng=random.Random(1),
+        readiness="normal",
+        adjustment=0,
+    )
+
+    assert f"{105:064x}" not in {item.sha256 for item in items}
+
+
+def test_recent_full_play_failed_lamps_are_not_warmup_successes(tmp_path) -> None:
+    conn = _assistant(tmp_path)
+    sha256 = f"{4:064x}"
+    try:
+        with conn:
+            for index, played_at in enumerate((NOW - 120, NOW - 60), start=1):
+                conn.execute(
+                    """INSERT INTO plays(
+                        sha256, mode, played_at, playcount, source_generation,
+                        source, clear, completed, bp_rate, is_course,
+                        payload_hash, ingested_at
+                       ) VALUES (?, 0, ?, ?, 0, 'collector', 1, 1, 0.02, 0, ?, ?)""",
+                    (sha256, played_at, index, f"failed-lamp-{index}", played_at),
+                )
+
+        record = next(
+            value
+            for value in SQLiteRecommendationRepository(conn).load_input(
+                ProfileContext()
+            ).candidates
+            if value["sha256"] == sha256
+        )
+        assert record["recent_successes"] == 0
+        assert record["recent_failures"] == 2
+    finally:
+        conn.close()
+
+
+def test_missing_pattern_analysis_gets_a_penalty_and_visible_warning() -> None:
+    rows = list(_warmup_records())
+    safe = next(row for row in rows if row["sha256"] == f"{4:064x}")
+    safe["micro_rate"] = None
+    missing_core = next(row for row in rows if row["sha256"] == f"{5:064x}")
+    missing_core["density_p90"] = None
+    candidates, _, _, frontiers = _load_candidates(tuple(rows), None)
+
+    items = _select_warmup(
+        candidates,
+        set(),
+        quota=100_000,
+        frontiers=frontiers,
+        now=NOW,
+        rng=random.Random(1),
+        readiness="normal",
+        adjustment=0,
+    )
+    selected = {item.sha256 for item in items}
+    assert f"{5:064x}" not in selected
+    candidate = next(value for value in candidates if value.sha256 == f"{4:064x}")
+    penalized = [
+        candidate.warmup_feature_scores[feature]
+        if candidate.warmup_features[feature] is not None else 0.55
+        for feature in WARMUP_FEATURES
+    ]
+    assert candidate.warmup_load == pytest.approx(
+        0.65 * max(penalized) + 0.35 * sum(penalized) / len(penalized)
+    )
+
+    session = build_session_from_input(
+        RecommendationInput(
+            ProfileContext(),
+            1,
+            0,
+            tuple(rows),
+            table_sources=({"table_id": "satellite", "last_error": None},),
+        ),
+        menu_date="2026-08-15",
+        target_judged=100,
+        reserve_judged=0,
+        clock=lambda: NOW,
+    )
+    assert any("pattern analysis missing" in warning for warning in session.table_warnings)
+
+
+def test_satellite_warmup_uses_hard_sl3_to_sl5_not_single_easy_sl10_to_sl11() -> None:
+    rows = [
+        _record(index, level=f"sl{index}", clear=6 if index <= 5 else 1)
+        for index in range(1, 12)
+    ]
+    rows.extend(
+        _record(200 + index, level=f"sl{level}", clear=4, playcount=1)
+        for index, level in enumerate((10, 10, 11, 11))
+    )
+    candidates, _, _, frontiers = _load_candidates(tuple(rows), None)
+
+    items = _select_warmup(
+        candidates,
+        set(),
+        quota=100_000,
+        frontiers=frontiers,
+        now=NOW,
+        rng=random.Random(2),
+        readiness="normal",
+        adjustment=0,
+    )
+
+    levels = [int(item.source_level.removeprefix("sl")) for item in items]
+    assert levels
+    assert set(levels).issubset({3, 4, 5})
+    assert levels == sorted(levels)
+
+
 @pytest.mark.parametrize(
     ("feature", "value"),
     (
@@ -277,6 +413,9 @@ def test_warmup_requires_evidence_and_rejects_unsafe_or_unknown_charts() -> None
         ("long_jack_rate", 1.0),
         ("avg_chord", 8.0),
         ("chord_ge3", 1.0),
+        ("grid_bpm", 260.0),
+        ("stream_sec", 60.0),
+        ("last_kill", 2.5),
         ("chart_seconds", 300.0),
     ),
 )
@@ -300,6 +439,33 @@ def test_each_extreme_pattern_feature_is_excluded_from_warmup(
     )
 
     assert f"{4:064x}" not in {item.sha256 for item in items}
+
+
+@pytest.mark.parametrize(
+    ("feature", "value"),
+    (("end_density", 19.0), ("burst_max", 22.0)),
+)
+def test_non_flat_density_shape_is_excluded_even_when_every_chart_ties(
+    feature: str, value: float
+) -> None:
+    rows = [
+        _record(index, level=index, clear=6 if index <= 7 else 1)
+        for index in range(16)
+    ]
+    for row in rows:
+        row[feature] = value
+    candidates, _, _, frontiers = _load_candidates(tuple(rows), None)
+
+    assert _select_warmup(
+        candidates,
+        set(),
+        quota=100_000,
+        frontiers=frontiers,
+        now=NOW,
+        rng=random.Random(1),
+        readiness="normal",
+        adjustment=0,
+    ) == []
 
 
 def test_tired_and_previous_result_shift_warmup_one_level_lower() -> None:
@@ -454,6 +620,60 @@ def test_table_refresh_failures_are_exposed_in_session_warnings() -> None:
     assert not any(warning.startswith("satellite:") for warning in session.table_warnings)
 
 
+def test_low_table_match_coverage_is_visible() -> None:
+    session = build_session_from_input(
+        RecommendationInput(
+            ProfileContext(),
+            1,
+            0,
+            _warmup_records(),
+            table_sources=(
+                {
+                    "table_id": "satellite",
+                    "last_error": None,
+                    "entry_count": 1_000,
+                    "matched_count": 10,
+                },
+            ),
+        ),
+        menu_date="2026-08-15",
+        target_judged=100,
+        reserve_judged=0,
+        clock=lambda: NOW,
+    )
+
+    assert "satellite: low owned-chart match coverage (10/1000)" in (
+        session.table_warnings
+    )
+
+
+def test_partial_genocide_title_match_coverage_is_visible() -> None:
+    session = build_session_from_input(
+        RecommendationInput(
+            ProfileContext(),
+            1,
+            0,
+            _warmup_records(),
+            table_sources=(
+                {
+                    "table_id": "genocide",
+                    "last_error": None,
+                    "entry_count": 1_035,
+                    "matched_count": 550,
+                },
+            ),
+        ),
+        menu_date="2026-08-15",
+        target_judged=100,
+        reserve_judged=0,
+        clock=lambda: NOW,
+    )
+
+    assert "genocide: low owned-chart match coverage (550/1035)" in (
+        session.table_warnings
+    )
+
+
 def test_unknown_play_date_is_not_selected_as_overdue_review() -> None:
     rows = tuple(
         {**_record(index, level=index, clear=6), "last_played": 0}
@@ -478,37 +698,52 @@ def test_unknown_play_date_is_not_selected_as_overdue_review() -> None:
 
 
 def test_previous_warmup_results_produce_a_bounded_adjustment(tmp_path) -> None:
-    warmup_hashes = [f"{index:064x}" for index in range(3)]
-    payload = {
-        "queue": [
-            {"category": "01 WARMUP", "sha256": sha256}
-            for sha256 in warmup_hashes
-        ]
-    }
-
-    def adjustment(name: str, results: list[tuple[int, float]]) -> int:
+    def adjustment(
+        name: str,
+        results: list[tuple[int, float] | tuple[int, int, float]],
+        *,
+        queue_size: int | None = None,
+        played_at_base: int = 4 * 3_600 + 1,
+        session_created_at: int = 100,
+    ) -> int:
+        size = len(results) if queue_size is None else queue_size
+        warmup_hashes = [f"{index:064x}" for index in range(size)]
+        payload = {
+            "menu_date": "1970-01-01",
+            "profile": {"timezone": "UTC"},
+            "queue": [
+                {"category": "01 WARMUP", "sha256": sha256}
+                for sha256 in warmup_hashes
+            ]
+        }
         conn = store.init(tmp_path / name)
         try:
             with conn:
                 conn.execute(
                     "INSERT INTO sessions(created_at, arm, slots_json) "
-                    "VALUES (100, 'model', ?)",
-                    (json.dumps(payload),),
+                    "VALUES (?, 'model', ?)",
+                    (session_created_at, json.dumps(payload)),
                 )
-                for index, (completed, bp_rate) in enumerate(results):
+                for index, result in enumerate(results):
+                    if len(result) == 2:
+                        completed, bp_rate = result
+                        clear = 4 if completed else 1
+                    else:
+                        clear, completed, bp_rate = result
                     conn.execute(
                         """INSERT INTO plays(
                             sha256, mode, played_at, playcount, source_generation,
                             source, clear, completed, bp_rate, is_course,
                             payload_hash, ingested_at
-                           ) VALUES (?, 0, ?, 1, 0, 'collector', 1, ?, ?, 0, ?, ?)""",
+                           ) VALUES (?, 0, ?, 1, 0, 'collector', ?, ?, ?, 0, ?, ?)""",
                         (
                             warmup_hashes[index],
-                            101 + index,
+                            played_at_base + index,
+                            clear,
                             completed,
                             bp_rate,
                             f"payload-{index}",
-                            101 + index,
+                            played_at_base + index,
                         ),
                     )
             return SQLiteRecommendationRepository(conn).load_input(
@@ -519,3 +754,18 @@ def test_previous_warmup_results_produce_a_bounded_adjustment(tmp_path) -> None:
 
     assert adjustment("poor.db", [(0, 0.12), (0, 0.12), (1, 0.03)]) == -1
     assert adjustment("comfortable.db", [(1, 0.03)] * 3) == 1
+    assert adjustment(
+        "failed.db", [(4, 1, 0.03), (1, 1, 0.03)]
+    ) == -1
+    assert adjustment(
+        "truncated.db", [(1, 0.03), (1, 0.03)], queue_size=4
+    ) == -1
+    assert adjustment(
+        "late.db", [(0, 0.12), (0, 0.12)], played_at_base=2 * 86_400
+    ) == 0
+    assert adjustment(
+        "before-selection.db",
+        [(0, 0.12), (0, 0.12)],
+        played_at_base=4 * 3_600 + 1,
+        session_created_at=5 * 3_600,
+    ) == 0

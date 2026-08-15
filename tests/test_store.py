@@ -11,7 +11,7 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
     path = tmp_path / "assistant.db"
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         tables = {
             row[0]
             for row in conn.execute(
@@ -50,6 +50,15 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
             "selected_gauge_kind",
         }.issubset(play_columns)
         assert {"gauge", "gauge_source"}.isdisjoint(play_columns)
+        table_source_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(table_sources)")
+        }
+        assert {"entry_count", "matched_count"}.issubset(table_source_columns)
+        pattern_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(chart_pattern_features)")
+        }
+        assert {"grid_bpm", "stream_sec", "last_kill"}.issubset(pattern_columns)
         store.migrate(conn)
         assert conn.execute("SELECT count(*) FROM schema_version").fetchone()[0] == 1
     finally:
@@ -97,7 +106,7 @@ def test_init_migrates_v2_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_imports'"
@@ -121,7 +130,7 @@ def test_init_migrates_v3_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='replay_metadata'"
@@ -145,7 +154,7 @@ def test_init_migrates_v4_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_targets'"
@@ -171,11 +180,71 @@ def test_init_migrates_v5_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE type='table' AND name='chart_pattern_features'"
         ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_init_migrates_v6_table_coverage_columns(tmp_path) -> None:
+    path = tmp_path / "assistant.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            store.SCHEMA_V2 + store.SCHEMA_V3 + store.SCHEMA_V4
+            + store.SCHEMA_V5 + store.SCHEMA_V6
+        )
+        conn.execute("INSERT INTO schema_version VALUES (6)")
+        conn.execute(
+            "INSERT INTO table_sources(table_id, page_url) VALUES ('satellite', 'url')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = store.init(path)
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(table_sources)")}
+        assert {"entry_count", "matched_count"}.issubset(columns)
+        assert conn.execute(
+            "SELECT page_url FROM table_sources WHERE table_id='satellite'"
+        ).fetchone()[0] == "url"
+    finally:
+        conn.close()
+
+
+def test_init_migrates_v7_pattern_safety_columns_additively(tmp_path) -> None:
+    path = tmp_path / "assistant.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            store.SCHEMA_V2 + store.SCHEMA_V3 + store.SCHEMA_V4
+            + store.SCHEMA_V5 + store.SCHEMA_V6 + store.SCHEMA_V7
+        )
+        conn.execute("INSERT INTO schema_version VALUES (7)")
+        conn.execute(
+            "INSERT INTO chart_pattern_features(sha256) VALUES (?)",
+            ("a" * 64,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = store.init(path)
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(chart_pattern_features)")
+        }
+        assert {"grid_bpm", "stream_sec", "last_kill"}.issubset(columns)
+        assert conn.execute(
+            "SELECT sha256 FROM chart_pattern_features"
+        ).fetchone()[0] == "a" * 64
     finally:
         conn.close()

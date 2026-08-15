@@ -239,6 +239,9 @@ def _create_songdata(path: Path) -> None:
               chord_ge3 REAL,
               micro_rate REAL,
               long_jack_rate REAL,
+              grid_bpm REAL,
+              stream_sec REAL,
+              last_kill REAL,
               practice_low INTEGER,
               analysis_version INTEGER,
               error TEXT
@@ -246,10 +249,17 @@ def _create_songdata(path: Path) -> None:
             """
         )
         conn.executemany(
-            "INSERT INTO bmscf_chart_analysis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bmscf_chart_analysis VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                ("1" * 64, 2, 1.4, 0.12, 0.08, 0.02, 1, 3, None),
-                ("2" * 64, None, None, None, None, None, None, 3, "parse error"),
+                (
+                    "1" * 64, 2, 1.4, 0.12, 0.08, 0.02,
+                    176.0, 14.0, 1.1, 1, 3, None,
+                ),
+                (
+                    "2" * 64, None, None, None, None, None,
+                    None, None, None, None, 3, "parse error",
+                ),
             ],
         )
         conn.commit()

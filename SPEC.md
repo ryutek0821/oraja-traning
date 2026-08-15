@@ -317,7 +317,7 @@ CREATE TABLE experiment_sessions (...); -- session arm、候補hash、選択確�
 CREATE TABLE experiment_targets (...);  -- retention/transfer × 1/3/7/14日
 ```
 
-**`schema_version` は 5**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブルを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 8**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxyを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 
@@ -484,4 +484,4 @@ v1が推定するのは `P(今クリアできる)` であって `E(この譜面�
 
 - UI・README に「**学習効果はヒューリスティック、成功確率のみ統計モデル**」と明記する
 - v1は「表別レベル＋粗い負荷特性による多様化推薦」。**「多次元弱点推定」を名乗るのは A-7 のゲートを通った軸が増えてから**
-- 1秒集計では「16分乱打と高密度同時押し」「隣接トリルと左右交互」「微縦連と通常乱打」を区別できない。乱打・縦連・トリルの軸は oraja-constellator の `bmscf_chart_analysis`（`micro_rate` / `long_jack_rate` / `avg_chord` / `rhythm_family`）を A-7 のゲートで評価して取り込む
+- 1秒集計では「16分乱打と高密度同時押し」「隣接トリルと左右交互」「微縦連と通常乱打」を区別できない。WARMUP安全判定では oraja-constellator の `bmscf_chart_analysis`（`micro_rate` / `long_jack_rate` / `avg_chord` / `grid_bpm` / `stream_sec` / `last_kill`）を取り込む。`grid_bpm`は高速交互の保守的proxyであり、レーン列を見たトリル判定とは名乗らない
