@@ -53,13 +53,31 @@ jobs:
         with:
           name: cloudflare-sbom
           path: cloudflare/artifacts/cloudflare-sbom.json
-      - if: ${{ hashFiles('cloudflare/container/Dockerfile') != '' }}
+      - name: Detect preview deploy inputs
+        id: preview_inputs
+        run: |
+          if [ -f container/Dockerfile ] && [ -d web/public ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Preview deploy dry-run is deferred until the Container and Web artifacts exist."
+          fi
+      - if: steps.preview_inputs.outputs.ready == 'true'
         run: npm run deploy:preview:dry
 
   container:
-    if: ${{ hashFiles('cloudflare/container/Dockerfile') != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: npm --prefix cloudflare run container:build
+      - name: Detect Container build input
+        id: container_input
+        run: |
+          if [ -f cloudflare/container/Dockerfile ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Container build is deferred until its owning feature adds a Dockerfile."
+          fi
+      - if: steps.container_input.outputs.ready == 'true'
+        run: npm --prefix cloudflare run container:build
