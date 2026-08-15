@@ -112,6 +112,7 @@ class TableFrontier:
 @dataclass(frozen=True, slots=True)
 class Candidate:
     sha256: str
+    mode: int
     md5: str | None
     title: str
     artist: str
@@ -147,6 +148,7 @@ class Candidate:
 class MenuItem:
     sequence: int
     sha256: str
+    mode: int
     md5: str | None
     title: str
     artist: str
@@ -538,6 +540,7 @@ def _load_candidates(
         candidates.append(
             Candidate(
                 sha256=str(row["sha256"]),
+                mode=int(row.get("mode") or 0),
                 md5=None if row["md5"] is None else str(row["md5"]),
                 title=str(row["title"] or "UNKNOWN"),
                 artist=str(row["artist"] or "UNKNOWN"),
@@ -627,6 +630,7 @@ def _to_item(
     return MenuItem(
         sequence=0,
         sha256=candidate.sha256,
+        mode=candidate.mode,
         md5=candidate.md5,
         title=candidate.title,
         artist=candidate.artist,

@@ -130,7 +130,10 @@ def _parser() -> argparse.ArgumentParser:
     experiment_start.add_argument("--days", type=int, default=14)
     experiment_start.add_argument("--min-samples-per-arm", type=int, default=20)
 
-    experiment_assign = experiment_commands.add_parser("assign")
+    experiment_assign = experiment_commands.add_parser(
+        "assign",
+        help="assign one arm and reserve a distinct transfer chart per interval",
+    )
     experiment_assign.add_argument("--assistant-db", type=Path, default=Path("assistant.db"))
     experiment_assign.add_argument("--experiment-id", type=int, required=True)
     experiment_assign.add_argument("--session-key", required=True)
@@ -140,7 +143,9 @@ def _parser() -> argparse.ArgumentParser:
         help="optional JSON candidate sets; defaults to the latest Daily Menu",
     )
 
-    experiment_candidates = experiment_commands.add_parser("candidates")
+    experiment_candidates = experiment_commands.add_parser(
+        "candidates", help="show the auditable arm and eligible transfer pools"
+    )
     experiment_candidates.add_argument(
         "--assistant-db", type=Path, default=Path("assistant.db")
     )
@@ -152,7 +157,9 @@ def _parser() -> argparse.ArgumentParser:
     experiment_resolve.add_argument("--experiment-id", type=int, required=True)
     experiment_resolve.add_argument("--now", type=int, default=None)
 
-    experiment_targets = experiment_commands.add_parser("targets")
+    experiment_targets = experiment_commands.add_parser(
+        "targets", help="show exact chart modes, probabilities, and play windows"
+    )
     experiment_targets.add_argument(
         "--assistant-db", type=Path, default=Path("assistant.db")
     )

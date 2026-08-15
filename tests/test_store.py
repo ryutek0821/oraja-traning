@@ -11,7 +11,7 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
     path = tmp_path / "assistant.db"
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         tables = {
             row[0]
             for row in conn.execute(
@@ -51,6 +51,10 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
             "selected_gauge_kind",
         }.issubset(play_columns)
         assert {"gauge", "gauge_source"}.isdisjoint(play_columns)
+        experiment_session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(experiment_sessions)")
+        }
+        assert "input_candidate_hash" in experiment_session_columns
         table_source_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(table_sources)")
         }
@@ -107,7 +111,7 @@ def test_init_migrates_v2_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_imports'"
@@ -131,7 +135,7 @@ def test_init_migrates_v3_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='replay_metadata'"
@@ -155,7 +159,7 @@ def test_init_migrates_v4_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_targets'"
@@ -175,18 +179,55 @@ def test_init_migrates_v5_additively(tmp_path) -> None:
         conn.execute(
             "INSERT INTO sessions(created_at, arm, slots_json) VALUES (1, 'A', '[]')"
         )
+        conn.execute(
+            """
+            INSERT INTO experiments(
+              id, name, seed, starts_at, ends_at, min_samples_per_arm, created_at
+            ) VALUES (1, 'legacy', 'seed', 1, 100, 1, 1)
+            """
+        )
+        sha256 = "1" * 64
+        conn.execute(
+            """
+            INSERT INTO experiment_sessions(
+              id, experiment_id, session_key, session_at, arm, arm_probability,
+              selection_probability, candidate_hash, candidates_json,
+              selected_sha256, selected_mode, selected_p_pred,
+              transfer_sha256, transfer_mode, transfer_p_pred, assigned_at
+            ) VALUES (1, 1, 'legacy', 2, 'coach', 0.5, 0.5, 'hash', '{}',
+                      ?, 1, 0.5, ?, 1, 0.5, 2)
+            """,
+            (sha256, sha256),
+        )
+        conn.execute(
+            """
+            INSERT INTO experiment_targets(
+              session_id, target_kind, interval_days, sha256, mode,
+              due_at, window_closes_at, p_pred
+            ) VALUES (1, 'transfer', 3, ?, 1, 10, 20, 0.5)
+            """,
+            (sha256,),
+        )
         conn.commit()
     finally:
         conn.close()
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE type='table' AND name='chart_pattern_features'"
         ).fetchone()
+        assert tuple(
+            conn.execute(
+                "SELECT sha256, mode, interval_days FROM experiment_targets"
+            ).fetchone()
+        ) == ("1" * 64, 1, 3)
+        assert conn.execute(
+            "SELECT input_candidate_hash FROM experiment_sessions"
+        ).fetchone()[0] == "hash"
     finally:
         conn.close()
 
@@ -209,7 +250,7 @@ def test_init_migrates_v6_table_coverage_columns(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         columns = {row[1] for row in conn.execute("PRAGMA table_info(table_sources)")}
         assert {"entry_count", "matched_count"}.issubset(columns)
         assert conn.execute(
@@ -238,7 +279,7 @@ def test_init_migrates_v7_pattern_safety_columns_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(chart_pattern_features)")
@@ -274,7 +315,7 @@ def test_init_migrates_v8_replay_scan_state_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         assert conn.execute(
             "SELECT path FROM replay_metadata"
         ).fetchone()[0] == "slot.brd"
@@ -282,5 +323,61 @@ def test_init_migrates_v8_replay_scan_state_additively(tmp_path) -> None:
             "SELECT 1 FROM sqlite_master "
             "WHERE type='table' AND name='replay_scan_state'"
         ).fetchone()
+        assert "input_candidate_hash" in {
+            row[1] for row in conn.execute("PRAGMA table_info(experiment_sessions)")
+        }
+    finally:
+        conn.close()
+
+
+def test_init_migrates_v9_experiment_input_hash_additively(tmp_path) -> None:
+    path = tmp_path / "assistant.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            store.SCHEMA_V2 + store.SCHEMA_V3 + store.SCHEMA_V4
+            + store.SCHEMA_V5 + store.SCHEMA_V6 + store.SCHEMA_V7
+            + store.SCHEMA_V8 + store.SCHEMA_V9
+        )
+        conn.execute("INSERT INTO schema_version VALUES (9)")
+        conn.execute(
+            """
+            INSERT INTO experiments(
+              id, name, seed, starts_at, ends_at, min_samples_per_arm, created_at
+            ) VALUES (1, 'legacy-v9', 'seed', 1, 100, 1, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO experiment_sessions(
+              id, experiment_id, session_key, session_at, arm, arm_probability,
+              selection_probability, candidate_hash, candidates_json,
+              selected_sha256, selected_mode, selected_p_pred,
+              transfer_sha256, transfer_mode, transfer_p_pred, assigned_at
+            ) VALUES (1, 1, 'legacy-v9', 2, 'coach', 0.5, 0.5,
+                      'effective-hash', '{}', ?, 1, 0.5, ?, 1, 0.5, 2)
+            """,
+            ("1" * 64, "2" * 64),
+        )
+        conn.execute(
+            """
+            INSERT INTO replay_scan_state(
+              path, device, inode, mtime_ns, compressed_size, outcome, checked_at
+            ) VALUES ('slot.brd', 1, 2, 3, 4, 'valid', 5)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = store.init(path)
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute(
+            "SELECT input_candidate_hash FROM experiment_sessions"
+        ).fetchone()[0] == "effective-hash"
+        assert conn.execute(
+            "SELECT outcome FROM replay_scan_state WHERE path='slot.brd'"
+        ).fetchone()[0] == "valid"
     finally:
         conn.close()

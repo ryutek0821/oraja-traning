@@ -43,7 +43,7 @@ Shift_JIS/JavaScript旧形式をコード実行せず解析し、hashがない�
 一意な場合だけ照合します。照合数/全項目数は保存され、低照合率をメニュー警告へ出します。
 
 schema version 1の既存`assistant.db`は正しい値へ復元できないため、in-place移行しません。
-version 2以降は履歴を保持して段階的に移行します。現行schema versionは9です。
+version 2以降は履歴を保持して段階的に移行します。現行schema versionは10です。
 
 ## 毎日の更新
 
@@ -214,20 +214,26 @@ oraja-training experiment report --assistant-db ./assistant.db \
 ```
 
 候補は最新Daily MenuのFOCUSと、同じ表・レベル・既プレイ状態のrandom controlから自動生成します。
-同傾向・同レベルの未練習譜面をtransferとして予約し、`candidates`サブコマンドで割付前に確認できます。
+同傾向・同レベルの未練習譜面をtransfer候補poolとし、`candidates`サブコマンドで割付前に確認できます。
 手動指定する場合の`candidates.json`は重複しない`coach`、`control`、`transfer`の各配列を持ち、要素は
-`{"sha256":"…","mode":0,"p_pred":0.7}`です。候補集合hash、arm確率、譜面の
-selection probabilityを保存し、同じsession keyの再実行は同じ割付を返します。選曲した譜面の
-保持と未練習類似譜面への転移を1/3/7/14日後に評価します。過去playまたは同じ実験で予約済みの
-transfer候補は自動除外します。24時間の評価窓が閉じた時点でplayが一意な場合だけ解決し、
+`{"sha256":"…","mode":0,"p_pred":0.7}`です。`transfer`には最低4曲が必要です。候補集合hash、
+元入力hash、arm確率、譜面のselection probabilityを保存し、既プレイ・予約済み候補が入力に含まれても
+同じsession keyと元JSONの再実行は同じ割付を返します。割付時にpool全M曲から4曲を非復元抽出し、
+各intervalで特定の1曲が選ばれる周辺selection probabilityは`1/M`です。
+`assign`のJSONは互換用のday 1 `transfer`に加え、`transfers`へ1/3/7/14日と対応する4曲、mode、
+予測値、周辺selection probabilityを出します。選曲した譜面の保持と未練習類似譜面への転移を
+1/3/7/14日後に評価します。各transfer評価には別の未練習譜面を固定するため、day 1で初めて
+演奏した譜面をday 3以降の「未練習への転移」として再利用しません。過去playまたは同じ実験で予約済みの
+transfer候補は自動除外し、予約中のtransfer譜面は以後の通常Daily Menuにも出しません。
+24時間の評価窓が閉じた時点でplayが一意な場合だけ解決し、
 複数または別targetとの再利用は`duplicate`、未観測は`missing`として除外します。各armの事前最小標本数に達するまでは
 arm差とBrier差を`inconclusive`として出しません。書込み先は`assistant.db`だけです。
 
-割付セッションでは`selected`だけを練習し、`transfer`は翌日の最初の評価窓まで演奏しません。
-以後は`experiment targets`に表示された各24時間窓で、retentionとtransferをそれぞれ**1回だけ**
-演奏します。窓より前のプレイは評価されず、同じ窓で2回以上演奏するとそのtargetは`duplicate`に
-なるため、再挑戦は次の評価窓まで待ちます。`due_at_utc`から`window_closes_at_utc`までが
-対象期間です。
+割付セッションでは`selected`だけを練習し、各`transfers`譜面は割り当てられた評価窓まで演奏しません。
+以後は`experiment targets`に表示された各24時間窓で、retentionとその日のtransferをそれぞれ**1回だけ**
+演奏します。transferを指定窓より前に演奏した場合や同じ窓で2回以上演奏した場合、そのtargetは
+`duplicate`として解析から除外されるため、早取りや再挑戦はしません。`due_at_utc`から`window_closes_at_utc`までが
+対象期間です。既存schema v5の単一transfer割付は書き換えず、同じsession keyの再実行でも元のtargetを返します。
 
 ### Codexでの日次・定期レビュー
 

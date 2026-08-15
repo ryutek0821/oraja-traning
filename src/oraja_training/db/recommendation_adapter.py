@@ -25,7 +25,7 @@ WITH ranked_state AS (
          row_number() OVER (
            PARTITION BY sha256 ORDER BY played_at DESC, mode ASC
          ) AS rn
-  FROM score_state WHERE mode IN (0, 1)
+  FROM score_state WHERE mode IN (0, 1, 2)
 ), recent_events AS (
   SELECT p.*,
          row_number() OVER (
@@ -34,7 +34,7 @@ WITH ranked_state AS (
                     p.ingested_at DESC, p.id DESC
          ) AS semantic_rank
   FROM plays AS p
-  WHERE p.mode IN (0, 1) AND p.is_course = 0
+  WHERE p.mode IN (0, 1, 2) AND p.is_course = 0
     AND p.source IN ('collector', 'daily_snapshot')
 ), recent_ranked AS (
   SELECT p.*,
@@ -58,6 +58,7 @@ WITH ranked_state AS (
 )
 SELECT c.sha256, c.md5, c.title, c.artist, c.notes,
        te.table_id, te.level,
+       COALESCE(s.mode, 0) mode,
        COALESCE(s.clear, 0) clear,
        COALESCE(s.playcount, 0) playcount,
        COALESCE(s.played_at, 0) last_played,
@@ -85,6 +86,11 @@ LEFT JOIN recent_summary r ON r.sha256 = c.sha256
 LEFT JOIN chart_features f ON f.sha256 = c.sha256
 LEFT JOIN chart_pattern_features pf ON pf.sha256 = c.sha256
 WHERE c.song_mode = 7 AND c.notes > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM experiment_targets target
+    WHERE target.target_kind = 'transfer' AND target.status = 'pending'
+      AND target.sha256 = c.sha256
+  )
 ORDER BY c.sha256,
   CASE te.table_id
     WHEN 'genocide' THEN 0 WHEN 'overjoy' THEN 1

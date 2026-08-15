@@ -321,7 +321,7 @@ CREATE TABLE experiment_sessions (...); -- session arm、候補hash、選択確�
 CREATE TABLE experiment_targets (...);  -- retention/transfer × 1/3/7/14日
 ```
 
-**`schema_version` は 8**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxyを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 10**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxy、version 9でReplay走査状態、version 10で実験の元候補hashを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POORを含めており、`ems`/`lms`を保存していないため**正しい値を復元できない**。version 1の`assistant.db`を開いたら、黙って読まずに「削除してbackfillをやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 
@@ -466,9 +466,9 @@ RESERVE 10k を別に提示する。focus譜面は3枠離して再試行し、�
 ### A-8.1 自己実験
 
 - `seed + session_key`のSHA-256からarmを50/50で決め、session内でarmを混在させない。
-- coach/controlは重複しない候補集合から一様抽出し、正規化候補JSONのSHA-256、arm確率、周辺selection probabilityを保存する。同じ実験で既に選曲・予約した譜面は以後の候補から除外する。
-- 選曲譜面をretention、session開始前に未練習かつ別指定の類似譜面をtransferとして、session時刻の1/3/7/14日後から24時間を評価窓にする。
-- 評価窓が閉じるまでは確定せず、窓全体で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は`missing`、複数件または同じplayの再利用は`duplicate`とし、期限外playは採用しない。
+- coach/controlは重複しない候補集合から一様抽出し、元入力hash、予約除外後の正規化候補JSONとSHA-256、arm確率、周辺selection probabilityを保存する。予約確認からtarget INSERTまでは単一writer transactionとし、同じ実験で既に選曲・予約した譜面は以後の候補と通常Daily Menuから除外する。
+- 選曲譜面をretentionとし、session開始前に未練習かつ別指定の類似譜面pool全M曲を保存する。そこから4曲を非復元抽出して1/3/7/14日後の各24時間窓へ別々に固定し、各intervalの周辺selection probabilityを`1/M`として再現可能にする。先の窓で演奏済みになった譜面を後の未練習transferへ再利用しない。
+- 評価窓が閉じるまでは確定せず、窓全体で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は`missing`、複数件、同じplayの再利用、またはtransferの指定窓より前のplayは`duplicate`として解析から除外する。
 - arm別の成功率とBrierをtarget種別・間隔ごとに出す。両armが事前設定した最小標本数へ達するまで差は`inconclusive`とする。
 - すべての実験書込みはassistant-owned schema v5だけへ行い、beatoraja入力DBへ書かない。
 
