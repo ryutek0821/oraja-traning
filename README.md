@@ -132,6 +132,24 @@ oraja-training serve \
   --progress-token-file ./runtime/progress-token.txt
 ```
 
+Macへのログイン後もサーバーを常駐・自動復旧させる場合は、ユーザーLaunchAgentを登録します。
+installerは設定hostがこのMacの`tailscale ip -4`または`tailscale ip -6`と一致しない場合、
+tokenファイルが現在ユーザー所有かつgroup/otherから読めない状態でない場合に登録を拒否します。
+plistにはtokenのパスだけを保存し、token値は保存しません。
+
+```console
+./scripts/install-progress-server-launch-agent.sh --host 100.118.150.23
+```
+
+このLaunchAgentはログイン時に起動し、異常終了後は30秒以上の間隔を置いて再起動します。
+ログは`runtime/progress-server.log`です。以前に同じlabelを`launchctl submit`で起動していた
+場合は、このprogress serverだと確認できたジョブだけを停止して置き換えます。解除対象も
+`com.ryutek.oraja-training.progress-server`だけです。
+
+```console
+./scripts/install-progress-server-launch-agent.sh --uninstall
+```
+
 RYU-DESKTOP2では、実際に使用しているplayerの`score.db`を指定して送信します。
 
 ```powershell
@@ -142,7 +160,8 @@ RYU-DESKTOP2では、実際に使用しているplayerの`score.db`を指定し�
 
 送信ツールはDBを読み取り専用で5秒ごとに確認し、値が変化した時と30秒ごとのheartbeatで
 送信します。同じ累積値を再送しても二重加算されず、古い観測値やカウンター巻き戻りは
-Mac側で拒否されます。90秒受信がなければTOPページを`STALE`表示にします。
+Mac側で拒否されます。90秒受信がなければTOPページを`STALE`表示にします。WindowsとMacの
+時計が90秒を超えてずれていても受信が続く間は`STALE`にせず、時刻ずれを`WARN`表示します。
 
 ログオン中に状態を確認する場合はTkinterモニターを使います。`score.db`を省略するとGUIの
 「参照」から選択でき、選択したDB、Mac URL、tokenファイルの**パスだけ**を
