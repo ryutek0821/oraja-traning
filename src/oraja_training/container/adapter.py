@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import sqlite3
 import tarfile
@@ -35,7 +36,7 @@ from oraja_training.db.model_adapter import (
     SQLiteUnitOfWork,
 )
 from oraja_training.db.recommendation_adapter import SQLiteRecommendationRepository
-from oraja_training.domain import ProfileContext, RecommendationInput
+from oraja_training.domain import ProfileContext, ProfileSettings, RecommendationInput
 from oraja_training.features import build_from_repository
 from oraja_training.model import FitResult, fit_from_port
 from oraja_training.plan import (
@@ -43,6 +44,7 @@ from oraja_training.plan import (
     build_session_from_input,
     build_session_from_repository,
     recommendation_output,
+    table_payloads,
 )
 
 from .manifest import (
@@ -503,6 +505,73 @@ def _json_artifact(value: Any, *, limits: JobLimits) -> bytes:
     return content
 
 
+def _table_settings(context: Mapping[str, Any] | None) -> ProfileSettings | None:
+    if context is None:
+        return None
+    settings = context.get("settings")
+    if not isinstance(settings, Mapping):
+        raise ContainerError("table settings are missing", code="table_input_unavailable", status=422)
+    try:
+        revision = int(context.get("settings_revision", 0))
+        if revision < 1:
+            raise ValueError
+        parsed = ProfileSettings(
+            timezone=str(settings["timezone"]),
+            target_judged=int(settings["target_judged"]),
+            reserve_judged=int(settings["reserve_judged"]),
+            readiness=str(settings["readiness"]),
+        )
+        if not 10_000 <= parsed.target_judged <= 1_000_000:
+            raise ValueError
+        if not 0 <= parsed.reserve_judged <= min(500_000, parsed.target_judged):
+            raise ValueError
+        return parsed
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContainerError("table settings are invalid", code="invalid_contract", status=422) from exc
+
+
+def _seed_table_catalog(
+    connection: sqlite3.Connection,
+    context: Mapping[str, Any],
+    fetched_at: int,
+) -> None:
+    rows = context.get("catalog_entries")
+    manifest_hash = context.get("catalog_manifest_sha256")
+    if (
+        not isinstance(rows, list)
+        or not 1 <= len(rows) <= 20_000
+        or not isinstance(manifest_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+    ):
+        raise ContainerError("table catalog is unavailable", code="table_input_unavailable", status=422)
+    if hashlib.sha256(canonical_json(rows).encode("utf-8")).hexdigest() != manifest_hash:
+        raise ContainerError("table catalog digest is invalid", code="invalid_contract", status=422)
+    accepted: list[tuple[str, str, str, str | None, str, int]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ContainerError("table catalog is invalid", code="invalid_contract", status=422)
+        table_id = row.get("table_id")
+        level = row.get("level")
+        sha256 = row.get("sha256")
+        md5 = row.get("md5")
+        title = row.get("title")
+        if (
+            not isinstance(table_id, str) or not 1 <= len(table_id) <= 64
+            or not isinstance(level, str) or not 1 <= len(level) <= 64
+            or not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or (md5 is not None and (not isinstance(md5, str) or re.fullmatch(r"[0-9a-f]{32}", md5) is None))
+            or not isinstance(title, str) or len(title) > 512
+        ):
+            raise ContainerError("table catalog is invalid", code="invalid_contract", status=422)
+        accepted.append((table_id, level, sha256, md5, title, fetched_at))
+    with connection:
+        connection.execute("DELETE FROM table_entries")
+        connection.executemany(
+            "INSERT INTO table_entries(table_id, level, sha256, md5, title, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
+            accepted,
+        )
+
+
 class ContainerAdapter:
     """Run one validated input manifest in an isolated temporary workspace."""
 
@@ -543,6 +612,7 @@ class ContainerAdapter:
         readiness: str = "normal",
         recommendation_input: RecommendationInput | None = None,
         recommendation_repository: Any | None = None,
+        table_context: Mapping[str, Any] | None = None,
         revision: int = 1,
         generated_at: str | None = None,
         cancellation: CancellationToken | None = None,
@@ -567,13 +637,19 @@ class ContainerAdapter:
                 or manifest_sha256(accepted_upload) != input_manifest["source_manifest_sha256"]
             ):
                 raise ContainerError("input is not bound to the accepted upload", code="invalid_contract", status=422)
-        if menu_date is None:
-            menu_date = input_manifest["requested_at"][:10]
-        rendered_menu_date = menu_date.isoformat() if isinstance(menu_date, date) else str(menu_date)
+        rendered_menu_date = (
+            None
+            if menu_date is None
+            else menu_date.isoformat() if isinstance(menu_date, date) else str(menu_date)
+        )
+        if table_context is not None and table_context.get("profile_id") != input_manifest.profile_id:
+            raise ContainerError("table context crosses profile partition", code="invalid_contract", status=422)
+        settings = _table_settings(table_context)
         profile = ProfileContext(
             profile_id=input_manifest.profile_id,
-            display_name=profile_display_name,
-            timezone=timezone_name,
+            display_name=str(table_context.get("display_name", profile_display_name)) if table_context else profile_display_name,
+            timezone=settings.timezone if settings else timezone_name,
+            settings=settings,
         )
         if recommendation_input is not None and recommendation_input.profile.profile_id != profile.profile_id:
             raise ContainerError("recommendation input crosses profile partition", code="invalid_contract", status=422)
@@ -603,7 +679,7 @@ class ContainerAdapter:
             )
             if assistant_path in _source_paths(source_dir):
                 raise ContainerError("assistant database crosses source partition", code="invalid_contract", status=422)
-            fit_result, recommendation = self._run_core(
+            fit_result, recommendation, rendered_tables = self._run_core(
                 input_manifest,
                 source_dir=source_dir,
                 assistant_path=assistant_path,
@@ -612,6 +688,7 @@ class ContainerAdapter:
                 readiness=readiness,
                 recommendation_input=recommendation_input,
                 recommendation_repository=recommendation_repository,
+                table_context=table_context,
                 entrypoint=entrypoint,
                 token=token,
                 started=started,
@@ -620,13 +697,15 @@ class ContainerAdapter:
             if _source_signatures(source_dir) != source_signals:
                 raise InputIntegrityError()
             counters = self._read_counters(assistant_path)
-            records = self._artifact_payloads(assistant_path, fit_result, counters)
+            records = self._artifact_payloads(
+                assistant_path, fit_result, counters, rendered_tables
+            )
             artifact_records: list[ArtifactRecord] = []
-            for kind, payload in records.items():
+            for kind, relative_name, payload in records:
                 token.check()
                 key = (
                     f"profiles/{input_manifest.profile_id}/jobs/{input_manifest.job_id}/"
-                    f"revisions/{revision}/{kind}.json"
+                    f"revisions/{revision}/{relative_name}"
                 )
                 content = _json_artifact(payload, limits=self.limits)
                 stored = self.artifact_store.put(key, content, content_type="application/json")
@@ -762,14 +841,15 @@ class ContainerAdapter:
         source_dir: Path,
         assistant_path: Path,
         profile: ProfileContext,
-        menu_date: str,
+        menu_date: str | None,
         readiness: str,
         recommendation_input: RecommendationInput | None,
         recommendation_repository: Any | None,
+        table_context: Mapping[str, Any] | None,
         entrypoint: str,
         token: CancellationToken,
         started: float,
-    ) -> tuple[FitResult, Any | None]:
+    ) -> tuple[FitResult, Any, dict[str, Any]]:
         try:
             if entrypoint == "five_db_backfill":
                 backfill.run(source_dir, assistant_path, clock=self.clock)
@@ -791,7 +871,11 @@ class ContainerAdapter:
                     unit_of_work=SQLiteUnitOfWork(assistant),
                     trained_at=int(self.clock()),
                 )
+                if table_context is not None:
+                    _seed_table_catalog(assistant, table_context, int(self.clock()))
+                    recommendation_repository = SQLiteRecommendationRepository(assistant)
                 recommendation: Any | None = None
+                session: Any | None = None
                 if recommendation_input is not None:
                     session = build_session_from_input(
                         recommendation_input,
@@ -809,15 +893,23 @@ class ContainerAdapter:
                         clock=self.clock,
                     )
                     recommendation = recommendation_output(session)
-            return fit_result, recommendation
+            if recommendation is None or session is None:
+                raise ContainerError(
+                    "table catalog and profile settings are required",
+                    code="table_input_unavailable",
+                    retryable=False,
+                    status=422,
+                )
+            return fit_result, recommendation, table_payloads(session)
         except (ContainerError, ManifestError):
             raise
-        except MenuBuildError:
-            # A profile without a refreshed difficulty-table snapshot can
-            # still complete normalization/model work.  The publisher can
-            # retry the recommendation phase after the profile snapshot is
-            # available, without discarding the derived artifacts.
-            return fit_result if "fit_result" in locals() else FitResult("collecting", 0, 0), None
+        except MenuBuildError as exc:
+            raise ContainerError(
+                "table input cannot produce a bounded recommendation",
+                code="table_input_unavailable",
+                retryable=False,
+                status=422,
+            ) from exc
         except (sqlite3.DatabaseError, readers.ReaderSchemaError, OSError) as exc:
             raise InputIntegrityError() from exc
 
@@ -840,7 +932,8 @@ class ContainerAdapter:
         assistant_path: Path,
         fit_result: FitResult,
         counters: Mapping[str, int],
-    ) -> dict[str, Any]:
+        rendered_tables: Mapping[str, Any],
+    ) -> list[tuple[str, str, Any]]:
         conn = store.init(assistant_path)
         try:
             play_columns = (
@@ -881,26 +974,37 @@ class ContainerAdapter:
                 "model": _model_dict(model),
                 "raw_db_exported": False,
             }
-            return {
-                "normalized_events": {
+            records: list[tuple[str, str, Any]] = [
+                ("normalized_events", "normalized_events.json", {
                     "contract": "container-artifact",
                     "schema_version": "1",
                     "kind": "normalized_events",
                     "counters": dict(counters),
                     "events": plays,
-                },
-                "feature_input": {
+                }),
+                ("feature_input", "feature_input.json", {
                     "contract": "container-artifact",
                     "schema_version": "1",
                     "kind": "feature_input",
                     "features": features,
-                },
-                "model_input": {
+                }),
+                ("model_input", "model_input.json", {
                     "contract": "container-artifact",
                     "schema_version": "1",
                     "kind": "model_input",
                     "model": model_payload,
-                },
+                }),
+            ]
+            table_kinds = {
+                "table/recommend/header.json": "recommend_header",
+                "table/recommend/score.json": "recommend_score",
+                "table/today/header.json": "daily_menu_header",
+                "table/today/score.json": "daily_menu_score",
             }
+            for relative_name, kind in table_kinds.items():
+                if relative_name not in rendered_tables:
+                    raise ContainerError("table renderer omitted an artifact", code="invalid_contract", status=422)
+                records.append((kind, relative_name, rendered_tables[relative_name]))
+            return records
         finally:
             conn.close()

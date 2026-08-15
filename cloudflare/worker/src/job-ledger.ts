@@ -79,6 +79,12 @@ export type LatestPointerView = {
   updatedAt: number;
 };
 
+export type PublishedTable = {
+  kind: "recommend" | "today";
+  contentHash: string;
+  headerObjectKey: string;
+};
+
 export type JobStatusView = JobEnvelope & {
   status: JobStatus;
   createdAt: number;
@@ -737,6 +743,7 @@ export class D1JobLedger {
     job: JobEnvelope,
     manifestSha256: string,
     artifactKey?: string | null,
+    tables: readonly PublishedTable[] = [],
   ): Promise<{ published: boolean; pointer: LatestPointerView }> {
     if (!isSha256(manifestSha256)) {
       throw new JobLedgerError("invalid_manifest_digest", 400, false);
@@ -755,6 +762,52 @@ export class D1JobLedger {
       job.revision,
     ).first<{ id: string }>();
     if (!revision) throw new JobLedgerError("revision_not_found", 409, false);
+
+    if (tables.length !== 0 && (tables.length !== 2 || new Set(tables.map((table) => table.kind)).size !== 2)) {
+      throw new JobLedgerError("table_artifact_set_invalid", 400, false);
+    }
+    const tableStatements: D1PreparedStatement[] = [];
+    for (const table of tables) {
+      if (!isSha256(table.contentHash)
+        || !table.headerObjectKey.startsWith(`profiles/${job.profileId}/jobs/${job.jobId}/revisions/${job.revision}/table/${table.kind}/`)
+        || !table.headerObjectKey.endsWith("/header.json")) {
+        throw new JobLedgerError("table_artifact_invalid", 400, false);
+      }
+      const existing = await this.db.prepare(
+        `SELECT content_hash, object_key FROM artifact_revisions
+          WHERE account_id = ?1 AND profile_id = ?2 AND table_kind = ?3 AND revision = ?4`,
+      ).bind(job.accountId, job.profileId, table.kind, job.revision).first<{ content_hash: string; object_key: string }>();
+      if (existing && (existing.content_hash !== table.contentHash || existing.object_key !== table.headerObjectKey)) {
+        throw new JobLedgerError("table_artifact_immutable_conflict", 409, false);
+      }
+      const latest = await this.db.prepare(
+        `SELECT revision FROM artifact_latest
+          WHERE account_id = ?1 AND profile_id = ?2 AND table_kind = ?3`,
+      ).bind(job.accountId, job.profileId, table.kind).first<{ revision: number }>();
+      const previous = latest && numberValue(latest.revision) < job.revision ? numberValue(latest.revision) : 0;
+      tableStatements.push(
+        this.db.prepare(
+          `INSERT OR IGNORE INTO artifact_revisions(
+             id, account_id, profile_id, revision, table_kind, content_hash,
+             object_key, previous_revision, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+        ).bind(this.idFactory(), job.accountId, job.profileId, job.revision, table.kind,
+          table.contentHash, table.headerObjectKey, previous, this.clock()),
+        this.db.prepare(
+          `INSERT INTO artifact_latest(
+             account_id, profile_id, table_kind, revision, content_hash, object_key, updated_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(profile_id, table_kind) DO UPDATE SET
+             account_id = excluded.account_id,
+             revision = excluded.revision,
+             content_hash = excluded.content_hash,
+             object_key = excluded.object_key,
+             updated_at = excluded.updated_at
+           WHERE excluded.revision > artifact_latest.revision`,
+        ).bind(job.accountId, job.profileId, table.kind, job.revision,
+          table.contentHash, table.headerObjectKey, this.clock()),
+      );
+    }
 
     const now = this.clock();
     const results = await this.db.batch([
@@ -801,6 +854,7 @@ export class D1JobLedger {
         now,
         manifestSha256,
       ),
+      ...tableStatements,
     ]);
     const pointer = await this.db.prepare(
       `SELECT revision, revision_id, manifest_sha256, artifact_key, updated_at

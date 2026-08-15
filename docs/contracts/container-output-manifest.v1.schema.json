@@ -65,7 +65,7 @@
         "required": ["kind", "object_key", "sha256", "size_bytes", "content_type"],
         "properties": {
           "kind": {
-            "enum": ["normalized_events", "feature_input", "model_input"]
+            "enum": ["normalized_events", "feature_input", "model_input", "recommend_header", "recommend_score", "daily_menu_header", "daily_menu_score"]
           },
           "object_key": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/objectKey" },
           "sha256": { "$ref": "https://oraja-training.dev/contracts/common.schema.json#/$defs/sha256" },

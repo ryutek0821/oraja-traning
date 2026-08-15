@@ -9,9 +9,11 @@ import {
   JobLedgerError,
   sha256Hex,
   type JobEnvelope,
+  type PublishedTable,
 } from "./job-ledger";
 import {
   WORKFLOW_STEP_POLICIES,
+  canonicalJson,
   isTransientError,
   workflowInstanceId,
   type WorkflowStepName,
@@ -46,11 +48,13 @@ export type TablesOutput = {
   recommendationDigest: string;
   menuDigest: string;
   bridge: ContainerBridgeResult;
+  publications: PublishedTable[];
 };
 
 export type ArtifactOutput = {
   manifestSha256: string;
   artifactKey: string | null;
+  publications: PublishedTable[];
 };
 
 export type PublishOutput = {
@@ -155,10 +159,34 @@ function defaultActivities(env: WorkflowEnv, ledger: D1JobLedger): WorkflowActiv
     },
 
     async generateTables(job, input) {
+      const table = (kind: "recommend" | "today"): PublishedTable => {
+        const prefix = kind === "recommend" ? "recommend" : "daily_menu";
+        const header = input.bridge.tableArtifacts.find((artifact) => artifact.kind === `${prefix}_header`);
+        const score = input.bridge.tableArtifacts.find((artifact) => artifact.kind === `${prefix}_score`);
+        if (!header || !score || header.objectKey.replace(/header\.json$/, "") !== score.objectKey.replace(/score\.json$/, "")) {
+          throw new WorkflowActivityError("table_artifact_set_invalid", false);
+        }
+        return {
+          kind,
+          contentHash: "",
+          headerObjectKey: header.objectKey,
+          parts: [header.sha256, score.sha256],
+        } as PublishedTable & { parts: string[] };
+      };
+      const raw = [table("recommend"), table("today")] as Array<PublishedTable & { parts: string[] }>;
+      const publications: PublishedTable[] = [];
+      for (const item of raw) {
+        publications.push({
+          kind: item.kind,
+          headerObjectKey: item.headerObjectKey,
+          contentHash: await sha256Hex(canonicalJson({ kind: item.kind, parts: item.parts })),
+        });
+      }
       return {
-        recommendationDigest: await sha256Hex(`${job.profileId}:${job.revision}:recommendation:${input.modelDigest}`),
-        menuDigest: await sha256Hex(`${job.profileId}:${job.revision}:menu:${input.modelDigest}`),
+        recommendationDigest: publications.find((item) => item.kind === "recommend")!.contentHash,
+        menuDigest: publications.find((item) => item.kind === "today")!.contentHash,
         bridge: input.bridge,
+        publications,
       };
     },
 
@@ -170,11 +198,11 @@ function defaultActivities(env: WorkflowEnv, ledger: D1JobLedger): WorkflowActiv
         throw new WorkflowActivityError("artifact_manifest_missing", false);
       }
       const manifestSha256 = recordedDigest;
-      return { manifestSha256, artifactKey: input.bridge.artifactKey };
+      return { manifestSha256, artifactKey: input.bridge.artifactKey, publications: input.publications };
     },
 
     async publish(job, input) {
-      const result = await ledger.recordSuccessAndPublish(job, input.manifestSha256, input.artifactKey);
+      const result = await ledger.recordSuccessAndPublish(job, input.manifestSha256, input.artifactKey, input.publications);
       return {
         published: result.published,
         currentRevision: result.pointer.revision,

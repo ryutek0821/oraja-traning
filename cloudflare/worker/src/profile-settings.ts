@@ -13,6 +13,17 @@ type ProfileSettingsRow = {
   updated_at: number;
 };
 
+export type TableRegenerationSource = {
+  profileId: string;
+  settingsRevision: number;
+  sourceManifestSha256: string;
+  inputKey: string;
+  recommendObjectKey: string;
+  recommendScoreObjectKey: string;
+  todayObjectKey: string;
+  todayScoreObjectKey: string;
+};
+
 const DEFAULT_TARGET = 100_000;
 const DEFAULT_RESERVE = 10_000;
 
@@ -90,6 +101,12 @@ export async function updateProfileSettings(
     ? readiness(current.readiness ?? "normal")
     : readiness(input.readiness);
   if (nextReserve > nextTarget) throw new ApiError("invalid_reserve_judged", 400);
+  if (nextTimezone === current.timezone
+    && nextTarget === (current.target_judged ?? DEFAULT_TARGET)
+    && nextReserve === (current.reserve_judged ?? DEFAULT_RESERVE)
+    && nextReadiness === (current.readiness ?? "normal")) {
+    return publicSettings(current);
+  }
   await db.batch([
     db.prepare(
       `UPDATE profiles SET timezone = ?1, updated_at = ?2
@@ -116,6 +133,56 @@ export async function updateProfileSettings(
     ).bind(uuidV7(), accountId, current.profile_id, now),
   ]);
   return readProfileSettings(db, accountId);
+}
+
+export async function tableRegenerationSource(
+  db: D1Database,
+  accountId: string,
+): Promise<TableRegenerationSource | null> {
+  const row = await db.prepare(
+    `SELECT p.id AS profile_id, COALESCE(s.settings_revision, 1) AS settings_revision,
+            j.input_hash AS source_manifest_sha256, j.input_key,
+            recommend.object_key AS recommend_object_key,
+            today.object_key AS today_object_key
+       FROM profiles p
+       LEFT JOIN profile_settings s
+         ON s.account_id = p.account_id AND s.profile_id = p.id
+       JOIN artifact_latest recommend
+         ON recommend.account_id = p.account_id AND recommend.profile_id = p.id
+        AND recommend.table_kind = 'recommend'
+       JOIN artifact_latest today
+         ON today.account_id = p.account_id AND today.profile_id = p.id
+        AND today.table_kind = 'today'
+       JOIN jobs j
+         ON j.account_id = p.account_id AND j.profile_id = p.id
+        AND j.status = 'succeeded' AND j.job_kind IN ('initial', 'monthly', 'play')
+        AND j.input_key LIKE 'upload-session:%'
+      WHERE p.account_id = ?1 AND p.status = 'active'
+      ORDER BY j.finished_at DESC, j.created_at DESC
+      LIMIT 1`,
+  ).bind(accountId).first<Record<string, unknown>>();
+  if (!row
+    || typeof row.profile_id !== "string"
+    || typeof row.input_key !== "string"
+    || !/^upload-session:[0-9a-f-]{36}$/i.test(row.input_key)
+    || typeof row.source_manifest_sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(row.source_manifest_sha256)
+    || typeof row.recommend_object_key !== "string"
+    || !row.recommend_object_key.endsWith("/header.json")
+    || typeof row.today_object_key !== "string"
+    || !row.today_object_key.endsWith("/header.json")) return null;
+  const settingsRevision = Number(row.settings_revision);
+  if (!Number.isSafeInteger(settingsRevision) || settingsRevision < 1) return null;
+  return {
+    profileId: row.profile_id,
+    settingsRevision,
+    sourceManifestSha256: row.source_manifest_sha256,
+    inputKey: row.input_key,
+    recommendObjectKey: row.recommend_object_key,
+    recommendScoreObjectKey: row.recommend_object_key.replace(/header\.json$/, "score.json"),
+    todayObjectKey: row.today_object_key,
+    todayScoreObjectKey: row.today_object_key.replace(/header\.json$/, "score.json"),
+  };
 }
 
 function randomSecret(): string {
