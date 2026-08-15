@@ -473,7 +473,7 @@ Easy 78 / Normal 37 / Hard 99 / ExHard 22の計236行で、残る148行は不明
 
 - read-only reader、schema v4、backfill、content-diff Poller、静的2DB日次取込を実装済み
 - Replayはobject形式のGZIP JSONだけを制限付きで読み、`keyinput` を復号・保存しない。slot上書き履歴と未一致・曖昧・破損カウンタを保存する
-- `sha256 + mode + date` がただ1件のplayへ完全一致した場合だけ `selected_gauge_kind` を更新する
+- Replay日時以降30秒以内の `sha256 + mode` がただ1件のplayへ対応した場合だけ `selected_gauge_kind` を更新する
 - `initialize` / `daily-update` により入力DBへWAL等を書かず、SHA-256で同一提出を冪等化
 - 初期実測値は個人データ由来のため公開版から除外。再現可能な合成fixtureを回帰基準とする
 - legacy: max survival 1.0 / `survival>1` 0 / completed 368 / `judged=notes` 272/272

@@ -17,6 +17,8 @@ BEATORAJA_DB_NAMES = {
     "songdata.db",
     "songinfo.db",
 }
+REPLAY_MATCH_TOLERANCE_SECONDS = 30
+REPLAY_LN_MODES = frozenset({1, 2})
 
 
 SCHEMA_V2 = """
@@ -451,33 +453,78 @@ def ingest_replay_metadata(
     its score event arrives.
     """
 
+    def refresh_play_gauge(play_id: int) -> None:
+        replacement = conn.execute(
+            """
+            SELECT selected_gauge_kind FROM replay_metadata
+            WHERE match_status = 'matched' AND matched_play_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (play_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
+            (None if replacement is None else str(replacement[0]), play_id),
+        )
+
     path = str(metadata.path)
     existing = conn.execute(
-        "SELECT id, match_status FROM replay_metadata WHERE path = ? AND content_hash = ?",
+        """
+        SELECT id, match_status, matched_play_id FROM replay_metadata
+        WHERE path = ? AND content_hash = ?
+        """,
         (path, metadata.content_hash),
     ).fetchone()
-    matches = conn.execute(
-        """
-        SELECT id FROM plays
-        WHERE sha256 = ? AND mode = ? AND played_at = ? AND is_course = 0
-        ORDER BY id
-        LIMIT 2
-        """,
-        (metadata.sha256, metadata.mode, metadata.played_at),
-    ).fetchall()
+    def play_matches(mode: int) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT id FROM plays
+            WHERE sha256 = ? AND mode = ?
+              AND played_at >= ? AND played_at <= ? AND is_course = 0
+            ORDER BY id
+            LIMIT 2
+            """,
+            (
+                metadata.sha256,
+                mode,
+                metadata.played_at,
+                metadata.played_at + REPLAY_MATCH_TOLERANCE_SECONDS,
+            ),
+        ).fetchall()
+
+    matches = play_matches(metadata.mode)
+    if not matches and metadata.mode in REPLAY_LN_MODES:
+        # ReplayData always stores the configured LN mode. ScoreData stores 0
+        # for charts without undefined LN, so use that normalization only when
+        # there is no exact-mode candidate.
+        matches = play_matches(0)
     if existing is not None:
         previous_status = str(existing[1])
-        if previous_status != "matched" and len(matches) == 1:
+        previous_play_id = None if existing[2] is None else int(existing[2])
+        if len(matches) == 1:
             matched_play_id = int(matches[0][0])
+            if previous_status == "matched" and previous_play_id == matched_play_id:
+                return previous_status, False, False
             conn.execute(
                 "UPDATE replay_metadata SET match_status = 'matched', matched_play_id = ? WHERE id = ?",
                 (matched_play_id, int(existing[0])),
             )
-            conn.execute(
-                "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
-                (metadata.selected_gauge_kind, matched_play_id),
-            )
+            if previous_play_id is not None and previous_play_id != matched_play_id:
+                refresh_play_gauge(previous_play_id)
+            refresh_play_gauge(matched_play_id)
             return "matched", False, True
+        if len(matches) > 1 and previous_status != "ambiguous":
+            conn.execute(
+                """
+                UPDATE replay_metadata
+                SET match_status = 'ambiguous', matched_play_id = NULL
+                WHERE id = ?
+                """,
+                (int(existing[0]),),
+            )
+            if previous_play_id is not None:
+                refresh_play_gauge(previous_play_id)
+            return "ambiguous", False, True
         return previous_status, False, False
 
     previous = conn.execute(
@@ -519,10 +566,7 @@ def ingest_replay_metadata(
         ),
     )
     if matched_play_id is not None:
-        conn.execute(
-            "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
-            (metadata.selected_gauge_kind, matched_play_id),
-        )
+        refresh_play_gauge(matched_play_id)
     return status, previous_hash is not None, True
 
 

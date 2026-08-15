@@ -225,9 +225,12 @@ collectorは `replay/*.brd` のGZIP JSONから、開始ゲージ・seed・実配
 allowlist済みmetadataだけを読みます。`keyinput` は復号・保存しません。圧縮/展開サイズを
 制限し、読取前後でファイルが同一の場合だけ採用します。
 
-Replayは `sha256 + mode + date` がただ1件のplayに完全一致した場合だけ
+beatoraja本体はReplay日時を結果確定時、score日時をその直後のDB保存時に別々に採番します。
+そのためReplay日時から30秒以内の `sha256 + mode` がただ1件のplayに対応した場合だけ
 `selected_gauge_kind` を更新します。未一致・曖昧一致・破損・読取中の上書きはplayを
 変更せず、tickの `replay_*` カウンタと `replay_metadata` のslot履歴で監査できます。
+ReplayのLNモードと完全一致するplayを優先し、完全一致がなくReplay modeが1/2の場合だけ、
+未定義LNを含まない譜面でscore側が正規化する`mode=0`を照合します。
 
 停止は `Ctrl-C` です。入力側の `.brd`、`score.db` / `scoredatalog.db` / `scorelog.db` /
 `songdata.db` / `songinfo.db` には書き込みません。
