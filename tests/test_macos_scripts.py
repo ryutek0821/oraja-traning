@@ -1,5 +1,7 @@
 from pathlib import Path
+import plistlib
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,17 +19,67 @@ def test_progress_server_launch_agent_installer_has_valid_bash_syntax() -> None:
     assert "--uninstall" in result.stdout
 
 
-def test_progress_server_launch_agent_is_private_and_persistent() -> None:
+def test_progress_server_launch_agent_is_private_and_persistent(
+    tmp_path: Path, monkeypatch
+) -> None:
     source = INSTALLER.read_text(encoding="utf-8")
     assert '"KeepAlive": True' in source
     assert '"RunAtLoad": True' in source
     assert '"ThrottleInterval": 30' in source
-    assert '"Umask": "077"' in source
     assert '"WorkingDirectory": project_root' in source
     assert '"--progress-token-file",' in source
     assert 'token_file,' in source
     assert 'Path(value).is_absolute()' in source
     assert 'cat "$TOKEN_FILE"' not in source
+
+    marker = "<<'PY'\n"
+    _, separator, tail = source.partition(marker)
+    assert separator
+    renderer, separator, _ = tail.partition("\nPY\n")
+    assert separator
+
+    output = tmp_path / "agent.plist"
+    token_file = tmp_path / "progress-token.txt"
+    token_file.write_text("private-token", encoding="utf-8")
+    arguments = [
+        "embedded-plist-renderer",
+        str(output),
+        sys.executable,
+        str(ROOT),
+        str(ROOT / "export" / "current"),
+        "100.118.150.23",
+        "8765",
+        str(tmp_path / "progress.json"),
+        str(token_file),
+        str(tmp_path / "progress-server.log"),
+    ]
+    monkeypatch.setattr(sys, "argv", arguments)
+    exec(compile(renderer, str(INSTALLER), "exec"), {"__name__": "__main__"})
+
+    raw = output.read_bytes()
+    payload = plistlib.loads(raw)
+    assert type(payload["Umask"]) is int
+    assert payload["Umask"] == 0o077
+    assert b"<integer>63</integer>" in raw
+    assert payload["KeepAlive"] is True
+    assert payload["ThrottleInterval"] == 30
+    assert payload["ProgramArguments"] == [
+        sys.executable,
+        "-m",
+        "oraja_training.cli",
+        "serve",
+        "--export-dir",
+        str(ROOT / "export" / "current"),
+        "--host",
+        "100.118.150.23",
+        "--port",
+        "8765",
+        "--progress-state",
+        str(tmp_path / "progress.json"),
+        "--progress-token-file",
+        str(token_file),
+    ]
+    assert b"private-token" not in raw
 
 
 def test_progress_server_launch_agent_preserves_the_submitted_job_arguments() -> None:

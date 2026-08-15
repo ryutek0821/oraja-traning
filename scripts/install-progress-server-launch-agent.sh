@@ -279,7 +279,7 @@ payload = {
     "RunAtLoad": True,
     "KeepAlive": True,
     "ThrottleInterval": 30,
-    "Umask": "077",
+    "Umask": 0o077,
     "ProcessType": "Background",
     "StandardOutPath": log_file,
     "StandardErrorPath": log_file,
