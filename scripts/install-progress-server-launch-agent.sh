@@ -101,6 +101,8 @@ readonly AGENT_DIR="$USER_HOME/Library/LaunchAgents"
 readonly PLIST_PATH="$AGENT_DIR/$LABEL.plist"
 readonly DOMAIN_TARGET="gui/$USER_ID"
 readonly SERVICE_TARGET="$DOMAIN_TARGET/$LABEL"
+readonly LAUNCHCTL_ATTEMPTS=5
+readonly LAUNCHCTL_RETRY_SECONDS=1
 
 job_is_ours() {
     local description="$1"
@@ -123,6 +125,55 @@ stop_existing_job() {
     job_is_ours "$description" \
         || fail "refusing to replace an unrecognized job with label $LABEL"
     /bin/launchctl bootout "$SERVICE_TARGET"
+}
+
+wait_until_job_is_unregistered() {
+    local attempt
+    for ((attempt = 1; attempt <= LAUNCHCTL_ATTEMPTS; attempt++)); do
+        if ! /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+            return 0
+        fi
+        if ((attempt < LAUNCHCTL_ATTEMPTS)); then
+            /bin/sleep "$LAUNCHCTL_RETRY_SECONDS"
+        fi
+    done
+    return 1
+}
+
+bootstrap_launch_agent() {
+    local attempt
+    local last_error=""
+    for ((attempt = 1; attempt <= LAUNCHCTL_ATTEMPTS; attempt++)); do
+        if /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+            return 0
+        fi
+        if last_error="$(
+            /bin/launchctl bootstrap "$DOMAIN_TARGET" "$PLIST_PATH" 2>&1
+        )"; then
+            if /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        if ((attempt < LAUNCHCTL_ATTEMPTS)); then
+            /bin/sleep "$LAUNCHCTL_RETRY_SECONDS"
+        fi
+    done
+    if /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ -n "$last_error" ]]; then
+        printf 'last launchctl error: %s\n' "$last_error" >&2
+    fi
+    return 1
+}
+
+print_bootstrap_recovery() {
+    printf 'Recovery commands:\n' >&2
+    printf '  /bin/launchctl bootout %q 2>/dev/null || true\n' \
+        "$SERVICE_TARGET" >&2
+    printf '  /bin/launchctl bootstrap %q %q\n' \
+        "$DOMAIN_TARGET" "$PLIST_PATH" >&2
+    printf '  /bin/launchctl kickstart %q\n' "$SERVICE_TARGET" >&2
 }
 
 if ((UNINSTALL)); then
@@ -303,8 +354,18 @@ candidate_plist=""
 
 if [[ -n "$existing_description" ]]; then
     /bin/launchctl bootout "$SERVICE_TARGET"
+    if ! wait_until_job_is_unregistered; then
+        printf 'error: %s remained registered after bootout\n' "$LABEL" >&2
+        print_bootstrap_recovery
+        exit 1
+    fi
 fi
-/bin/launchctl bootstrap "$DOMAIN_TARGET" "$PLIST_PATH"
+if ! bootstrap_launch_agent; then
+    printf 'error: failed to bootstrap %s after %s attempts\n' \
+        "$LABEL" "$LAUNCHCTL_ATTEMPTS" >&2
+    print_bootstrap_recovery
+    exit 1
+fi
 /bin/launchctl kickstart "$SERVICE_TARGET"
 /bin/launchctl print "$SERVICE_TARGET" >/dev/null
 

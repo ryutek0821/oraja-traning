@@ -110,3 +110,22 @@ def test_progress_server_launch_agent_fails_closed_on_host_and_job_identity() ->
     assert '/bin/launchctl bootstrap "$DOMAIN_TARGET" "$PLIST_PATH"' in source
     assert '/bin/rm -f "$PLIST_PATH"' in source
     assert "launchctl remove" not in source
+
+
+def test_progress_server_launch_agent_retries_bootstrap_after_bootout() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert "readonly LAUNCHCTL_ATTEMPTS=5" in source
+    assert "readonly LAUNCHCTL_RETRY_SECONDS=1" in source
+    assert "wait_until_job_is_unregistered" in source
+    assert "bootstrap_launch_agent" in source
+    retry = source.split("bootstrap_launch_agent() {", 1)[1].split("\n}\n", 1)[0]
+    assert retry.index('launchctl print "$SERVICE_TARGET"') < retry.index(
+        'launchctl bootstrap "$DOMAIN_TARGET" "$PLIST_PATH"'
+    )
+    assert retry.count('launchctl print "$SERVICE_TARGET"') >= 3
+    assert '/bin/sleep "$LAUNCHCTL_RETRY_SECONDS"' in retry
+    assert "failed to bootstrap %s after %s attempts" in source
+    assert "Recovery commands:" in source
+    assert 'launchctl bootout %q 2>/dev/null || true' in source
+    assert 'launchctl bootstrap %q %q' in source
+    assert '"$DOMAIN_TARGET" "$PLIST_PATH"' in source
