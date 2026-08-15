@@ -5,6 +5,7 @@ import json
 from email.message import Message
 from http import HTTPStatus
 from pathlib import Path
+import socket
 import sqlite3
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from oraja_training.serve.app import (
     COCKPIT_HTML,
     TrainingHTTPServer,
     TrainingRequestHandler,
+    _server_type_for_host,
     _validate_progress_bind,
 )
 
@@ -134,6 +136,16 @@ def test_progress_receiver_rejects_wildcard_and_lan_bindings() -> None:
         _validate_progress_bind(host, "configured")
 
 
+def test_server_socket_family_matches_the_literal_host() -> None:
+    assert _server_type_for_host("127.0.0.1").address_family == socket.AF_INET
+    assert _server_type_for_host("localhost").address_family == socket.AF_INET
+    assert _server_type_for_host("::1").address_family == socket.AF_INET6
+    assert (
+        _server_type_for_host("fd7a:115c:a1e0::ef38:9617").address_family
+        == socket.AF_INET6
+    )
+
+
 def test_status_is_stale_when_database_or_manifest_is_missing(tmp_path: Path) -> None:
     export = tmp_path / "export"
     export.mkdir()
@@ -231,7 +243,9 @@ def test_idempotent_replay_does_not_refresh_an_old_observation(
     assert server.status()["stale"] is True
 
 
-def test_old_first_observation_is_immediately_stale(tmp_path: Path, monkeypatch) -> None:
+def test_old_first_observation_warns_without_marking_a_fresh_receive_stale(
+    tmp_path: Path, monkeypatch
+) -> None:
     export = tmp_path / "export"
     export.mkdir()
     (export / "manifest.json").write_text(
@@ -246,7 +260,11 @@ def test_old_first_observation_is_immediately_stale(tmp_path: Path, monkeypatch)
     ).encode()
 
     assert _post(server, "secret-token", payload)[0] == HTTPStatus.OK
-    assert server.status()["stale"] is True
+    status = server.status()
+    assert status["stale"] is False
+    assert status["message"] is None
+    assert status["progress_clock_skew_seconds"] == -1_000
+    assert "1000秒" in status["progress_warning"]
 
 
 def test_remote_progress_becomes_stale(tmp_path: Path, monkeypatch) -> None:

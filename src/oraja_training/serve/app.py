@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import threading
 import time
@@ -196,6 +197,8 @@ class TrainingHTTPServer(ThreadingHTTPServer):
     def status(self) -> dict[str, Any]:
         stale = False
         errors: list[str] = []
+        warning: str | None = None
+        clock_skew_seconds: int | None = None
         baseline = 0
         try:
             manifest = _read_json(self.export_dir / "manifest.json")
@@ -217,8 +220,13 @@ class TrainingHTTPServer(ThreadingHTTPServer):
                 remote_received_at = int(
                     progress.get("received_at", remote_observed_at)
                 )
-                freshness_at = min(remote_observed_at, remote_received_at)
-                if int(time.time()) - freshness_at > self.progress_stale_after:
+                clock_skew_seconds = remote_observed_at - remote_received_at
+                if abs(clock_skew_seconds) > self.progress_stale_after:
+                    warning = (
+                        f"{source}の観測時刻が受信時刻と"
+                        f"{abs(clock_skew_seconds)}秒ずれています"
+                    )
+                if int(time.time()) - remote_received_at > self.progress_stale_after:
                     stale = True
                     errors.append(f"{source}からの進捗が停止しています")
             except FileNotFoundError:
@@ -257,6 +265,8 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             "progress_source": source,
             "progress_observed_at": remote_observed_at,
             "progress_received_at": remote_received_at,
+            "progress_clock_skew_seconds": clock_skew_seconds,
+            "progress_warning": warning,
             "live_judged": live,
             "remaining_judged": max(0, target - live),
             "progress": min(1.0, live / target),
@@ -265,6 +275,22 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             "message": " / ".join(errors) if errors else None,
             "checked_at": _utc_now(),
         }
+
+
+class _IPv6TrainingHTTPServer(TrainingHTTPServer):
+    """Training server whose listening socket matches an IPv6 host."""
+
+    address_family = socket.AF_INET6
+
+
+def _server_type_for_host(host: str) -> type[TrainingHTTPServer]:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return TrainingHTTPServer
+    if address.version == 6:
+        return _IPv6TrainingHTTPServer
+    return TrainingHTTPServer
 
 
 class TrainingRequestHandler(BaseHTTPRequestHandler):
@@ -422,7 +448,8 @@ def make_server(
         raise ValueError("progress_state and progress_token must be configured together")
     _validate_progress_bind(host, progress_token)
 
-    return TrainingHTTPServer(
+    server_type = _server_type_for_host(host)
+    return server_type(
         (host, int(port)), export_dir, score_db, target_judged=target_judged,
         progress_state=progress_state, progress_token=progress_token,
         progress_source_id=progress_source_id,
@@ -486,7 +513,7 @@ const pick=(o,...ks)=>{for(const k of ks)if(o&&o[k]!=null)return o[k];return nul
 function charts(s){const q=pick(s,'queue','items','charts','menu');return Array.isArray(q)?q:[]}
 function showSession(s){const q=charts(s),next=pick(s,'next')||q[0]||{};document.querySelector('#next-title').textContent=pick(next,'title','name')||'次の譜面はありません';document.querySelector('#artist').textContent=pick(next,'artist','subtitle')||'—';document.querySelector('#notes').textContent=fmt(pick(next,'notes','judged')||0);document.querySelector('#level').textContent=pick(next,'level','difficulty')||'—';document.querySelector('#target').textContent=pick(next,'target','lamp','goal')||'—';document.querySelector('#slot').textContent=pick(next,'slot','category','phase')||'WARMUP';document.querySelector('#band').textContent=pick(next,'band','recommend_band')||'R1';document.querySelector('#queue-count').textContent=q.length;const box=document.querySelector('#queue');box.innerHTML=q.slice(1,7).map((x,i)=>`<div class="queue-item"><span>${String(i+2).padStart(2,'0')} / ${esc(pick(x,'slot','category','phase')||'NEXT')}</span><b>${esc(pick(x,'title','name')||'名称未設定')}</b></div>`).join('')||'<div class="empty">後続の譜面はありません。</div>'}
 function esc(v){const d=document.createElement('div');d.textContent=String(v);return d.innerHTML}
-function showStatus(s){const live=Number(s.live_judged)||0,target=Number(s.target_judged)||100000,p=Math.min(1,live/target),received=Number(s.progress_received_at)||0,stamp=received?'最終受信 '+new Date(received*1000).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'更新 '+new Date(s.checked_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});document.querySelector('#played').textContent=fmt(live);document.querySelector('#remaining').textContent=fmt(s.remaining_judged);document.querySelector('#rate').textContent=Math.floor(p*100)+'%';document.querySelector('#big-count').textContent=fmt(live);document.querySelector('#state').textContent=s.complete?'GOAL':'IN PROGRESS';document.querySelector('#dot').classList.toggle('stale',!!s.stale);document.querySelector('#sync').textContent=s.stale?'STALE':'LIVE';document.querySelector('#checked').textContent=s.stale?((s.message||'前回値を表示中')+' / '+stamp):stamp;[...document.querySelectorAll('.segment')].forEach((el,i)=>el.style.setProperty('--fill',Math.max(0,Math.min(1,p*10-i))*100+'%'))}
+function showStatus(s){const live=Number(s.live_judged)||0,target=Number(s.target_judged)||100000,p=Math.min(1,live/target),received=Number(s.progress_received_at)||0,warning=s.progress_warning||'',stamp=received?'最終受信 '+new Date(received*1000).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'更新 '+new Date(s.checked_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});document.querySelector('#played').textContent=fmt(live);document.querySelector('#remaining').textContent=fmt(s.remaining_judged);document.querySelector('#rate').textContent=Math.floor(p*100)+'%';document.querySelector('#big-count').textContent=fmt(live);document.querySelector('#state').textContent=s.complete?'GOAL':'IN PROGRESS';document.querySelector('#dot').classList.toggle('stale',!!s.stale||!!warning);document.querySelector('#sync').textContent=s.stale?'STALE':warning?'WARN':'LIVE';document.querySelector('#checked').textContent=s.stale?((s.message||'前回値を表示中')+' / '+stamp):warning?(warning+' / '+stamp):stamp;[...document.querySelectorAll('.segment')].forEach((el,i)=>el.style.setProperty('--fill',Math.max(0,Math.min(1,p*10-i))*100+'%'))}
 const rail=document.querySelector('#rail');for(let i=0;i<10;i++){const e=document.createElement('i');e.className='segment';rail.appendChild(e)}
 async function load(){try{const [a,b]=await Promise.all([fetch('/api/session',{cache:'no-store'}),fetch('/api/status',{cache:'no-store'})]);if(a.ok)showSession(await a.json());else document.querySelector('#next-title').textContent='今日のメニューを生成してください';if(b.ok)showStatus(await b.json())}catch(e){document.querySelector('#sync').textContent='OFFLINE';document.querySelector('#dot').classList.add('stale');document.querySelector('#checked').textContent='サーバーへ接続できません'}}load();setInterval(async()=>{try{const r=await fetch('/api/status',{cache:'no-store'});if(r.ok)showStatus(await r.json())}catch(e){}},5000);
 </script></body></html>'''
