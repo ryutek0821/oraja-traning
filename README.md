@@ -158,21 +158,33 @@ coach推薦と同レベルrandom controlは、session単位で決定的に割り
 ```console
 oraja-training experiment start --assistant-db ./assistant.db \
   --name p6-two-week --seed PRIVATE_FIXED_SEED --starts-at 1800000000
+oraja-training experiment candidates --assistant-db ./assistant.db \
+  --experiment-id 1 --session-key 2026-08-15-am
 oraja-training experiment assign --assistant-db ./assistant.db \
-  --experiment-id 1 --session-key 2026-08-15-am --session-at 1800000000 \
-  --candidates-json ./candidates.json
+  --experiment-id 1 --session-key 2026-08-15-am --session-at 1800000000
+oraja-training experiment targets --assistant-db ./assistant.db \
+  --experiment-id 1 --status pending
 oraja-training experiment resolve --assistant-db ./assistant.db \
   --experiment-id 1
 oraja-training experiment report --assistant-db ./assistant.db \
   --experiment-id 1
 ```
 
-`candidates.json`は`coach`、`control`、`transfer`の各配列を持ち、要素は
+候補は最新Daily MenuのFOCUSと、同じ表・レベル・既プレイ状態のrandom controlから自動生成します。
+同傾向・同レベルの未練習譜面をtransferとして予約し、`candidates`サブコマンドで割付前に確認できます。
+手動指定する場合の`candidates.json`は重複しない`coach`、`control`、`transfer`の各配列を持ち、要素は
 `{"sha256":"…","mode":0,"p_pred":0.7}`です。候補集合hash、arm確率、譜面の
 selection probabilityを保存し、同じsession keyの再実行は同じ割付を返します。選曲した譜面の
-保持と未練習類似譜面への転移を1/3/7/14日後に評価します。期限内のplayが一意な場合だけ解決し、
-複数は`duplicate`、未観測は`missing`として除外します。各armの事前最小標本数に達するまでは
+保持と未練習類似譜面への転移を1/3/7/14日後に評価します。過去playまたは同じ実験で予約済みの
+transfer候補は自動除外します。24時間の評価窓が閉じた時点でplayが一意な場合だけ解決し、
+複数または別targetとの再利用は`duplicate`、未観測は`missing`として除外します。各armの事前最小標本数に達するまでは
 arm差とBrier差を`inconclusive`として出しません。書込み先は`assistant.db`だけです。
+
+割付セッションでは`selected`だけを練習し、`transfer`は翌日の最初の評価窓まで演奏しません。
+以後は`experiment targets`に表示された各24時間窓で、retentionとtransferをそれぞれ**1回だけ**
+演奏します。窓より前のプレイは評価されず、同じ窓で2回以上演奏するとそのtargetは`duplicate`に
+なるため、再挑戦は次の評価窓まで待ちます。`due_at_utc`から`window_closes_at_utc`までが
+対象期間です。
 
 ### Codexでの日次・定期レビュー
 
