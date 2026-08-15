@@ -2,7 +2,12 @@
 package dev.oraja.training.ir;
 
 import bms.player.beatoraja.ir.*;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
 import java.lang.reflect.*;
+import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.file.*;
 import java.time.Instant;
 import java.util.List;
@@ -12,6 +17,7 @@ public final class ContractTestMain {
     public static void main(String[] args) throws Exception {
         mapperAndSpoolContract();
         compositeDoesNotLeakOfficialToken();
+        ownerReadContract();
         System.out.println("IR contract smoke tests passed");
     }
 
@@ -56,6 +62,92 @@ public final class ContractTestMain {
         composite.login(new IRAccount(uuidUnchecked(), "official-device-token", "official"));
         assert "official-device-token".equals(official.loginAccount.password);
         assert "legacy-secret".equals(legacy.loginAccount.password);
+    }
+
+    private static void ownerReadContract() throws Exception {
+        String profile = uuid();
+        String token = "ot_" + "x".repeat(43);
+        int[] playReads = {0};
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> respond(exchange, profile, token, playReads));
+        server.start();
+        Path spool = Files.createTempDirectory("oraja-ir-read-");
+        try {
+            IrConfiguration configuration = new IrConfiguration(
+                    URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/"),
+                    spool, true, true, 64 * 1024);
+            Constructor<OrajaTrainingIRConnection> constructor = OrajaTrainingIRConnection.class
+                    .getDeclaredConstructor(IrConfiguration.class);
+            constructor.setAccessible(true);
+            OrajaTrainingIRConnection connection = constructor.newInstance(configuration);
+            IRResponse<IRPlayerData> login = connection.login(new IRAccount(profile, token, "untrusted-name"));
+            assert login.isSucceeded();
+            assert profile.equals(login.getData().id);
+            assert "Server owner".equals(login.getData().name);
+
+            IRChartData chart = new IRChartData(null, "a".repeat(64), IRChartData.Mode.BEAT_7K, 0);
+            IRScoreData[] scores = connection.getPlayData(login.getData(), chart).getData();
+            assert scores.length == 1;
+            assert scores[0].epg == 10 && scores[0].gauge == 3;
+            int ownerReadCount = playReads[0];
+            assert connection.getPlayData(new IRPlayerData(uuid(), "rival", ""), chart).getData().length == 0;
+            assert playReads[0] == ownerReadCount : "cross-profile read reached the network";
+
+            assert connection.getRivals().getData().length == 0;
+            assert connection.getTableDatas().getData().length == 0;
+            assert connection.getCoursePlayData(login.getData(), null).getData().length == 0;
+            assert connection.getIllegalSongs().getData().length == 0;
+            assert "beatoraja-test".equals(connection.getVersionInfo("beatoraja-test").getData().version);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    private static void respond(HttpExchange exchange, String profile, String token, int[] playReads)
+            throws IOException {
+        assert ("Bearer " + token).equals(exchange.getRequestHeaders().getFirst("Authorization"));
+        String path = exchange.getRequestURI().getPath();
+        String body;
+        if ("/v1/ir/player".equals(path)) {
+            body = "{\"contract\":\"ir-read.v1\",\"player\":{\"id\":\"" + profile
+                    + "\",\"name\":\"Server owner\",\"rank\":\"\"}}";
+        } else if ("/v1/ir/play-data".equals(path)) {
+            playReads[0]++;
+            assert exchange.getRequestURI().getRawQuery().contains("player_id=" + profile);
+            body = scoreResponse(profile);
+        } else if ("/v1/ir/rivals".equals(path)) {
+            body = "{\"contract\":\"ir-read.v1\",\"players\":[]}";
+        } else if ("/v1/ir/tables".equals(path)) {
+            body = "{\"contract\":\"ir-read.v1\",\"tables\":[]}";
+        } else if ("/v1/ir/course-play-data".equals(path)) {
+            body = "{\"contract\":\"ir-read.v1\",\"scores\":[]}";
+        } else if ("/v1/ir/illegal-songs".equals(path)) {
+            body = "{\"contract\":\"ir-read.v1\",\"sha256\":[]}";
+        } else if ("/v1/ir/version".equals(path)) {
+            body = "{\"contract\":\"ir-read.v1\",\"version\":{\"version\":\"beatoraja-test\",\"message\":\"\",\"download_url\":null}}";
+        } else {
+            body = "{\"error\":\"not_found\"}";
+            exchange.sendResponseHeaders(404, body.length());
+            exchange.getResponseBody().write(body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            exchange.close();
+            return;
+        }
+        byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.getResponseBody().write(bytes);
+        exchange.close();
+    }
+
+    private static String scoreResponse(String profile) {
+        return "{\"contract\":\"ir-read.v1\",\"scores\":[{"
+                + "\"sha256\":\"" + "a".repeat(64) + "\",\"lntype\":0,\"id\":\"" + profile
+                + "\",\"player\":\"\",\"clear\":5,\"date\":1700000000,"
+                + "\"epg\":10,\"lpg\":2,\"egr\":3,\"lgr\":1,\"egd\":0,\"lgd\":0,"
+                + "\"ebd\":1,\"lbd\":0,\"epr\":0,\"lpr\":0,\"ems\":0,\"lms\":0,"
+                + "\"avgjudge\":0,\"maxcombo\":12,\"notes\":17,\"passnotes\":17,"
+                + "\"minbp\":1,\"option\":2,\"seed\":123,\"assist\":0,\"gauge\":3,\"skin\":\"\"}],"
+                + "\"truncated\":false}";
     }
 
     private static String uuid() throws Exception {
