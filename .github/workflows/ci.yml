@@ -96,7 +96,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: exch-bms2/beatoraja
-          ref: 721856fbb431
+          ref: 721856fbb4311241ea81711e0574e5cc094c13c2
           path: .upstream/beatoraja
           persist-credentials: false
       - uses: actions/setup-java@v4
