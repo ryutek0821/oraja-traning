@@ -43,7 +43,7 @@ Shift_JIS/JavaScript旧形式をコード実行せず解析し、hashがない�
 一意な場合だけ照合します。照合数/全項目数は保存され、低照合率をメニュー警告へ出します。
 
 schema version 1の既存`assistant.db`は正しい値へ復元できないため、in-place移行しません。
-version 2以降は履歴を保持して段階的に移行します。現行schema versionは8です。
+version 2以降は履歴を保持して段階的に移行します。現行schema versionは9です。
 
 ## 毎日の更新
 

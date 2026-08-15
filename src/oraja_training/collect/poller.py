@@ -77,7 +77,6 @@ class Poller:
         self.max_retries = max(1, int(max_retries))
         self.clock = clock
         self._last_signature: SourceSignature | None = None
-        self._last_replay_signature: tuple[tuple[str, int, int, int, int], ...] | None = None
         self._owns_connection = not isinstance(assistant_db, sqlite3.Connection)
 
         if isinstance(assistant_db, sqlite3.Connection):
@@ -213,18 +212,42 @@ class Poller:
             except FileNotFoundError:
                 continue
             signals.append(
-                (path.name, stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                (str(path), stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
             )
         return tuple(signals)
 
     def _collect_replays(self, *, now: int, force: bool = False) -> TickResult:
         signature = self._replay_signature()
-        if not force and signature == self._last_replay_signature:
+        signals = {item[0]: item[1:] for item in signature}
+        states = store.load_replay_scan_states(self.conn)
+        unseen = [item for item in signature if item[0] not in states]
+        changed = [
+            item
+            for item in signature
+            if item[0] in states and states[item[0]][:4] != item[1:]
+        ]
+        candidates = unseen + changed
+        selected = candidates[:replay.MAX_REPLAY_FILES]
+        if force and len(selected) < replay.MAX_REPLAY_FILES:
+            selected_paths = {item[0] for item in selected}
+            unchanged = [
+                item for item in signature if item[0] not in selected_paths
+            ]
+            selected.extend(
+                unchanged[: replay.MAX_REPLAY_FILES - len(selected)]
+            )
+
+        stale_paths = sorted(set(states).difference(signals))
+        if not selected and not stale_paths:
             return TickResult(0, 0, False, scanned=False)
 
-        report = replay.scan_report(self.replay_dir)
+        report = replay.scan_report(
+            self.replay_dir,
+            candidates=(item[0] for item in selected),
+        )
         matched = unmatched = ambiguous = overwritten = 0
         with self.conn:
+            store.delete_replay_scan_states(self.conn, stale_paths)
             for metadata in report.metadata:
                 status, was_overwritten, inserted = store.ingest_replay_metadata(
                     self.conn, metadata, observed_at=now
@@ -239,6 +262,44 @@ class Poller:
                     unmatched += 1
                 overwritten += int(was_overwritten)
 
+            observations: list[dict[str, int | str]] = []
+            for metadata in report.metadata:
+                observations.append(
+                    {
+                        "path": str(metadata.path),
+                        "device": metadata.device,
+                        "inode": metadata.inode,
+                        "mtime_ns": metadata.mtime_ns,
+                        "compressed_size": metadata.compressed_size,
+                        "outcome": "valid",
+                        "checked_at": now,
+                    }
+                )
+            for paths, outcome in (
+                (report.invalid_paths, "invalid"),
+                (report.unstable_paths, "unstable"),
+            ):
+                for path in paths:
+                    signal = signals.get(str(path))
+                    if signal is None:
+                        continue
+                    observations.append(
+                        {
+                            "path": str(path),
+                            "device": signal[0],
+                            "inode": signal[1],
+                            "mtime_ns": signal[2],
+                            "compressed_size": signal[3],
+                            "outcome": outcome,
+                            "checked_at": now,
+                        }
+                    )
+            store.upsert_replay_scan_states(self.conn, observations)
+            persisted_invalid, persisted_unstable = store.replay_scan_error_counts(
+                self.conn
+            )
+            audit_invalid = max(persisted_invalid, report.invalid)
+            audit_unstable = max(persisted_unstable, report.unstable)
             last_mtime = (
                 max(item[3] for item in signature) / 1_000_000_000
                 if signature else None
@@ -252,14 +313,13 @@ class Poller:
                 last_run_at=now,
                 last_error=(
                     None
-                    if not report.invalid and not report.unstable
-                    else f"invalid={report.invalid}, unstable={report.unstable}"
+                    if not audit_invalid and not audit_unstable
+                    else f"invalid={audit_invalid}, unstable={audit_unstable}"
                 ),
             )
-        self._last_replay_signature = signature
         return TickResult(
             0, 0, False,
-            scanned=bool(signature) or bool(report.invalid or report.unstable),
+            scanned=bool(selected) or bool(report.invalid or report.unstable),
             replay_scanned=len(report.metadata) + report.invalid + report.unstable,
             replay_matched=matched,
             replay_unmatched=unmatched,

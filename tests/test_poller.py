@@ -258,6 +258,62 @@ def test_replay_exact_match_history_overwrite_and_invalid_counter(tmp_path) -> N
         assert "keyinput" not in columns
 
 
+def test_replay_batches_eventually_ingest_over_128_files_across_restart(
+    tmp_path,
+) -> None:
+    source = _source_dir(tmp_path)
+    replay_count = replay.MAX_REPLAY_FILES + 2
+    for index in range(replay_count):
+        _replay(
+            source / "replay" / f"slot-{index:03d}.brd",
+            sha256=f"{index:064x}",
+        )
+    assistant = tmp_path / "assistant.db"
+
+    with Poller(source, assistant, clock=lambda: 4_100) as poller:
+        first = poller.tick(force=True)
+        assert first.replay_scanned == replay.MAX_REPLAY_FILES
+        assert first.replay_invalid == 0
+        assert poller.conn.execute(
+            "SELECT count(*) FROM replay_metadata"
+        ).fetchone()[0] == replay.MAX_REPLAY_FILES
+
+    with Poller(source, assistant, clock=lambda: 4_101) as restarted:
+        second = restarted.tick()
+        assert second.replay_scanned == 2
+        assert second.replay_invalid == 0
+        assert restarted.conn.execute(
+            "SELECT count(*) FROM replay_metadata"
+        ).fetchone()[0] == replay_count
+        assert restarted.tick().replay_scanned == 0
+
+
+def test_replay_batch_progresses_past_persisted_invalid_files(
+    tmp_path, monkeypatch
+) -> None:
+    source = _source_dir(tmp_path)
+    replay_dir = source / "replay"
+    replay_dir.mkdir()
+    (replay_dir / "slot-0.brd").write_bytes(b"not-gzip")
+    (replay_dir / "slot-1.brd").write_bytes(b"not-gzip")
+    _replay(replay_dir / "slot-2.brd", sha256="b" * 64)
+    assistant = tmp_path / "assistant.db"
+    monkeypatch.setattr(replay, "MAX_REPLAY_FILES", 2)
+
+    with Poller(source, assistant, clock=lambda: 4_200) as poller:
+        first = poller.tick(force=True)
+        assert first.replay_invalid == 2
+        assert first.replay_scanned == 2
+
+    with Poller(source, assistant, clock=lambda: 4_201) as restarted:
+        second = restarted.tick()
+        assert second.replay_invalid == 0
+        assert second.replay_scanned == 1
+        assert restarted.conn.execute(
+            "SELECT count(*) FROM replay_metadata"
+        ).fetchone()[0] == 1
+
+
 def test_replay_matches_only_the_bounded_result_timestamp_skew(tmp_path) -> None:
     source = _source_dir(tmp_path)
     _replay(source / "replay" / "within.brd", date=70)
@@ -391,7 +447,7 @@ def test_replay_changed_during_read_is_counted_and_audited(
     monkeypatch.setattr(
         replay,
         "scan_report",
-        lambda _: replay.ReplayScanResult((), unstable=1),
+        lambda _, **__: replay.ReplayScanResult((), unstable=1),
     )
 
     with Poller(source, tmp_path / "assistant.db", clock=lambda: 5_500) as poller:
