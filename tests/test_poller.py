@@ -6,6 +6,8 @@ import gzip
 import json
 import sqlite3
 
+import pytest
+
 from oraja_training.collect import replay
 from oraja_training.collect.poller import Poller
 from oraja_training.db import readers
@@ -92,6 +94,18 @@ def _source_dir(tmp_path: Path) -> Path:
     _put(source / "scoredatalog.db", "scoredatalog", initial, create=True)
     _put(source / "score.db", "score", initial, create=True)
     return source
+
+
+def _source_artifact_state(source: Path) -> dict[str, tuple[str, int]]:
+    suffixes = (".db", ".db-wal", ".db-shm", ".db-journal")
+    return {
+        path.name: (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.stat().st_mtime_ns,
+        )
+        for path in sorted(source.iterdir())
+        if path.name.endswith(suffixes)
+    }
 
 
 def _replay(
@@ -196,6 +210,74 @@ def test_restart_reuses_cursor_without_touching_source_databases(tmp_path) -> No
     assert result.lost_events == 0
     assert result.generation_changed is False
     assert after == before
+
+
+def test_first_tick_does_not_touch_source_database_or_live_sidecars(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    live_connections: list[sqlite3.Connection] = []
+    try:
+        for name, table in (
+            ("score.db", "score"),
+            ("scoredatalog.db", "scoredatalog"),
+        ):
+            conn = sqlite3.connect(source / name)
+            assert conn.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+            conn.execute("PRAGMA wal_autocheckpoint = 0")
+            conn.execute(f"UPDATE {table} SET date = date + 1")
+            conn.commit()
+            live_connections.append(conn)
+
+        # A stale rollback journal may coexist with a WAL database after an
+        # interrupted process.  It must be treated as source data, not opened
+        # or cleaned up in place by the collector.
+        (source / "scoredatalog.db-journal").write_bytes(b"stale-journal-marker")
+        before = _source_artifact_state(source)
+        assert {
+            "score.db-wal",
+            "score.db-shm",
+            "scoredatalog.db-wal",
+            "scoredatalog.db-shm",
+            "scoredatalog.db-journal",
+        } <= set(before)
+
+        with Poller(source, tmp_path / "assistant.db", clock=lambda: 2_750) as poller:
+            result = poller.tick(force=True)
+
+        assert result.new_plays == 1
+        assert _source_artifact_state(source) == before
+    finally:
+        for conn in live_connections:
+            conn.close()
+
+
+def test_append_style_scoredatalog_schema_fails_closed(tmp_path) -> None:
+    source = _source_dir(tmp_path)
+    conn = sqlite3.connect(source / "scoredatalog.db")
+    try:
+        conn.execute("ALTER TABLE scoredatalog RENAME TO legacy_scoredatalog")
+        conn.execute(
+            "CREATE TABLE scoredatalog AS "
+            "SELECT * FROM legacy_scoredatalog WHERE 0"
+        )
+        conn.execute("INSERT INTO scoredatalog SELECT * FROM legacy_scoredatalog")
+        conn.execute("INSERT INTO scoredatalog SELECT * FROM legacy_scoredatalog")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 2_875) as poller:
+        with pytest.raises(
+            readers.ReaderSchemaError,
+            match="unsupported scoredatalog schema.*append-style",
+        ):
+            poller.tick(force=True)
+        state = poller.conn.execute(
+            "SELECT last_error FROM collector_state WHERE key = 'scoredatalog'"
+        ).fetchone()
+        assert poller.conn.execute("SELECT count(*) FROM plays").fetchone()[0] == 0
+
+    assert state is not None
+    assert "expected overwrite-only PRIMARY KEY (sha256, mode)" in state[0]
 
 
 def test_score_change_during_read_retries_snapshot(tmp_path, monkeypatch) -> None:
