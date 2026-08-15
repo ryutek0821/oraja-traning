@@ -47,6 +47,12 @@ def test_send_progress_posts_cumulative_snapshot(monkeypatch) -> None:
 
 
 def test_daemon_retries_a_locked_database(monkeypatch, capsys) -> None:
+    class StopDaemon(Exception):
+        pass
+
+    def stop_after_retry(_seconds: float) -> None:
+        raise StopDaemon
+
     monkeypatch.setattr(
         progress_sender,
         "_read_latest_judged",
@@ -55,10 +61,10 @@ def test_daemon_retries_a_locked_database(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         progress_sender.time,
         "sleep",
-        lambda _seconds: (_ for _ in ()).throw(StopIteration),
+        stop_after_retry,
     )
 
-    with pytest.raises(StopIteration):
+    with pytest.raises(StopDaemon):
         progress_sender.run_sender("score.db", "http://example.test", "token")
     assert "database is locked" in capsys.readouterr().err
 
