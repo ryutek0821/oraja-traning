@@ -8,6 +8,8 @@ const profileDo = await readFile(new URL("worker/src/profile-do.ts", root), "utf
 const worker = await readFile(new URL("worker/src/index.ts", root), "utf8");
 const exporter = await readFile(new URL("worker/src/privacy-export.ts", root), "utf8");
 const migration = await readFile(new URL("migrations/0010_privacy_lifecycle.sql", root), "utf8");
+const encryptionMigration = await readFile(new URL("migrations/0015_encrypted_privacy_exports.sql", root), "utf8");
+const cryptoSource = await readFile(new URL("worker/src/privacy-crypto.ts", root), "utf8");
 
 test("export uses a versioned job and owner-scoped durable outbox", () => {
   assert.match(migration, /CREATE TABLE privacy_export_jobs/);
@@ -78,4 +80,27 @@ test("export snapshot is owner scoped, bounded, digest verified, and connected t
   assert.match(exporter, /advisor_decision_audits/);
   assert.match(privacy, /DELETE FROM advisor_journal/);
   assert.match(privacy, /DELETE FROM advisor_decision_audits/);
+});
+
+test("privacy archives are authenticated ciphertext with one-time authenticated key delivery", () => {
+  assert.match(cryptoSource, /AES-GCM/);
+  assert.match(cryptoSource, /crypto\.getRandomValues\(new Uint8Array\(32\)\)/);
+  assert.match(exporter, /env\.EXPORT_KEK/);
+  assert.match(exporter, /application\/vnd\.oraja\.profile-export\+encrypted/);
+  assert.doesNotMatch(exporter, /customMetadata:[^\n]*wrappedKey/);
+  assert.match(encryptionMigration, /wrapped_key_b64/);
+  assert.match(encryptionMigration, /privacy_export_ready_requires_encryption/);
+  assert.match(worker, /x-oraja-export-key/);
+  assert.match(worker, /unwrapExportKey/);
+  assert.match(worker, /cache-control": "no-store"/);
+});
+
+test("portable snapshot includes complete owner state and bounded artifact bodies without keys", () => {
+  for (const entity of ["profile_settings", "job_events", "job_revisions", "revision_outcomes", "workflow_step_attempts", "oauth_grants", "raw_inventory", "advisor_journal"]) {
+    assert.match(exporter, new RegExp(entity));
+  }
+  assert.match(exporter, /MAX_ARTIFACT_BYTES/);
+  assert.match(exporter, /object\.text\(\)/);
+  assert.match(profileDo, /entries: page\.map/);
+  assert.match(profileDo, /portableState/);
 });

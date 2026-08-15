@@ -45,6 +45,27 @@ Hard stops:
    explicit approval. Until then, revoke recovery credentials and retain the
    encrypted evidence according to the security retention policy.
 
+## Owner privacy export verification
+
+The authenticated one-time download returns ciphertext and the following
+`no-store` response headers: schema, cipher, IV, one-time data key, plaintext
+SHA-256, and ciphertext SHA-256. Save the ciphertext as `.oraenc`; copy the
+non-secret headers to a local `metadata.json` using the keys `export_id`,
+`schema`, `cipher`, `iv`, `plaintext_sha256`, and `ciphertext_sha256`. Keep the
+`x-oraja-export-key` value out of that file and supply it only as the temporary
+`ORAJA_EXPORT_KEY` process environment variable:
+
+```sh
+ORAJA_EXPORT_KEY='<one-time-key>' node scripts/verify-privacy-restore.mjs export.oraenc metadata.json
+```
+
+The verifier authenticates/decrypts the archive, rejects owner IDs and storage
+keys, validates section digests, imports into a new empty in-memory isolated
+state, and compares history/table/journal hashes. It refuses a non-empty
+destination. Never point a privacy-export restore at production or an existing
+owner. A real external drill into newly provisioned D1/R2/DO resources is still
+required; this isolated verifier is not promotion evidence by itself.
+
 ## Current implementation gate
 
 The drill must be marked **blocked**, not passed, while any application-owned
