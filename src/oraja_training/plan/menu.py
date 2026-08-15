@@ -740,7 +740,12 @@ def _immutable_json(path: Path, value: Any) -> None:
             raise RevisionConflictError(f"immutable artifact conflict: {path.name}")
 
 
-def _table_payloads(session: Session) -> dict[str, Any]:
+def table_payloads(session: Session) -> dict[str, Any]:
+    """Return the four bounded beatoraja table documents for one session.
+
+    The mapping is storage-neutral so the Container and local filesystem
+    publisher use exactly the same core rendering path.
+    """
     display_name = session.profile.display_name
     recommend_header = {
         "name": f"{display_name} Personal Recommend",
@@ -865,7 +870,7 @@ def write_export(
     """
 
     root = Path(output_dir).expanduser().resolve()
-    payloads = _table_payloads(session)
+    payloads = table_payloads(session)
     content_hash = _artifact_content_hash(payloads)
     pointer = _latest_pointer(root)
     current_revision = int(pointer.get("revision", 0) or 0)

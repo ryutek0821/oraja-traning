@@ -10,6 +10,7 @@ from .menu import (
     build_session_from_repository,
     next_training_date,
     recommendation_output,
+    table_payloads,
     training_day,
     write_export,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "build_session_from_repository",
     "next_training_date",
     "recommendation_output",
+    "table_payloads",
     "training_day",
     "write_export",
 ]

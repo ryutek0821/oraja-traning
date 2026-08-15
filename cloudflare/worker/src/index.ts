@@ -78,13 +78,14 @@ import {
   dispatchSchedule,
   type JobEnvelope,
 } from "./job-ledger";
-import { SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
+import { regenerationInputDigest, SCHEDULE_CRONS, type ScheduleName } from "./workflow-state";
 import { handleCapabilityTable } from "./tables";
 import {
   listTableCapabilities,
   readProfileSettings,
   revokeTableCapability,
   rotateTableCapability,
+  tableRegenerationSource,
   updateProfileSettings,
 } from "./profile-settings";
 export { GenerateWorkflow } from "./workflow";
@@ -780,7 +781,39 @@ async function handleProfileSettingsRoutes(request: Request, env: Env, origin?: 
     }
     if (settingsRoute && request.method === "PATCH") {
       const body = await readJsonBody(request, 8 * 1024);
-      return json({ settings: await updateProfileSettings(env.CONTROL_DB, accountId, body) }, 200, origin);
+      const settings = await updateProfileSettings(env.CONTROL_DB, accountId, body);
+      const source = await tableRegenerationSource(env.CONTROL_DB, accountId);
+      let regeneration: Record<string, unknown> = { enqueued: false, reason: "table_artifact_unavailable" };
+      if (source) {
+        const [recommend, recommendScore, today, todayScore] = await Promise.all([
+          env.ARTIFACT_BUCKET.head(source.recommendObjectKey),
+          env.ARTIFACT_BUCKET.head(source.recommendScoreObjectKey),
+          env.ARTIFACT_BUCKET.head(source.todayObjectKey),
+          env.ARTIFACT_BUCKET.head(source.todayScoreObjectKey),
+        ]);
+        if (recommend && recommendScore && today && todayScore) {
+          const inputDigest = await regenerationInputDigest(
+            source.profileId,
+            source.sourceManifestSha256,
+            source.settingsRevision,
+          );
+          const accepted = await new JobDispatcher(
+            new D1JobLedger(env.CONTROL_DB),
+            env.JOB_QUEUE,
+          ).acceptAndEnqueue({
+            accountId,
+            profileId: source.profileId,
+            jobKind: "regenerate",
+            eventId: `settings:${source.profileId}:${source.settingsRevision}`,
+            requestId: requestId(request),
+            correlationId: `settings:${source.profileId}:${source.settingsRevision}`,
+            inputDigest,
+            inputKey: source.inputKey,
+          });
+          regeneration = { enqueued: true, job_id: accepted.job.jobId, job_status: accepted.status };
+        }
+      }
+      return json({ settings, regeneration }, 200, origin);
     }
     if (capabilitiesRoute && request.method === "GET") {
       return json({ capabilities: await listTableCapabilities(env.CONTROL_DB, accountId) }, 200, origin);

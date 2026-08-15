@@ -1,4 +1,4 @@
-import { canonicalJson } from "./workflow-state";
+import { canonicalJson, regenerationInputDigest } from "./workflow-state";
 import { sha256Hex, type JobEnvelope } from "./job-ledger";
 import { D1UploadSessionStore } from "./upload-store";
 import {
@@ -20,6 +20,14 @@ export type ContainerBridgeEnv = {
 export type ContainerBridgeResult = {
   outputManifestSha256: string;
   artifactKey: string;
+  tableArtifacts: TableArtifact[];
+};
+
+export type TableArtifact = {
+  kind: "recommend_header" | "recommend_score" | "daily_menu_header" | "daily_menu_score";
+  objectKey: string;
+  sha256: string;
+  sizeBytes: number;
 };
 
 type ContainerArtifact = {
@@ -43,8 +51,9 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_BRIDGE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_INLINE_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const MAX_CONTAINER_RESPONSE_BYTES = 96 * 1024 * 1024;
-const MAGIC = new TextEncoder().encode("ORAJA5DB1\n");
+const MAGIC = new TextEncoder().encode("ORAJA5DB2\n");
 const encoder = new TextEncoder();
+const MAX_TABLE_CONTEXT_BYTES = 16 * 1024 * 1024;
 
 export class ContainerBridgeError extends Error {
   constructor(
@@ -123,14 +132,24 @@ function fileHeader(file: UploadFileSession): Uint8Array {
   }));
 }
 
+function contextHeader(content: Uint8Array, digest: string): Uint8Array {
+  return encoder.encode(canonicalJson({
+    file_name: "table-context.json",
+    sha256: digest,
+    size_bytes: content.byteLength,
+  }));
+}
+
 function uint32(value: number): Uint8Array {
   const bytes = new Uint8Array(4);
   new DataView(bytes.buffer).setUint32(0, value);
   return bytes;
 }
 
-function transportLength(files: readonly UploadFileSession[]): number {
-  return files.reduce((total, file) => total + 4 + fileHeader(file).byteLength + file.sizeBytes, MAGIC.byteLength);
+function transportLength(files: readonly UploadFileSession[], context: Uint8Array, contextDigest: string): number {
+  const header = contextHeader(context, contextDigest);
+  return files.reduce((total, file) => total + 4 + fileHeader(file).byteLength + file.sizeBytes, MAGIC.byteLength)
+    + 4 + header.byteLength + context.byteLength;
 }
 
 function framedStream(
@@ -138,6 +157,8 @@ function framedStream(
   objects: readonly R2Object[],
   scope: string,
   cryptoBox: EnvelopeCrypto,
+  context: Uint8Array,
+  contextDigest: string,
 ): ReadableStream<Uint8Array> {
   async function* frames(): AsyncGenerator<Uint8Array> {
     yield MAGIC;
@@ -157,6 +178,10 @@ function framedStream(
         reader.releaseLock();
       }
     }
+    const header = contextHeader(context, contextDigest);
+    yield uint32(header.byteLength);
+    yield header;
+    yield context;
   }
   const iterator = frames();
   return new ReadableStream<Uint8Array>({
@@ -173,6 +198,63 @@ function framedStream(
       await iterator.return(undefined);
     },
   });
+}
+
+async function loadTableContext(job: JobEnvelope, db: D1Database): Promise<{ bytes: Uint8Array; settingsRevision: number }> {
+  const profile = await db.prepare(
+    `SELECT p.display_name, p.timezone,
+            COALESCE(s.target_judged, 100000) AS target_judged,
+            COALESCE(s.reserve_judged, 10000) AS reserve_judged,
+            COALESCE(s.readiness, 'normal') AS readiness,
+            COALESCE(s.settings_revision, 1) AS settings_revision
+       FROM profiles p
+       LEFT JOIN profile_settings s
+         ON s.account_id = p.account_id AND s.profile_id = p.id
+      WHERE p.account_id = ?1 AND p.id = ?2 AND p.status = 'active'`,
+  ).bind(job.accountId, job.profileId).first<Record<string, unknown>>();
+  if (!profile) throw new ContainerBridgeError("table_input_unavailable", false);
+  const result = await db.prepare(
+    `SELECT s.public_id AS table_id, e.level, e.sha256, e.md5, e.title
+       FROM chart_catalog_entries e
+       JOIN chart_catalog_versions v ON v.id = e.catalog_version_id
+       JOIN chart_catalog_sources s ON s.id = v.source_id
+      WHERE v.status = 'active' AND s.retired_at IS NULL
+        AND e.level IS NOT NULL AND e.song_mode = 7
+      ORDER BY s.public_id, e.level, e.sha256
+      LIMIT 20001`,
+  ).all<Record<string, unknown>>();
+  if (result.results.length < 1 || result.results.length > 20_000) {
+    throw new ContainerBridgeError("table_input_unavailable", false);
+  }
+  const entries = result.results.map((row) => ({
+    table_id: row.table_id,
+    level: row.level,
+    sha256: row.sha256,
+    md5: row.md5,
+    title: row.title,
+  }));
+  const catalogManifestSha256 = await sha256Hex(canonicalJson(entries));
+  const context = encoder.encode(canonicalJson({
+    profile_id: job.profileId,
+    display_name: profile.display_name,
+    settings_revision: profile.settings_revision,
+    settings: {
+      timezone: profile.timezone,
+      target_judged: profile.target_judged,
+      reserve_judged: profile.reserve_judged,
+      readiness: profile.readiness,
+    },
+    catalog_manifest_sha256: catalogManifestSha256,
+    catalog_entries: entries,
+  }));
+  if (context.byteLength > MAX_TABLE_CONTEXT_BYTES) {
+    throw new ContainerBridgeError("table_input_too_large", false);
+  }
+  const settingsRevision = Number(profile.settings_revision);
+  if (!Number.isSafeInteger(settingsRevision) || settingsRevision < 1) {
+    throw new ContainerBridgeError("table_input_unavailable", false);
+  }
+  return { bytes: context, settingsRevision };
 }
 
 function parseInputPointer(value: string | null): string {
@@ -219,7 +301,11 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
   const scope = await profileScope(job.profileId);
   const session = await new D1UploadSessionStore(env.CONTROL_DB).getCompletedSession(scope, uploadId);
   if (!session) throw new ContainerBridgeError("input_manifest_not_found", true);
-  if (session.manifestSha256 !== job.inputDigest) throw new ContainerBridgeError("input_digest_mismatch", false);
+  const tableContext = await loadTableContext(job, env.CONTROL_DB);
+  const expectedInputDigest = job.jobKind === "regenerate" && job.eventId.startsWith("settings:")
+    ? await regenerationInputDigest(job.profileId, session.manifestSha256, tableContext.settingsRevision)
+    : session.manifestSha256;
+  if (expectedInputDigest !== job.inputDigest) throw new ContainerBridgeError("input_digest_mismatch", false);
   const byName = new Map(session.files.map((file) => [file.fileName, file]));
   const files = FIVE_DB_FILE_NAMES.map((name) => byName.get(name));
   if (files.some((file) => !file)) throw new ContainerBridgeError("input_file_set_invalid", false);
@@ -242,10 +328,10 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
     account_id: job.accountId,
     profile_id: job.profileId,
     trust_domain: job.trustDomain,
-    source_manifest_sha256: job.inputDigest,
+    source_manifest_sha256: session.manifestSha256,
     input_bundle: {
       object_key: `profiles/${job.profileId}/uploads/${uploadId}/five-db.enc`,
-      sha256: job.inputDigest,
+      sha256: session.manifestSha256,
       size_bytes: totalPlaintext,
       encryption: "envelope-v1",
       key_ref: `profile-key:${job.profileId}`,
@@ -260,8 +346,9 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
     },
   };
   const cryptoBox = EnvelopeCrypto.fromSecret(env.ENVELOPE_MASTER_KEY);
-  const body = framedStream(ordered, objects, scope, cryptoBox);
-  const length = transportLength(ordered);
+  const tableContextDigest = await sha256Bytes(tableContext.bytes);
+  const body = framedStream(ordered, objects, scope, cryptoBox, tableContext.bytes, tableContextDigest);
+  const length = transportLength(ordered, tableContext.bytes, tableContextDigest);
   const stub = env.PYTHON_PROCESSOR.get(env.PYTHON_PROCESSOR.idFromName(job.jobId));
   const response = await stub.fetch("http://python-processor/v1/jobs", {
     method: "POST",
@@ -270,7 +357,7 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
       "content-length": String(length),
       "x-container-input-manifest": encodeBase64Url(canonicalJson(inputManifest)),
       "x-container-output-revision": String(job.revision),
-      "x-container-transport": "five-db-framed-v1",
+      "x-container-transport": "five-db-framed-v2",
     },
     body,
   });
@@ -294,6 +381,7 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
     throw new ContainerBridgeError("container_artifact_contract_invalid", false);
   }
   let inlineBytes = 0;
+  const tableArtifacts: TableArtifact[] = [];
   const prefix = `profiles/${job.profileId}/jobs/${job.jobId}/revisions/${job.revision}/`;
   for (const artifact of payload.artifacts) {
     if (!artifact.object_key.startsWith(prefix) || !SHA256.test(artifact.sha256)) {
@@ -313,9 +401,20 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
       throw new ContainerBridgeError("container_artifact_digest_mismatch", false);
     }
     await immutablePut(env.ARTIFACT_BUCKET, artifact.object_key, content, artifact.sha256, artifact.content_type);
+    if (["recommend_header", "recommend_score", "daily_menu_header", "daily_menu_score"].includes(artifact.kind)) {
+      tableArtifacts.push({
+        kind: artifact.kind as TableArtifact["kind"],
+        objectKey: artifact.object_key,
+        sha256: artifact.sha256,
+        sizeBytes: artifact.size_bytes,
+      });
+    }
+  }
+  if (tableArtifacts.length !== 4 || new Set(tableArtifacts.map((artifact) => artifact.kind)).size !== 4) {
+    throw new ContainerBridgeError("table_artifact_missing", false);
   }
   const artifactKey = `${prefix}manifest.json`;
   const manifestBytes = encoder.encode(canonicalJson(payload.output_manifest));
   await immutablePut(env.ARTIFACT_BUCKET, artifactKey, manifestBytes, payload.output_manifest_sha256, "application/json");
-  return { outputManifestSha256: payload.output_manifest_sha256, artifactKey };
+  return { outputManifestSha256: payload.output_manifest_sha256, artifactKey, tableArtifacts };
 }
