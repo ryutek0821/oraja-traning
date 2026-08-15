@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -364,6 +364,20 @@ ALTER TABLE chart_pattern_features ADD COLUMN last_kill REAL;
 """
 
 
+SCHEMA_V9 = """
+CREATE TABLE replay_scan_state (
+  path             TEXT PRIMARY KEY,
+  device           INTEGER NOT NULL,
+  inode            INTEGER NOT NULL,
+  mtime_ns         INTEGER NOT NULL,
+  compressed_size  INTEGER NOT NULL,
+  outcome          TEXT NOT NULL,
+  checked_at       INTEGER NOT NULL,
+  CHECK(outcome IN ('valid', 'invalid', 'unstable'))
+);
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -428,7 +442,7 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n"
                 + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
-                + SCHEMA_V7 + SCHEMA_V8
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
             )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
@@ -443,7 +457,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
-                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
+                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -456,7 +470,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
-                + SCHEMA_V7 + SCHEMA_V8
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -469,7 +483,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6 + SCHEMA_V7
-                + SCHEMA_V8
+                + SCHEMA_V8 + SCHEMA_V9
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -482,6 +496,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
+                + SCHEMA_V9
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -492,7 +507,9 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 6:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -502,7 +519,17 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 7:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V8)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V8 + SCHEMA_V9)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 8:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V9)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -511,6 +538,79 @@ def migrate(conn: sqlite3.Connection) -> None:
         return
 
     raise RuntimeError(f"unsupported assistant DB schema_version {current}")
+
+
+def load_replay_scan_states(
+    conn: sqlite3.Connection,
+) -> dict[str, tuple[int, int, int, int, str]]:
+    """Return the last durably checked filesystem identity for each replay path."""
+
+    rows = conn.execute(
+        """
+        SELECT path, device, inode, mtime_ns, compressed_size, outcome
+        FROM replay_scan_state
+        """
+    )
+    return {
+        str(row[0]): (
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            int(row[4]),
+            str(row[5]),
+        )
+        for row in rows
+    }
+
+
+def upsert_replay_scan_states(
+    conn: sqlite3.Connection, observations: Iterable[Mapping[str, Any]]
+) -> None:
+    """Persist checked replay identities, including fail-closed outcomes."""
+
+    conn.executemany(
+        """
+        INSERT INTO replay_scan_state(
+          path, device, inode, mtime_ns, compressed_size, outcome, checked_at
+        ) VALUES (
+          :path, :device, :inode, :mtime_ns, :compressed_size, :outcome,
+          :checked_at
+        )
+        ON CONFLICT(path) DO UPDATE SET
+          device = excluded.device,
+          inode = excluded.inode,
+          mtime_ns = excluded.mtime_ns,
+          compressed_size = excluded.compressed_size,
+          outcome = excluded.outcome,
+          checked_at = excluded.checked_at
+        """,
+        observations,
+    )
+
+
+def delete_replay_scan_states(conn: sqlite3.Connection, paths: Iterable[str]) -> None:
+    """Forget scan state for replay slots that no longer exist."""
+
+    conn.executemany(
+        "DELETE FROM replay_scan_state WHERE path = ?",
+        ((path,) for path in paths),
+    )
+
+
+def replay_scan_error_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Return current persisted invalid and unstable slot counts."""
+
+    counts = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            """
+            SELECT outcome, count(*) FROM replay_scan_state
+            WHERE outcome != 'valid'
+            GROUP BY outcome
+            """
+        )
+    }
+    return counts.get("invalid", 0), counts.get("unstable", 0)
 
 
 def ingest_replay_metadata(

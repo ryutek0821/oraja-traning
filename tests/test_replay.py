@@ -114,3 +114,17 @@ def test_scan_is_deterministic_and_bounded(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(replay, "MAX_REPLAY_FILES", 1)
     with pytest.raises(replay.ReplayReadError, match="exceeds 1"):
         replay.scan(tmp_path)
+
+
+def test_scan_report_bounds_work_without_counting_overflow_as_invalid(
+    tmp_path, monkeypatch
+) -> None:
+    for index in range(3):
+        _write(tmp_path / f"{index}.brd", _payload(sha256=f"{index:064x}"))
+    monkeypatch.setattr(replay, "MAX_REPLAY_FILES", 2)
+
+    report = replay.scan_report(tmp_path)
+
+    assert len(report.metadata) == 2
+    assert report.invalid == 0
+    assert report.unstable == 0
