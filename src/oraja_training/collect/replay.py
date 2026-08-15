@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import gzip
 import hashlib
@@ -37,6 +38,8 @@ class ReplayChangedDuringRead(ReplayReadError):
 @dataclass(frozen=True, slots=True)
 class ReplayMeta:
     path: Path
+    device: int
+    inode: int
     content_hash: str
     compressed_size: int
     mtime_ns: int
@@ -60,6 +63,8 @@ class ReplayScanResult:
     metadata: tuple[ReplayMeta, ...]
     invalid: int = 0
     unstable: int = 0
+    invalid_paths: tuple[Path, ...] = ()
+    unstable_paths: tuple[Path, ...] = ()
 
 
 def _integer(value: Any, field: str, *, minimum: int | None = None) -> int:
@@ -142,6 +147,8 @@ def read(path: str | Path) -> ReplayMeta:
 
     return ReplayMeta(
         path=replay_path,
+        device=before.st_dev,
+        inode=before.st_ino,
         content_hash=digest.hexdigest(),
         compressed_size=before.st_size,
         mtime_ns=before.st_mtime_ns,
@@ -173,25 +180,35 @@ def scan(replay_dir: str | Path) -> list[ReplayMeta]:
     return [read(path) for path in paths]
 
 
-def scan_report(replay_dir: str | Path) -> ReplayScanResult:
-    """Scan every slot independently so one corrupt file cannot hide others."""
+def scan_report(
+    replay_dir: str | Path,
+    *,
+    candidates: Iterable[str | Path] | None = None,
+) -> ReplayScanResult:
+    """Scan one bounded batch so one corrupt file cannot hide other slots."""
 
     directory = Path(replay_dir)
     if not directory.is_dir():
         return ReplayScanResult(())
-    paths = sorted(directory.glob("*.brd"))
-    if len(paths) > MAX_REPLAY_FILES:
-        paths = paths[:MAX_REPLAY_FILES]
-        invalid = 1
-    else:
-        invalid = 0
-    unstable = 0
+    paths = sorted(
+        directory.glob("*.brd")
+        if candidates is None
+        else (Path(path) for path in candidates)
+    )[:MAX_REPLAY_FILES]
+    invalid_paths: list[Path] = []
+    unstable_paths: list[Path] = []
     metadata: list[ReplayMeta] = []
     for path in paths:
         try:
             metadata.append(read(path))
         except ReplayChangedDuringRead:
-            unstable += 1
+            unstable_paths.append(path)
         except (ReplayReadError, OSError):
-            invalid += 1
-    return ReplayScanResult(tuple(metadata), invalid=invalid, unstable=unstable)
+            invalid_paths.append(path)
+    return ReplayScanResult(
+        tuple(metadata),
+        invalid=len(invalid_paths),
+        unstable=len(unstable_paths),
+        invalid_paths=tuple(invalid_paths),
+        unstable_paths=tuple(unstable_paths),
+    )
