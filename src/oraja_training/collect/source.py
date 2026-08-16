@@ -36,11 +36,16 @@ class SourceSignature:
 
 
 def source_signature(db_path: str | Path) -> SourceSignature:
-    """Stat ``.db``, ``-wal`` and ``-shm`` independently."""
+    """Stat a SQLite database and each live sidecar independently."""
 
     main = Path(db_path)
     signals: list[FileSignal] = []
-    for path in (main, Path(f"{main}-wal"), Path(f"{main}-shm")):
+    for path in (
+        main,
+        Path(f"{main}-wal"),
+        Path(f"{main}-shm"),
+        Path(f"{main}-journal"),
+    ):
         try:
             stat = path.stat()
         except FileNotFoundError:

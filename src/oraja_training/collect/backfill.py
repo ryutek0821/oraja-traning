@@ -35,6 +35,7 @@ class SourceChangedDuringBackfill(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class BackfillResult:
     charts: int
+    pattern_features: int
     legacy_plays: int
     ir_imports: int
     song_rows_seen: int
@@ -78,6 +79,7 @@ def run(
 
     with closing(readers.open_snapshot(source_dir / "songdata.db")) as song_conn:
         songs = readers.read_songs(song_conn)
+        pattern_rows = readers.read_chart_patterns(song_conn)
     with closing(
         readers.open_snapshot(source_dir / "scoredatalog.db")
     ) as scoredatalog_conn:
@@ -112,6 +114,26 @@ def run(
                         "updated_at": now,
                     }
                     for song in songs
+                ),
+            )
+            store.upsert_chart_pattern_features(
+                conn,
+                (
+                    {
+                        "sha256": str(row["sha256"]),
+                        "rhythm_family": row.get("rhythm_family"),
+                        "avg_chord": row.get("avg_chord"),
+                        "chord_ge3": row.get("chord_ge3"),
+                        "micro_rate": row.get("micro_rate"),
+                        "long_jack_rate": row.get("long_jack_rate"),
+                        "practice_low": row.get("practice_low"),
+                        "analysis_version": int(row.get("analysis_version") or 0),
+                        "grid_bpm": row.get("grid_bpm"),
+                        "stream_sec": row.get("stream_sec"),
+                        "last_kill": row.get("last_kill"),
+                    }
+                    for row in pattern_rows
+                    if not row.get("error")
                 ),
             )
 
@@ -179,8 +201,10 @@ def run(
     skipped_ir_noplay = sum(
         int(row["date"]) == 0 and int(row["clear"]) == 0 for row in score_rows
     )
+    valid_pattern_rows = sum(not row.get("error") for row in pattern_rows)
     return BackfillResult(
         charts=chart_count,
+        pattern_features=valid_pattern_rows,
         legacy_plays=legacy_count,
         ir_imports=ir_count,
         song_rows_seen=len(songs),

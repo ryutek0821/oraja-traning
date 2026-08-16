@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -8,29 +10,38 @@ from oraja_training.collect.backfill import run
 
 
 @pytest.fixture(scope="module")
-def backfilled(player_db_dir, tmp_path_factory):
+def backfilled(synthetic_db_dir, tmp_path_factory):
     assistant_db = tmp_path_factory.mktemp("backfill") / "assistant.db"
-    result = run(player_db_dir, assistant_db, clock=lambda: 1_700_000_000)
+    result = run(synthetic_db_dir, assistant_db, clock=lambda: 1_700_000_000)
     return assistant_db, result
+
+
+def _golden() -> dict:
+    return json.loads(
+        (Path(__file__).parent / "golden/synthetic_backfill.json").read_text()
+    )
 
 
 def test_backfill_legacy_acceptance_values(backfilled) -> None:
     assistant_db, result = backfilled
-    assert result.charts == 65_998
-    assert result.ir_imports == 542
-    assert result.legacy_plays == 384
-    assert result.skipped_ir_noplay == 3
-    assert result.song_rows_seen == 66_156
+    expected = _golden()["backfill"]
+    assert {
+        "charts": result.charts,
+        "legacy_plays": result.legacy_plays,
+        "ir_imports": result.ir_imports,
+        "song_rows_seen": result.song_rows_seen,
+        "skipped_ir_noplay": result.skipped_ir_noplay,
+    } == expected["result"]
 
     conn = sqlite3.connect(assistant_db)
     try:
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot'"
-        ).fetchone()[0] == 384
+        ).fetchone()[0] == expected["legacy"]["rows"]
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
             "AND is_course = 1"
-        ).fetchone()[0] == 12
+        ).fetchone()[0] == expected["legacy"]["course_rows"]
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
             "AND survival > 1.0"
@@ -38,29 +49,29 @@ def test_backfill_legacy_acceptance_values(backfilled) -> None:
         assert conn.execute(
             "SELECT max(survival) FROM plays "
             "WHERE source = 'legacy_last_snapshot'"
-        ).fetchone()[0] == 1.0
+        ).fetchone()[0] == expected["legacy"]["max_survival"]
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
             "AND abs(survival - 1.0) < 1e-12"
-        ).fetchone()[0] == 365
+        ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
             "AND completed = 1"
-        ).fetchone()[0] == 368
-        assert conn.execute(
-            "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
-            "AND clear = 1 AND completed = 1"
-        ).fetchone()[0] == 84
+        ).fetchone()[0] == expected["legacy"]["completed_rows"]
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
             "AND clear >= 2 AND judged = notes"
-        ).fetchone()[0] == 272
+        ).fetchone()[0] == expected["legacy"]["full_judgement_rows"]
         empty_poor = conn.execute(
             "SELECT sum(empty_poor), max(empty_poor), "
             "sum(empty_poor = 0) FROM plays "
             "WHERE source = 'legacy_last_snapshot'"
         ).fetchone()
-        assert empty_poor == (11_255, 168, 2)
+        assert empty_poor == (
+            expected["legacy"]["empty_poor_sum"],
+            expected["legacy"]["empty_poor_max"],
+            expected["legacy"]["zero_empty_poor_rows"],
+        )
 
         gauge_counts = dict(
             conn.execute(
@@ -70,11 +81,8 @@ def test_backfill_legacy_acceptance_values(backfilled) -> None:
             )
         )
         assert gauge_counts == {
-            None: 148,
-            "EASY": 78,
-            "NORMAL": 37,
-            "HARD": 99,
-            "EXHARD": 22,
+            None if key == "null" else key: value
+            for key, value in expected["legacy"]["credited_gauge_counts"].items()
         }
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
@@ -90,6 +98,15 @@ def test_backfill_legacy_acceptance_values(backfilled) -> None:
             "(judged IS NOT NULL OR empty_poor IS NOT NULL OR "
             "survival IS NOT NULL OR completed IS NOT NULL)"
         ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM plays WHERE source = 'legacy_last_snapshot' "
+            "AND exceeded_aggregate_score = 1"
+        ).fetchone()[0] == expected["legacy"]["exceeded_aggregate_rows"]
+        assert conn.execute(
+            "SELECT count(*) FROM plays WHERE source = 'ir_import' "
+            "AND judged IS NULL AND empty_poor IS NULL AND survival IS NULL "
+            "AND completed IS NULL"
+        ).fetchone()[0] == expected["legacy"]["ir_null_derived_rows"]
     finally:
         conn.close()
 
@@ -97,36 +114,45 @@ def test_backfill_legacy_acceptance_values(backfilled) -> None:
 def test_backfill_follows_primary_key_and_noplay_rules(backfilled) -> None:
     assistant_db, result = backfilled
 
-    # The fixture contains 66,156 song paths but only 65,998 content hashes.
+    # The fixture contains five song paths but only four content hashes.
     # charts.sha256 is the canonical primary key in SPEC A-4.
-    assert result.charts == 65_998
+    assert result.charts == 4
 
-    # Three of the 545 date=0 score rows are clear=0/playcount=0 NoPlay rows.
+    # Two of the four date=0 score rows are clear=0/playcount=0 NoPlay rows.
     # SPEC 3.1 says these are not plays and must not enter plays.
-    assert result.ir_imports == 542
-    assert result.skipped_ir_noplay == 3
+    assert result.ir_imports == 2
+    assert result.skipped_ir_noplay == 2
+    assert result.pattern_features == 1
 
     conn = sqlite3.connect(assistant_db)
     try:
-        assert conn.execute("SELECT count(*) FROM charts").fetchone()[0] == 65_998
+        assert conn.execute("SELECT count(*) FROM charts").fetchone()[0] == 4
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'ir_import'"
-        ).fetchone()[0] == 542
+        ).fetchone()[0] == 2
         assert conn.execute(
             "SELECT count(*) FROM plays WHERE source = 'ir_import' AND clear = 0"
         ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM chart_pattern_features"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT practice_low, grid_bpm, stream_sec, last_kill "
+            "FROM chart_pattern_features WHERE sha256 = ?",
+            ("1" * 64,),
+        ).fetchone() == (1, 176.0, 14.0, 1.1)
     finally:
         conn.close()
 
 
-def test_backfill_is_idempotent(backfilled, player_db_dir) -> None:
+def test_backfill_is_idempotent(backfilled, synthetic_db_dir) -> None:
     assistant_db, _ = backfilled
-    second = run(player_db_dir, assistant_db, clock=lambda: 1_700_000_001)
-    assert second.charts == 65_998
-    assert second.legacy_plays == 384
-    assert second.ir_imports == 542
+    second = run(synthetic_db_dir, assistant_db, clock=lambda: 1_700_000_001)
+    assert second.charts == 4
+    assert second.legacy_plays == 4
+    assert second.ir_imports == 2
 
 
-def test_backfill_refuses_source_as_destination(player_db_dir) -> None:
+def test_backfill_refuses_source_as_destination(synthetic_db_dir) -> None:
     with pytest.raises(ValueError):
-        run(player_db_dir, player_db_dir / "score.db")
+        run(synthetic_db_dir, synthetic_db_dir / "score.db")

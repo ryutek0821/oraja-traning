@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>oraja-training account</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">本文へ移動</a>
+    <header class="masthead"><a class="wordmark" href="/"><span>07</span> oraja-training</a><button id="auth-locale" class="quiet" type="button">JA / KO</button></header>
+    <main id="main">
+      <section class="hero compact"><div><p class="eyebrow">PRIVATE TRAINING DESK</p><h1 data-auth="heading">自分の記録へ、戻る。</h1><p data-auth="lead">秘密値はURL、analytics、browser storageへ残しません。</p></div><div class="lanes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
+      <p id="auth-status" class="status" role="status" aria-live="polite"></p>
+      <div class="auth-grid">
+        <section class="panel" aria-labelledby="login-title">
+          <p class="eyebrow">SIGN IN</p><h2 id="login-title" data-auth="login">ログイン</h2>
+          <form id="login-form">
+            <label><span data-auth="user">ユーザーID</span><input name="user_id" autocomplete="username" required /></label>
+            <label><span data-auth="password">パスワード</span><input name="password" type="password" autocomplete="current-password" required /></label>
+            <button type="submit" data-auth="login">ログイン</button>
+          </form>
+        </section>
+        <section class="panel" aria-labelledby="register-title">
+          <p class="eyebrow">NEW ACCOUNT</p><h2 id="register-title" data-auth="register">アカウント登録</h2>
+          <form id="register-form">
+            <label><span data-auth="user">ユーザーID</span><input name="user_id" minlength="3" maxlength="32" pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{2,31}" autocomplete="username" required /></label>
+            <label><span data-auth="display">表示名</span><input name="display_name" maxlength="80" autocomplete="nickname" required /></label>
+            <label><span data-auth="password">パスワード</span><input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label>
+            <label><span data-auth="timezone">タイムゾーン</span><input name="timezone" value="Asia/Tokyo" required /></label>
+            <label><input name="terms_consent" type="checkbox" required /><span data-auth="terms">利用規約に同意する</span></label>
+            <label><input name="privacy_consent" type="checkbox" required /><span data-auth="privacy">プライバシー規約に同意する</span></label>
+            <button type="submit" data-auth="register">アカウント登録</button>
+          </form>
+        </section>
+        <section class="panel" aria-labelledby="recover-title">
+          <p class="eyebrow">RECOVERY</p><h2 id="recover-title" data-auth="recover">復旧コードでログイン</h2>
+          <form id="recovery-form">
+            <label><span data-auth="user">ユーザーID</span><input name="user_id" autocomplete="username" required /></label>
+            <label><span data-auth="code">復旧コード</span><input name="code" autocomplete="one-time-code" required /></label>
+            <button type="submit" data-auth="recover">復旧コードでログイン</button>
+          </form>
+        </section>
+        <section class="panel" aria-labelledby="reset-title">
+          <p class="eyebrow">PASSWORD RESET</p><h2 id="reset-title" data-auth="reset">再設定メールを送る</h2>
+          <form id="reset-form"><label><span data-auth="email">メール</span><input name="email" type="email" autocomplete="email" required /></label><button type="submit" data-auth="reset">再設定メールを送る</button></form>
+        </section>
+      </div>
+    </main>
+    <dialog id="recovery-dialog" aria-labelledby="recovery-codes-title"><h2 id="recovery-codes-title" data-auth="codesTitle">復旧コードを今保存してください</h2><p data-auth="codesHelp">再表示できません。安全なpassword managerへ保存してください。</p><code id="recovery-codes"></code><button id="recovery-saved" type="button" data-auth="saved">保存しました</button></dialog>
+    <script src="/auth.js" defer></script>
+  </body>
+</html>

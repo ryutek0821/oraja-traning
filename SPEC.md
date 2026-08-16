@@ -7,6 +7,26 @@
 
 ---
 
+## A-0. 適用範囲とサービスEpicとの関係
+
+この `SPEC.md` の v1 は、読み取り専用の beatoraja DB とローカル
+`assistant.db` を使う **self-hosted MVP** の実装正典である。ここでいう v1 の
+「IR連携なし」「書き込み先は `assistant.db` のみ」「ローカルHTTP配信」は、
+意図した制約であり、公式収集サービスの完成を意味しない。
+
+親Epic #1 の公式サービス計画（アカウント、公式IR、Cloudflare、Remote MCP、
+匿名集合学習）は、この文書の v1 を置き換える仕様ではない。サービス境界・wire
+contract・データ分類は `docs/architecture.md` と `docs/contracts/` を正典とし、
+各機能の実装と受入は #1 配下の Phase/実装issue（#2〜#23）で個別に完了させる。
+サービス実装が v1 のローカル挙動を変更するときは、先に adapter 契約と golden
+互換条件を更新する。
+
+2026-08-11 時点で、ローカル MVP と Phase 0 の設計資料は存在する。一方、公式
+Worker の実デプロイ、IR JAR、5DB upload、生成ジョブ、Remote MCP/OAuth、削除・
+復元、β運用、OSS公開はこの仕様の完了証拠に含まれず、未完了として扱う。
+
+---
+
 ## A-1. 目的と非目標
 
 **目的**: beatoraja のローカルDBを読み取り専用で監視し、プレイ単位の練習ログを蓄積した上で、次のセッションで叩くべき譜面・順序・回数を提示する。
@@ -26,7 +46,7 @@
 1. **beatoraja のDBへは、いかなる経路でも書き込まない。**
    `score.db` / `scoredatalog.db` / `scorelog.db` / `songdata.db` / `songinfo.db` すべて。
    特に `songdata.db` は oraja-constellator が `bmscf_*` テーブルで使用中。
-2. **`player-file/*.db` はユーザーの実データ。** テストでは `file:...?immutable=1` で開く。
+2. **ユーザーの実DBはリポジトリへ置かない。** ローカル検証で参照する場合も `file:...?immutable=1` で開く。
 3. ライブ読取は `file:...?mode=ro` + `busy_timeout`。
    **`immutable=1` をライブDBに使ってはならない**（変更されない前提で施錠を省くため、書込み中の不整合を読む）。
 4. 難易度表はキャッシュ付きで取得する。スクレイピングやIRへの大量アクセスをしない。
@@ -120,6 +140,10 @@ gzip圧縮JSON。`keyinput` は URL-safe Base64 + GZIP（1イベント = 符号�
 
 `ReplayData.gauge` は `BMSPlayer` が `config.getGauge()` を保存するため、**開始時に選択したゲージ**である。
 一方、`clear` はアシスト、フルコンボ、Gauge Auto Shift 後の状態を反映した**結果ランプ**であり、同義ではない。
+Replay日時は結果確定時、score日時はその直後のDB保存時に採番されるため、突合はReplay日時以降30秒以内の
+`sha256 + mode`が一意な場合だけ許可する。複数候補は曖昧としてplayを変更しない。
+Replayの設定LNモードに完全一致する候補がないmode 1/2だけ、score側の非未定義LN譜面正規化に合わせて
+mode 0を照合する。完全mode一致がある場合はmode 0へフォールバックしない。
 
 ⚠️ Step 0（Windows実機確認）で生成条件・上書き条件を検証してから Step 3 に着手すること。
 
@@ -198,6 +222,33 @@ CREATE TABLE collector_state (
   last_error        TEXT
 );
 
+-- .brd slotのmetadata-only履歴。keyinput/Replay本文は保存しない
+CREATE TABLE replay_metadata (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  path                   TEXT NOT NULL,
+  content_hash           TEXT NOT NULL,
+  previous_content_hash  TEXT,
+  observed_at            INTEGER NOT NULL,
+  mtime_ns               INTEGER NOT NULL,
+  compressed_size        INTEGER NOT NULL,
+  sha256                 TEXT NOT NULL,
+  mode                   INTEGER NOT NULL,
+  played_at              INTEGER NOT NULL,
+  gauge                  INTEGER NOT NULL,
+  selected_gauge_kind    TEXT NOT NULL,
+  randomoption           INTEGER,
+  randomoptionseed       INTEGER,
+  randomoption2          INTEGER,
+  randomoption2seed      INTEGER,
+  doubleoption           INTEGER,
+  seven_to_nine_pattern  INTEGER,
+  lane_shuffle_json      TEXT,
+  rand_json              TEXT,
+  match_status           TEXT NOT NULL,
+  matched_play_id        INTEGER REFERENCES plays(id),
+  UNIQUE(path, content_hash)
+);
+
 CREATE TABLE chart_features (
   sha256          TEXT PRIMARY KEY,
   feature_version INTEGER NOT NULL,
@@ -263,9 +314,14 @@ CREATE TABLE revisits (
   last_result   TEXT,
   PRIMARY KEY(sha256, mode)
 );
+
+-- schema v5: 事前登録した自己実験。入力beatoraja DBとは分離する。
+CREATE TABLE experiments (...);          -- seed、期間、arm別最小標本数
+CREATE TABLE experiment_sessions (...); -- session arm、候補hash、選択確率、選曲
+CREATE TABLE experiment_targets (...);  -- retention/transfer × 1/3/7/14日
 ```
 
-**`schema_version` は 3**。version 2 からは日次取込・ベスト差分・難易度表・推薦履歴用テーブルを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POOR を含めており、`ems`/`lms` を保存していないため**正しい値を復元できない**。version 1 の `assistant.db` を開いたら、黙って読まずに「削除して backfill をやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 10**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxy、version 9でReplay走査状態、version 10で実験の元候補hashを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POORを含めており、`ems`/`lms`を保存していないため**正しい値を復元できない**。version 1の`assistant.db`を開いたら、黙って読まずに「削除してbackfillをやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 
@@ -331,10 +387,10 @@ src/oraja_training/
   model/fit.py         evaluate_and_fit(conn) -> ModelReport           # 時間順holdout・ゲート判定
 
   plan/menu.py         build_session(...) -> Session                   # A-8 の構成
-  plan/schedule.py     due_revisits(conn, now) -> list
+  plan/experiment.py   start / assign_session / resolve_targets / report_experiment
 
   serve/app.py         ThreadingHTTPServer: /table/header.json /table/score.json / /api/status
-  cli.py               initialize / daily-update / tables refresh / features build / menu / review / serve
+  cli.py               initialize / daily-update / tables refresh / features build / menu / review / experiment / serve
 ```
 
 `Poller` の整合性要件: 1回のスキャンで `scoredatalog.db` と `score.db` の**両方**について、読取の前後で
@@ -407,6 +463,15 @@ RESERVE 10k を別に提示する。focus譜面は3枠離して再試行し、�
 
 **course は生成しない。セッション開始時に枠を固定して配信する**（難易度表のホットリロード保証が無いため）。
 
+### A-8.1 自己実験
+
+- `seed + session_key`のSHA-256からarmを50/50で決め、session内でarmを混在させない。
+- coach/controlは重複しない候補集合から一様抽出し、元入力hash、予約除外後の正規化候補JSONとSHA-256、arm確率、周辺selection probabilityを保存する。予約確認からtarget INSERTまでは単一writer transactionとし、同じ実験で既に選曲・予約した譜面は以後の候補と通常Daily Menuから除外する。
+- 選曲譜面をretentionとし、session開始前に未練習かつ別指定の類似譜面pool全M曲を保存する。そこから4曲を非復元抽出して1/3/7/14日後の各24時間窓へ別々に固定し、各intervalの周辺selection probabilityを`1/M`として再現可能にする。先の窓で演奏済みになった譜面を後の未練習transferへ再利用しない。
+- 評価窓が閉じるまでは確定せず、窓全体で`sha256 + mode`が一致し`completed`を持つplayが1件だけなら解決する。0件は`missing`、複数件、同じplayの再利用、またはtransferの指定窓より前のplayは`duplicate`として解析から除外する。
+- arm別の成功率とBrierをtarget種別・間隔ごとに出す。両armが事前設定した最小標本数へ達するまで差は`inconclusive`とする。
+- すべての実験書込みはassistant-owned schema v5だけへ行い、beatoraja入力DBへ書かない。
+
 ---
 
 ## A-9. 出力（`serve/app.py`）
@@ -423,4 +488,4 @@ v1が推定するのは `P(今クリアできる)` であって `E(この譜面�
 
 - UI・README に「**学習効果はヒューリスティック、成功確率のみ統計モデル**」と明記する
 - v1は「表別レベル＋粗い負荷特性による多様化推薦」。**「多次元弱点推定」を名乗るのは A-7 のゲートを通った軸が増えてから**
-- 1秒集計では「16分乱打と高密度同時押し」「隣接トリルと左右交互」「微縦連と通常乱打」を区別できない。乱打・縦連・トリルの軸は oraja-constellator の `bmscf_chart_analysis`（`micro_rate` / `long_jack_rate` / `avg_chord` / `rhythm_family`）を A-7 のゲートで評価して取り込む
+- 1秒集計では「16分乱打と高密度同時押し」「隣接トリルと左右交互」「微縦連と通常乱打」を区別できない。WARMUP安全判定では oraja-constellator の `bmscf_chart_analysis`（`micro_rate` / `long_jack_rate` / `avg_chord` / `grid_bpm` / `stream_sec` / `last_kill`）を取り込む。`grid_bpm`は高速交互の保守的proxyであり、レーン列を見たトリル判定とは名乗らない

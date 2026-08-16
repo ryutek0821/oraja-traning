@@ -1,0 +1,220 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "oraja-training",
+  "main": "./worker/src/index.ts",
+  "compatibility_date": "2026-08-11",
+  "workers_dev": true,
+  "keep_vars": false,
+  "observability": { "enabled": true },
+  "send_email": [
+    { "name": "AUTH_EMAIL" }
+  ],
+  "assets": {
+    "directory": "./web/public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/healthz", "/version"]
+  },
+  "env": {
+    "preview": {
+      "name": "oraja-training-preview",
+      "workers_dev": false,
+      "triggers": { "crons": ["0 2 1 * *", "0 3 * * *", "0 4 * * *"] },
+      "routes": [
+        { "pattern": "preview.oraja-training.example.invalid", "custom_domain": true }
+      ],
+      "send_email": [
+        { "name": "AUTH_EMAIL" }
+      ],
+      "vars": {
+        "ENVIRONMENT": "preview",
+        "BUILD_VERSION": "preview-local",
+        "PUBLIC_ORIGIN": "https://preview.oraja-training.example.invalid",
+        "CORS_ORIGINS": "https://preview.oraja-training.example.invalid",
+        "ORIGIN_ALLOWLIST": "preview.oraja-training.example.invalid"
+      },
+      "d1_databases": [
+        { "binding": "CONTROL_DB", "database_name": "oraja-training-preview-control" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "PROFILE_DO", "class_name": "ProfileDurableObject" },
+          { "name": "PYTHON_PROCESSOR", "class_name": "PythonProcessor" }
+        ]
+      },
+      "exports": {
+        "ProfileDurableObject": { "type": "durable-object", "storage": "sqlite" },
+        "PythonProcessor": { "type": "durable-object", "storage": "sqlite" }
+      },
+      "r2_buckets": [
+        { "binding": "RAW_BUCKET", "bucket_name": "oraja-training-preview-raw" },
+        { "binding": "ARTIFACT_BUCKET", "bucket_name": "oraja-training-preview-artifact" },
+        { "binding": "BACKUP_BUCKET", "bucket_name": "oraja-training-preview-backup" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "JOB_QUEUE", "queue": "oraja-training-preview-jobs" }
+        ],
+        "consumers": [
+          {
+            "queue": "oraja-training-preview-jobs",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 3,
+            "dead_letter_queue": "oraja-training-preview-jobs-dlq"
+          }
+        ]
+      },
+      "workflows": [
+        {
+          "binding": "GENERATE_WORKFLOW",
+          "name": "oraja-training-preview-generate",
+          "class_name": "GenerateWorkflow"
+        }
+      ],
+      "containers": [
+        {
+          "name": "oraja-training-preview-processor",
+          "class_name": "PythonProcessor",
+          "image": "./container/Dockerfile",
+          "image_build_context": "..",
+          "instance_type": "lite",
+          "max_instances": 1
+        }
+      ]
+    },
+    "staging": {
+      "name": "oraja-training-staging",
+      "workers_dev": false,
+      "triggers": { "crons": ["0 2 1 * *", "0 3 * * *", "0 4 * * *"] },
+      "routes": [
+        { "pattern": "staging.oraja-training.example.invalid", "custom_domain": true }
+      ],
+      "send_email": [
+        { "name": "AUTH_EMAIL" }
+      ],
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "BUILD_VERSION": "staging-local",
+        "PUBLIC_ORIGIN": "https://staging.oraja-training.example.invalid",
+        "CORS_ORIGINS": "https://staging.oraja-training.example.invalid",
+        "ORIGIN_ALLOWLIST": "staging.oraja-training.example.invalid"
+      },
+      "d1_databases": [
+        { "binding": "CONTROL_DB", "database_name": "oraja-training-staging-control" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "PROFILE_DO", "class_name": "ProfileDurableObject" },
+          { "name": "PYTHON_PROCESSOR", "class_name": "PythonProcessor" }
+        ]
+      },
+      "exports": {
+        "ProfileDurableObject": { "type": "durable-object", "storage": "sqlite" },
+        "PythonProcessor": { "type": "durable-object", "storage": "sqlite" }
+      },
+      "r2_buckets": [
+        { "binding": "RAW_BUCKET", "bucket_name": "oraja-training-staging-raw" },
+        { "binding": "ARTIFACT_BUCKET", "bucket_name": "oraja-training-staging-artifact" },
+        { "binding": "BACKUP_BUCKET", "bucket_name": "oraja-training-staging-backup" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "JOB_QUEUE", "queue": "oraja-training-staging-jobs" }
+        ],
+        "consumers": [
+          {
+            "queue": "oraja-training-staging-jobs",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 3,
+            "dead_letter_queue": "oraja-training-staging-jobs-dlq"
+          }
+        ]
+      },
+      "workflows": [
+        {
+          "binding": "GENERATE_WORKFLOW",
+          "name": "oraja-training-staging-generate",
+          "class_name": "GenerateWorkflow"
+        }
+      ],
+      "containers": [
+        {
+          "name": "oraja-training-staging-processor",
+          "class_name": "PythonProcessor",
+          "image": "./container/Dockerfile",
+          "image_build_context": "..",
+          "instance_type": "lite",
+          "max_instances": 1
+        }
+      ]
+    },
+    "production": {
+      "name": "oraja-training-production",
+      "workers_dev": false,
+      "triggers": { "crons": ["0 2 1 * *", "0 3 * * *", "0 4 * * *"] },
+      "routes": [
+        { "pattern": "oraja-training.example.invalid", "custom_domain": true }
+      ],
+      "send_email": [
+        { "name": "AUTH_EMAIL" }
+      ],
+      "vars": {
+        "ENVIRONMENT": "production",
+        "BUILD_VERSION": "production-local",
+        "PUBLIC_ORIGIN": "https://oraja-training.example.invalid",
+        "CORS_ORIGINS": "https://oraja-training.example.invalid",
+        "ORIGIN_ALLOWLIST": "oraja-training.example.invalid"
+      },
+      "d1_databases": [
+        { "binding": "CONTROL_DB", "database_name": "oraja-training-production-control" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "PROFILE_DO", "class_name": "ProfileDurableObject" },
+          { "name": "PYTHON_PROCESSOR", "class_name": "PythonProcessor" }
+        ]
+      },
+      "exports": {
+        "ProfileDurableObject": { "type": "durable-object", "storage": "sqlite" },
+        "PythonProcessor": { "type": "durable-object", "storage": "sqlite" }
+      },
+      "r2_buckets": [
+        { "binding": "RAW_BUCKET", "bucket_name": "oraja-training-production-raw" },
+        { "binding": "ARTIFACT_BUCKET", "bucket_name": "oraja-training-production-artifact" },
+        { "binding": "BACKUP_BUCKET", "bucket_name": "oraja-training-production-backup" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "JOB_QUEUE", "queue": "oraja-training-production-jobs" }
+        ],
+        "consumers": [
+          {
+            "queue": "oraja-training-production-jobs",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 3,
+            "dead_letter_queue": "oraja-training-production-jobs-dlq"
+          }
+        ]
+      },
+      "workflows": [
+        {
+          "binding": "GENERATE_WORKFLOW",
+          "name": "oraja-training-production-generate",
+          "class_name": "GenerateWorkflow"
+        }
+      ],
+      "containers": [
+        {
+          "name": "oraja-training-production-processor",
+          "class_name": "PythonProcessor",
+          "image": "./container/Dockerfile",
+          "image_build_context": "..",
+          "instance_type": "lite",
+          "max_instances": 1
+        }
+      ]
+    }
+  }
+}

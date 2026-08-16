@@ -1,0 +1,148 @@
+name: Cloudflare deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        type: choice
+        options:
+          - preview
+          - staging
+          - production
+      change_issue:
+        description: "Approved change issue, for example #20 (staging/production)"
+        required: false
+        type: string
+      backup_evidence:
+        description: "Immutable pre-deploy backup evidence ID (staging/production)"
+        required: false
+        type: string
+      restore_drill_evidence:
+        description: "Latest isolated restore-drill record ID (staging/production)"
+        required: false
+        type: string
+      rollback_version:
+        description: "Previously approved 40-character commit SHA"
+        required: false
+        type: string
+      release_manifest_sha256:
+        description: "SHA-256 of the reviewed release manifest"
+        required: false
+        type: string
+      migration_plan_sha256:
+        description: "SHA-256 of the reviewed migration plan"
+        required: false
+        type: string
+      go_no_go:
+        description: "Promotion decision (staging/production must select go)"
+        required: true
+        default: hold
+        type: choice
+        options:
+          - hold
+          - go
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: inputs.environment == 'preview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: preview
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run deploy:preview
+
+  staging:
+    if: inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+      ORAJA_CHANGE_ISSUE: ${{ inputs.change_issue }}
+      ORAJA_BACKUP_EVIDENCE: ${{ inputs.backup_evidence }}
+      ORAJA_RESTORE_DRILL_EVIDENCE: ${{ inputs.restore_drill_evidence }}
+      ORAJA_ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+      ORAJA_RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
+      ORAJA_MIGRATION_PLAN_SHA256: ${{ inputs.migration_plan_sha256 }}
+      ORAJA_GO_NO_GO: ${{ inputs.go_no_go }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run deploy:staging
+
+  production:
+    if: inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Configure required reviewers on the production GitHub Environment.
+    # This job is reachable only through workflow_dispatch and this gate.
+    environment:
+      name: production
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+      ORAJA_PRODUCTION_DEPLOY_APPROVED: "true"
+      ORAJA_CHANGE_ISSUE: ${{ inputs.change_issue }}
+      ORAJA_BACKUP_EVIDENCE: ${{ inputs.backup_evidence }}
+      ORAJA_RESTORE_DRILL_EVIDENCE: ${{ inputs.restore_drill_evidence }}
+      ORAJA_ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+      ORAJA_RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
+      ORAJA_MIGRATION_PLAN_SHA256: ${{ inputs.migration_plan_sha256 }}
+      ORAJA_GO_NO_GO: ${{ inputs.go_no_go }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run deploy:production

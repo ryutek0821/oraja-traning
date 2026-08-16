@@ -1,0 +1,39 @@
+{
+  "name": "@oraja-training/cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/check-config.mjs && node scripts/migrations.mjs check && node scripts/schema-check.mjs",
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types worker/worker-configuration.d.ts",
+    "schema:check": "node scripts/schema-check.mjs",
+    "public:scan": "node scripts/public-scan.mjs",
+    "migrations:check": "node scripts/migrations.mjs check",
+    "migration:plan": "node scripts/migrations.mjs plan",
+    "migration:apply": "node scripts/migrations.mjs apply",
+    "migration:rollback:plan": "node scripts/migrations.mjs rollback",
+    "preview:cleanup:plan": "node scripts/migrations.mjs preview-cleanup",
+    "sbom": "npm sbom --package-lock-only --sbom-format cyclonedx",
+    "container:build": "docker build --file container/Dockerfile --tag oraja-training/python-processor:ci ..",
+    "deploy:preview:dry": "node scripts/deploy.mjs preview --dry-run",
+    "deploy:staging:dry": "node scripts/deploy.mjs staging --dry-run",
+    "deploy:preview": "node scripts/deploy.mjs preview",
+    "deploy:staging": "node scripts/deploy.mjs staging",
+    "deploy:production": "node scripts/guarded-deploy.mjs production"
+  },
+  "devDependencies": {
+    "@cloudflare/containers": "0.3.7",
+    "@cloudflare/workers-types": "5.20260815.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.123.0"
+  },
+  "dependencies": {
+    "hash-wasm": "4.12.0"
+  }
+}

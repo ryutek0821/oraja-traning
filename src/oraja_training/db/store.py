@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 import sqlite3
+import json
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 10
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -16,6 +17,8 @@ BEATORAJA_DB_NAMES = {
     "songdata.db",
     "songinfo.db",
 }
+REPLAY_MATCH_TOLERANCE_SECONDS = 30
+REPLAY_LN_MODES = frozenset({1, 2})
 
 
 SCHEMA_V2 = """
@@ -234,6 +237,154 @@ CREATE TABLE recommendation_versions (
 """
 
 
+SCHEMA_V4 = """
+CREATE TABLE replay_metadata (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  path                   TEXT NOT NULL,
+  content_hash           TEXT NOT NULL,
+  previous_content_hash  TEXT,
+  observed_at            INTEGER NOT NULL,
+  mtime_ns               INTEGER NOT NULL,
+  compressed_size        INTEGER NOT NULL,
+  sha256                 TEXT NOT NULL,
+  mode                   INTEGER NOT NULL,
+  played_at              INTEGER NOT NULL,
+  gauge                  INTEGER NOT NULL,
+  selected_gauge_kind    TEXT NOT NULL,
+  randomoption           INTEGER,
+  randomoptionseed       INTEGER,
+  randomoption2          INTEGER,
+  randomoption2seed      INTEGER,
+  doubleoption           INTEGER,
+  seven_to_nine_pattern  INTEGER,
+  lane_shuffle_json      TEXT,
+  rand_json              TEXT,
+  match_status           TEXT NOT NULL,
+  matched_play_id        INTEGER REFERENCES plays(id),
+  UNIQUE(path, content_hash),
+  CHECK(match_status IN ('matched', 'unmatched', 'ambiguous'))
+);
+CREATE INDEX idx_replay_metadata_play
+  ON replay_metadata(sha256, mode, played_at);
+"""
+
+
+SCHEMA_V5 = """
+CREATE TABLE experiments (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                TEXT NOT NULL,
+  seed                TEXT NOT NULL,
+  starts_at           INTEGER NOT NULL,
+  ends_at             INTEGER NOT NULL,
+  min_samples_per_arm INTEGER NOT NULL,
+  created_at          INTEGER NOT NULL,
+  CHECK(ends_at > starts_at),
+  CHECK(min_samples_per_arm > 0)
+);
+
+CREATE TABLE experiment_sessions (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  experiment_id         INTEGER NOT NULL REFERENCES experiments(id),
+  session_key           TEXT NOT NULL,
+  session_at            INTEGER NOT NULL,
+  arm                   TEXT NOT NULL,
+  arm_probability       REAL NOT NULL,
+  selection_probability REAL NOT NULL,
+  candidate_hash        TEXT NOT NULL,
+  candidates_json       TEXT NOT NULL,
+  selected_sha256       TEXT NOT NULL,
+  selected_mode         INTEGER NOT NULL,
+  selected_p_pred       REAL NOT NULL,
+  transfer_sha256       TEXT NOT NULL,
+  transfer_mode         INTEGER NOT NULL,
+  transfer_p_pred       REAL NOT NULL,
+  assigned_at           INTEGER NOT NULL,
+  UNIQUE(experiment_id, session_key),
+  CHECK(arm IN ('coach', 'control')),
+  CHECK(arm_probability > 0 AND arm_probability <= 1),
+  CHECK(selection_probability > 0 AND selection_probability <= 1),
+  CHECK(selected_p_pred >= 0 AND selected_p_pred <= 1),
+  CHECK(transfer_p_pred >= 0 AND transfer_p_pred <= 1)
+);
+CREATE INDEX idx_experiment_sessions_experiment
+  ON experiment_sessions(experiment_id, arm);
+
+CREATE TABLE experiment_targets (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id       INTEGER NOT NULL REFERENCES experiment_sessions(id),
+  target_kind      TEXT NOT NULL,
+  interval_days    INTEGER NOT NULL,
+  sha256           TEXT NOT NULL,
+  mode             INTEGER NOT NULL,
+  due_at           INTEGER NOT NULL,
+  window_closes_at INTEGER NOT NULL,
+  p_pred           REAL NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending',
+  outcome          INTEGER,
+  resolved_play_id INTEGER REFERENCES plays(id),
+  resolved_at      INTEGER,
+  resolution_note  TEXT,
+  UNIQUE(session_id, target_kind, interval_days),
+  CHECK(target_kind IN ('retention', 'transfer')),
+  CHECK(interval_days IN (1, 3, 7, 14)),
+  CHECK(status IN ('pending', 'resolved', 'missing', 'duplicate')),
+  CHECK(outcome IS NULL OR outcome IN (0, 1)),
+  CHECK(p_pred >= 0 AND p_pred <= 1),
+  CHECK(window_closes_at > due_at)
+);
+CREATE INDEX idx_experiment_targets_resolution
+  ON experiment_targets(status, due_at, window_closes_at);
+"""
+
+
+SCHEMA_V6 = """
+CREATE TABLE chart_pattern_features (
+  sha256          TEXT PRIMARY KEY,
+  rhythm_family   INTEGER,
+  avg_chord       REAL,
+  chord_ge3       REAL,
+  micro_rate      REAL,
+  long_jack_rate  REAL,
+  practice_low    INTEGER,
+  analysis_version INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+SCHEMA_V7 = """
+ALTER TABLE table_sources ADD COLUMN entry_count INTEGER;
+ALTER TABLE table_sources ADD COLUMN matched_count INTEGER;
+"""
+
+
+SCHEMA_V8 = """
+ALTER TABLE chart_pattern_features ADD COLUMN grid_bpm REAL;
+ALTER TABLE chart_pattern_features ADD COLUMN stream_sec REAL;
+ALTER TABLE chart_pattern_features ADD COLUMN last_kill REAL;
+"""
+
+
+SCHEMA_V9 = """
+CREATE TABLE replay_scan_state (
+  path             TEXT PRIMARY KEY,
+  device           INTEGER NOT NULL,
+  inode            INTEGER NOT NULL,
+  mtime_ns         INTEGER NOT NULL,
+  compressed_size  INTEGER NOT NULL,
+  outcome          TEXT NOT NULL,
+  checked_at       INTEGER NOT NULL,
+  CHECK(outcome IN ('valid', 'invalid', 'unstable'))
+);
+"""
+
+
+SCHEMA_V10 = """
+ALTER TABLE experiment_sessions
+  ADD COLUMN input_candidate_hash TEXT NOT NULL DEFAULT '';
+UPDATE experiment_sessions SET input_candidate_hash = candidate_hash;
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -295,7 +446,11 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 0:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V2 + SCHEMA_V3)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
             )
@@ -307,7 +462,94 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 2:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V3)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
+                + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 3:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 4:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6 + SCHEMA_V7
+                + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 5:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
+                + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 6:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
+                + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 7:
+        try:
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+            )
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 8:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V9 + SCHEMA_V10)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 9:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V10)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -316,6 +558,206 @@ def migrate(conn: sqlite3.Connection) -> None:
         return
 
     raise RuntimeError(f"unsupported assistant DB schema_version {current}")
+
+
+def load_replay_scan_states(
+    conn: sqlite3.Connection,
+) -> dict[str, tuple[int, int, int, int, str]]:
+    """Return the last durably checked filesystem identity for each replay path."""
+
+    rows = conn.execute(
+        """
+        SELECT path, device, inode, mtime_ns, compressed_size, outcome
+        FROM replay_scan_state
+        """
+    )
+    return {
+        str(row[0]): (
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            int(row[4]),
+            str(row[5]),
+        )
+        for row in rows
+    }
+
+
+def upsert_replay_scan_states(
+    conn: sqlite3.Connection, observations: Iterable[Mapping[str, Any]]
+) -> None:
+    """Persist checked replay identities, including fail-closed outcomes."""
+
+    conn.executemany(
+        """
+        INSERT INTO replay_scan_state(
+          path, device, inode, mtime_ns, compressed_size, outcome, checked_at
+        ) VALUES (
+          :path, :device, :inode, :mtime_ns, :compressed_size, :outcome,
+          :checked_at
+        )
+        ON CONFLICT(path) DO UPDATE SET
+          device = excluded.device,
+          inode = excluded.inode,
+          mtime_ns = excluded.mtime_ns,
+          compressed_size = excluded.compressed_size,
+          outcome = excluded.outcome,
+          checked_at = excluded.checked_at
+        """,
+        observations,
+    )
+
+
+def delete_replay_scan_states(conn: sqlite3.Connection, paths: Iterable[str]) -> None:
+    """Forget scan state for replay slots that no longer exist."""
+
+    conn.executemany(
+        "DELETE FROM replay_scan_state WHERE path = ?",
+        ((path,) for path in paths),
+    )
+
+
+def replay_scan_error_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Return current persisted invalid and unstable slot counts."""
+
+    counts = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            """
+            SELECT outcome, count(*) FROM replay_scan_state
+            WHERE outcome != 'valid'
+            GROUP BY outcome
+            """
+        )
+    }
+    return counts.get("invalid", 0), counts.get("unstable", 0)
+
+
+def ingest_replay_metadata(
+    conn: sqlite3.Connection, metadata: Any, *, observed_at: int
+) -> tuple[str, bool, bool]:
+    """Persist a new slot version and update only an exactly matched play.
+
+    Returns ``(status, overwritten, changed)``. Re-observing identical slot
+    content is idempotent, except that an unmatched row may be reconciled after
+    its score event arrives.
+    """
+
+    def refresh_play_gauge(play_id: int) -> None:
+        replacement = conn.execute(
+            """
+            SELECT selected_gauge_kind FROM replay_metadata
+            WHERE match_status = 'matched' AND matched_play_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (play_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE plays SET selected_gauge_kind = ? WHERE id = ?",
+            (None if replacement is None else str(replacement[0]), play_id),
+        )
+
+    path = str(metadata.path)
+    existing = conn.execute(
+        """
+        SELECT id, match_status, matched_play_id FROM replay_metadata
+        WHERE path = ? AND content_hash = ?
+        """,
+        (path, metadata.content_hash),
+    ).fetchone()
+    def play_matches(mode: int) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT id FROM plays
+            WHERE sha256 = ? AND mode = ?
+              AND played_at >= ? AND played_at <= ? AND is_course = 0
+            ORDER BY id
+            LIMIT 2
+            """,
+            (
+                metadata.sha256,
+                mode,
+                metadata.played_at,
+                metadata.played_at + REPLAY_MATCH_TOLERANCE_SECONDS,
+            ),
+        ).fetchall()
+
+    matches = play_matches(metadata.mode)
+    if not matches and metadata.mode in REPLAY_LN_MODES:
+        # ReplayData always stores the configured LN mode. ScoreData stores 0
+        # for charts without undefined LN, so use that normalization only when
+        # there is no exact-mode candidate.
+        matches = play_matches(0)
+    if existing is not None:
+        previous_status = str(existing[1])
+        previous_play_id = None if existing[2] is None else int(existing[2])
+        if len(matches) == 1:
+            matched_play_id = int(matches[0][0])
+            if previous_status == "matched" and previous_play_id == matched_play_id:
+                return previous_status, False, False
+            conn.execute(
+                "UPDATE replay_metadata SET match_status = 'matched', matched_play_id = ? WHERE id = ?",
+                (matched_play_id, int(existing[0])),
+            )
+            if previous_play_id is not None and previous_play_id != matched_play_id:
+                refresh_play_gauge(previous_play_id)
+            refresh_play_gauge(matched_play_id)
+            return "matched", False, True
+        if len(matches) > 1 and previous_status != "ambiguous":
+            conn.execute(
+                """
+                UPDATE replay_metadata
+                SET match_status = 'ambiguous', matched_play_id = NULL
+                WHERE id = ?
+                """,
+                (int(existing[0]),),
+            )
+            if previous_play_id is not None:
+                refresh_play_gauge(previous_play_id)
+            return "ambiguous", False, True
+        return previous_status, False, False
+
+    previous = conn.execute(
+        "SELECT content_hash FROM replay_metadata WHERE path = ? ORDER BY id DESC LIMIT 1",
+        (path,),
+    ).fetchone()
+    previous_hash = None if previous is None else str(previous[0])
+    if len(matches) == 1:
+        status = "matched"
+        matched_play_id = int(matches[0][0])
+    elif matches:
+        status = "ambiguous"
+        matched_play_id = None
+    else:
+        status = "unmatched"
+        matched_play_id = None
+
+    conn.execute(
+        """
+        INSERT INTO replay_metadata(
+          path, content_hash, previous_content_hash, observed_at, mtime_ns,
+          compressed_size, sha256, mode, played_at, gauge, selected_gauge_kind,
+          randomoption, randomoptionseed, randomoption2, randomoption2seed,
+          doubleoption, seven_to_nine_pattern, lane_shuffle_json, rand_json,
+          match_status, matched_play_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            path, metadata.content_hash, previous_hash, int(observed_at),
+            metadata.mtime_ns, metadata.compressed_size, metadata.sha256,
+            metadata.mode, metadata.played_at, metadata.gauge,
+            metadata.selected_gauge_kind, metadata.randomoption,
+            metadata.randomoptionseed, metadata.randomoption2,
+            metadata.randomoption2seed, metadata.doubleoption,
+            metadata.seven_to_nine_pattern,
+            None if metadata.lane_shuffle_pattern is None else json.dumps(metadata.lane_shuffle_pattern, separators=(",", ":")),
+            None if metadata.rand is None else json.dumps(metadata.rand, separators=(",", ":")),
+            status, matched_play_id,
+        ),
+    )
+    if matched_play_id is not None:
+        refresh_play_gauge(matched_play_id)
+    return status, previous_hash is not None, True
 
 
 def init(path: str | Path) -> sqlite3.Connection:
@@ -464,6 +906,38 @@ def upsert_charts(
           updated_at = excluded.updated_at
         """,
         charts,
+    )
+
+
+def upsert_chart_pattern_features(
+    conn: sqlite3.Connection, features: Iterable[Mapping[str, Any]]
+) -> None:
+    """Copy optional oraja-constellator analysis into the assistant store."""
+
+    conn.executemany(
+        """
+        INSERT INTO chart_pattern_features(
+          sha256, rhythm_family, avg_chord, chord_ge3, micro_rate,
+          long_jack_rate, practice_low, analysis_version, grid_bpm,
+          stream_sec, last_kill
+        ) VALUES (
+          :sha256, :rhythm_family, :avg_chord, :chord_ge3, :micro_rate,
+          :long_jack_rate, :practice_low, :analysis_version, :grid_bpm,
+          :stream_sec, :last_kill
+        )
+        ON CONFLICT(sha256) DO UPDATE SET
+          rhythm_family=excluded.rhythm_family,
+          avg_chord=excluded.avg_chord,
+          chord_ge3=excluded.chord_ge3,
+          micro_rate=excluded.micro_rate,
+          long_jack_rate=excluded.long_jack_rate,
+          practice_low=excluded.practice_low,
+          analysis_version=excluded.analysis_version,
+          grid_bpm=excluded.grid_bpm,
+          stream_sec=excluded.stream_sec,
+          last_kill=excluded.last_kill
+        """,
+        features,
     )
 
 

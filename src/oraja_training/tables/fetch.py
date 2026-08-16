@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import unescape
 from html.parser import HTMLParser
 import hashlib
 import json
@@ -11,7 +12,7 @@ import re
 import time
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen as _urlopen
 
 
@@ -131,6 +132,82 @@ def _header_url_from_html(body: bytes, source_url: str) -> str:
     return urljoin(source_url, parser.header_url)
 
 
+def _parse_genocide_legacy(
+    body: bytes, source_url: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Parse GENOCIDE's Shift_JIS JavaScript array without evaluating code."""
+
+    try:
+        text = body.decode("cp932")
+    except UnicodeDecodeError as exc:
+        raise TableFetchError(f"invalid GENOCIDE encoding at {source_url}") from exc
+    begin = re.search(r"(?m)^\s*var\s+mname\s*=\s*\[\s*$", text)
+    if begin is None:
+        raise TableFetchError(f"no bmstable meta or GENOCIDE data at {source_url}")
+    end = re.search(r"(?m)^\s*\];\s*$", text[begin.end():])
+    if end is None:
+        raise TableFetchError(f"unterminated GENOCIDE data at {source_url}")
+    source = text[begin.end():begin.end() + end.start()]
+    string = r'((?:\\.|[^"\\])*)'
+    entry_pattern = re.compile(
+        r"\[\s*\d+\s*,\s*\"" + string
+        + r"\"\s*,\s*\"" + string
+        + r"\"\s*,\s*\"" + string + r"\"\s*,",
+        re.DOTALL,
+    )
+    entries: list[dict[str, Any]] = []
+    for match in entry_pattern.finditer(source):
+        values: list[str] = []
+        for encoded in match.groups():
+            fixed = re.sub(r'\\([^"/\\bfnrtu])', r'\\\\\1', encoded)
+            try:
+                value = json.loads(f'"{fixed}"')
+            except json.JSONDecodeError:
+                break
+            values.append(value)
+        if len(values) != 3:
+            continue
+        level, title, lr2_bms_id = values
+        if not level.startswith(("★", "☆")):
+            continue
+        if not title.strip():
+            continue
+        entries.append(
+            {
+                "level": level,
+                "title": unescape(title).strip(),
+                "lr2_bms_id": lr2_bms_id,
+                "_match": "unique_title",
+            }
+        )
+    if not entries:
+        raise TableFetchError(f"no valid GENOCIDE entries at {source_url}")
+    symbol = entries[0]["level"][0]
+    return (
+        {
+            "name": "GENOCIDE",
+            "symbol": symbol,
+            "data_url": source_url,
+            "format": "genocide-legacy",
+        },
+        entries,
+    )
+
+
+def _secure_same_host_url(base_url: str, resolved_url: str) -> str:
+    """Avoid mixed-content HTTP when an HTTPS table points at the same host."""
+
+    base = urlsplit(base_url)
+    resolved = urlsplit(resolved_url)
+    if (
+        base.scheme == "https"
+        and resolved.scheme == "http"
+        and base.hostname == resolved.hostname
+    ):
+        return urlunsplit(resolved._replace(scheme="https"))
+    return resolved_url
+
+
 def _validate_header(value: Any, url: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TableFetchError(f"header from {url} must be a JSON object")
@@ -153,7 +230,13 @@ def _normal_hash(value: Any, pattern: re.Pattern[str]) -> str | None:
     return value.strip().lower()
 
 
-def _validate_entries(value: Any, table_id: str, url: str) -> tuple[TableEntry, ...]:
+def _validate_entries(
+    value: Any,
+    table_id: str,
+    url: str,
+    *,
+    allow_unique_title: bool = False,
+) -> tuple[TableEntry, ...]:
     if not isinstance(value, list):
         raise TableFetchError(f"table data from {url} must be a JSON array")
     entries: list[TableEntry] = []
@@ -165,11 +248,17 @@ def _validate_entries(value: Any, table_id: str, url: str) -> tuple[TableEntry, 
             raise TableFetchError(f"entry {index} has no valid level")
         sha256 = _normal_hash(raw.get("sha256"), _HEX_64)
         md5 = _normal_hash(raw.get("md5"), _HEX_32)
-        if sha256 is None and md5 is None:
-            raise TableFetchError(f"entry {index} has no valid sha256 or md5")
         title = raw.get("title")
+        title_match = allow_unique_title and raw.get("_match") == "unique_title"
+        if sha256 is None and md5 is None and not (
+            title_match and isinstance(title, str) and title.strip()
+        ):
+            raise TableFetchError(f"entry {index} has no valid sha256 or md5")
         if title is not None and not isinstance(title, str):
             raise TableFetchError(f"entry {index} title must be a string")
+        entry_data = dict(raw)
+        if not title_match:
+            entry_data.pop("_match", None)
         entries.append(
             TableEntry(
                 table_id=table_id,
@@ -177,7 +266,7 @@ def _validate_entries(value: Any, table_id: str, url: str) -> tuple[TableEntry, 
                 sha256=sha256,
                 md5=md5,
                 title=title,
-                data=dict(raw),
+                data=entry_data,
             )
         )
     return tuple(entries)
@@ -207,10 +296,19 @@ def _save_cache(path: Path, value: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _updated_validators(response: _Response | None, old: Any) -> dict[str, Any]:
+    if response is None or response.not_modified:
+        return dict(old or {})
+    return {"etag": response.etag, "last_modified": response.last_modified}
+
+
 def _cached_table(cache: Mapping[str, Any], *, stale: bool) -> TableData:
     header = _validate_header(cache.get("header"), str(cache.get("header_url", "cache")))
     entries = _validate_entries(
-        cache.get("data"), str(cache["table_id"]), str(cache.get("data_url", "cache"))
+        cache.get("data"),
+        str(cache["table_id"]),
+        str(cache.get("data_url", "cache")),
+        allow_unique_title=cache.get("source_kind") == "genocide-legacy",
     )
     return TableData(
         table_id=str(cache["table_id"]),
@@ -266,17 +364,67 @@ def fetch_table(
                 raise TableFetchError("received 304 without a cached source")
             resolved_header_url = str(cache["header_url"])
             header = _validate_header(cache.get("header"), resolved_header_url)
+            raw_data = cache.get("data") if source_kind == "genocide-legacy" else None
         else:
             assert source_response.body is not None
             try:
                 source_json = _decode_json(source_response.body, source_url)
             except TableFetchError:
-                resolved_header_url = _header_url_from_html(source_response.body, source_url)
-                source_kind = "html"
+                try:
+                    resolved_header_url = _header_url_from_html(
+                        source_response.body, source_url
+                    )
+                except TableFetchError:
+                    if table_id != "genocide":
+                        raise
+                    header, raw_data = _parse_genocide_legacy(
+                        source_response.body, source_url
+                    )
+                    resolved_header_url = source_url
+                    source_kind = "genocide-legacy"
+                else:
+                    source_kind = "html"
             else:
                 header = _validate_header(source_json, source_url)
                 resolved_header_url = source_url
                 source_kind = "json"
+
+        if source_kind == "genocide-legacy":
+            data_url = source_url
+            entries = _validate_entries(
+                raw_data, table_id, data_url, allow_unique_title=True
+            )
+            fetched_at = int(time.time())
+            result = TableData(
+                table_id=table_id,
+                source_url=source_url,
+                header_url=resolved_header_url,
+                data_url=data_url,
+                header=header,
+                entries=entries,
+                fetched_at=fetched_at,
+                from_cache=source_response.not_modified,
+            )
+            if cache_path is not None:
+                _save_cache(
+                    cache_path,
+                    {
+                        "table_id": table_id,
+                        "source_url": source_url,
+                        "source_kind": source_kind,
+                        "header_url": resolved_header_url,
+                        "data_url": data_url,
+                        "header": header,
+                        "data": raw_data,
+                        "fetched_at": fetched_at,
+                        "source_validators": _updated_validators(
+                            source_response, (cache or {}).get("source_validators")
+                        ),
+                        "header_validators": {},
+                        "data_validators": {},
+                    },
+                )
+            return result
 
         header_response: _Response | None = None
         if source_kind == "html":
@@ -297,7 +445,10 @@ def fetch_table(
                     resolved_header_url,
                 )
 
-        data_url = urljoin(resolved_header_url, str(header["data_url"]).strip())
+        data_url = _secure_same_host_url(
+            resolved_header_url,
+            urljoin(resolved_header_url, str(header["data_url"]).strip()),
+        )
         old_data_url = str((cache or {}).get("data_url", ""))
         data_response = _request(
             data_url,
@@ -325,11 +476,6 @@ def fetch_table(
             from_cache=source_response.not_modified and data_response.not_modified,
         )
         if cache_path is not None:
-            def validators(response: _Response | None, old: Any) -> dict[str, Any]:
-                if response is None or response.not_modified:
-                    return dict(old or {})
-                return {"etag": response.etag, "last_modified": response.last_modified}
-
             _save_cache(
                 cache_path,
                 {
@@ -341,13 +487,13 @@ def fetch_table(
                     "header": header,
                     "data": raw_data,
                     "fetched_at": fetched_at,
-                    "source_validators": validators(
+                    "source_validators": _updated_validators(
                         source_response, (cache or {}).get("source_validators")
                     ),
-                    "header_validators": validators(
+                    "header_validators": _updated_validators(
                         header_response, (cache or {}).get("header_validators")
                     ),
-                    "data_validators": validators(
+                    "data_validators": _updated_validators(
                         data_response, (cache or {}).get("data_validators")
                     ),
                 },

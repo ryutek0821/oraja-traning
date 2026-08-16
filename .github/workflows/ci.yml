@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest tests/test_contracts.py -q
+      - run: pytest -q
+
+  cloudflare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUILD_VERSION: ${{ github.sha }}
+    defaults:
+      run:
+        working-directory: cloudflare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm test
+      - run: npm run schema:check
+      - run: npm run check
+      - run: npm run typecheck
+      - run: npm run public:scan
+      - run: mkdir -p artifacts
+      - run: npm sbom --package-lock-only --sbom-format cyclonedx > artifacts/cloudflare-sbom.json
+      - run: node -e "JSON.parse(require('fs').readFileSync('artifacts/cloudflare-sbom.json', 'utf8'))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-sbom
+          path: cloudflare/artifacts/cloudflare-sbom.json
+      - name: Detect preview deploy inputs
+        id: preview_inputs
+        run: |
+          if [ -f container/Dockerfile ] && [ -d web/public ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Preview deploy dry-run is deferred until the Container and Web artifacts exist."
+          fi
+      - if: steps.preview_inputs.outputs.ready == 'true'
+        run: npm run deploy:preview:dry
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Container build input
+        id: container_input
+        run: |
+          if [ -f cloudflare/container/Dockerfile ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Container build is deferred until its owning feature adds a Dockerfile."
+          fi
+      - if: steps.container_input.outputs.ready == 'true'
+        run: npm --prefix cloudflare run container:build
+
+  ir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the pinned beatoraja compatibility target
+        uses: actions/checkout@v4
+        with:
+          repository: exch-bms2/beatoraja
+          ref: 721856fbb4311241ea81711e0574e5cc094c13c2
+          path: .upstream/beatoraja
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: "17"
+          java-package: jdk+fx
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Build the pinned real beatoraja JAR
+        run: ant -f .upstream/beatoraja/build.xml create_run_jar
+      - name: Run behavior contracts against source-only compatibility fixtures
+        run: gradle --project-dir cloudflare/ir clean check
+      - name: Compile and assemble main sources against the real JAR
+        run: >-
+          gradle --project-dir cloudflare/ir clean realBeatorajaCompatibility releaseArtifacts
+          -PbeatorajaJar=${{ github.workspace }}/.upstream/beatoraja/build/beatoraja.jar
+          -PbeatorajaApiVersion=master@721856fbb431
+      - name: Verify public JAR boundary
+        run: |
+          jar tf cloudflare/ir/build/libs/oraja-training-ir-0.1.0.jar > /tmp/oraja-ir-entries.txt
+          grep -qx 'META-INF/LICENSE' /tmp/oraja-ir-entries.txt
+          grep -qx 'META-INF/NOTICE' /tmp/oraja-ir-entries.txt
+          if grep -Eq 'bms/player/beatoraja/ir/(IRAccount|IRConnection|IRScoreData|IRChartData)\.class' /tmp/oraja-ir-entries.txt; then
+            echo 'compile-only beatoraja compatibility class was bundled' >&2
+            exit 1
+          fi
+      - name: Preserve first-build checksums
+        run: |
+          mkdir -p /tmp/oraja-ir-first
+          cp cloudflare/ir/build/release/*.sha256 /tmp/oraja-ir-first/
+      - name: Rebuild and compare reproducible artifacts
+        run: |
+          gradle --project-dir cloudflare/ir clean releaseArtifacts \
+            -PbeatorajaJar=${{ github.workspace }}/.upstream/beatoraja/build/beatoraja.jar \
+            -PbeatorajaApiVersion=master@721856fbb431
+          diff -u /tmp/oraja-ir-first/oraja-training-ir-0.1.0.jar.sha256 cloudflare/ir/build/release/oraja-training-ir-0.1.0.jar.sha256
+          diff -u /tmp/oraja-ir-first/oraja-training-ir-0.1.0-sources.jar.sha256 cloudflare/ir/build/release/oraja-training-ir-0.1.0-sources.jar.sha256
+          diff -u /tmp/oraja-ir-first/oraja-training-ir-0.1.0-source.zip.sha256 cloudflare/ir/build/release/oraja-training-ir-0.1.0-source.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oraja-training-ir-release-candidate
+          path: cloudflare/ir/build/release/
+          if-no-files-found: error
+      - name: Attest IR artifact provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: cloudflare/ir/build/release/oraja-training-ir-*

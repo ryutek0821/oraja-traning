@@ -13,3 +13,11 @@ assistant.db-wal
 .sites/
 export/
 data/
+/runtime/
+cloudflare/node_modules/
+cloudflare/ir/.gradle/
+cloudflare/ir/build/
+cloudflare/.wrangler/
+cloudflare/.dev.vars*
+cloudflare/.env*
+cloudflare/worker/worker-configuration.d.ts

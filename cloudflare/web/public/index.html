@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>oraja-training cockpit</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">本文へ移動</a>
+    <header class="masthead">
+      <a class="wordmark" href="/" aria-label="oraja-training home"><span>07</span> oraja-training</a>
+      <nav aria-label="Account and language">
+        <button class="quiet" id="locale" type="button" aria-label="한국어로 전환">JA / KO</button>
+        <button class="quiet" id="logout" type="button" data-i18n="logout">ログアウト</button>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div>
+          <p class="eyebrow" data-i18n="eyebrow">BEATORAJA / SP7 TRAINING DESK</p>
+          <h1 id="hero-title" data-i18n="title">次の一曲を、<br />迷わず選ぶ。</h1>
+          <p class="lede" data-i18n="intro">公式IRの記録を、練習表と小さな判断材料へ変換します。</p>
+        </div>
+        <div class="lanes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      </section>
+
+      <p id="status" class="status" role="status" aria-live="polite" data-i18n="loading">読み込み中…</p>
+
+      <div class="desk" id="dashboard" hidden>
+        <aside class="rail" aria-label="Profile status">
+          <p class="eyebrow" data-i18n="profile">PROFILE</p>
+          <h2 id="profile-name">—</h2>
+          <dl>
+            <div><dt data-i18n="timezone">タイムゾーン</dt><dd id="timezone">—</dd></div>
+            <div><dt data-i18n="profileStatus">状態</dt><dd id="profile-status">—</dd></div>
+            <div><dt data-i18n="lastRun">最終処理</dt><dd id="last-run">—</dd></div>
+          </dl>
+          <a class="button secondary" href="/guide.html" data-i18n="guide">IR導入ガイド</a>
+        </aside>
+
+        <div class="workarea">
+          <section class="panel" aria-labelledby="tables-title">
+            <div class="panel-head"><div><p class="eyebrow">PLAYER OUTPUT</p><h2 id="tables-title" data-i18n="tables">今日の練習表</h2></div><button id="refresh" class="quiet" type="button" data-i18n="refresh">更新</button></div>
+            <div id="artifacts" class="cards"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="summary-title">
+            <div class="panel-head"><div><p class="eyebrow">7 / 30 / 90 DAYS</p><h2 id="summary-title" data-i18n="summary">練習の輪郭</h2></div></div>
+            <div id="summaries" class="summary-grid"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="devices-title">
+            <div class="panel-head"><div><p class="eyebrow">OFFICIAL IR</p><h2 id="devices-title" data-i18n="devices">接続端末</h2></div><button id="new-device" type="button" data-i18n="addDevice">端末を追加</button></div>
+            <div id="devices" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="settings-title">
+            <div class="panel-head"><div><p class="eyebrow">SESSION CONTROL</p><h2 id="settings-title" data-i18n="settings">練習設定</h2></div></div>
+            <form id="settings-form">
+              <label><span data-i18n="timezone">タイムゾーン</span><input id="setting-timezone" name="timezone" autocomplete="off" required /></label>
+              <label><span data-i18n="target">目標判定数</span><input id="setting-target" name="target" type="number" min="10000" max="1000000" step="1000" required /></label>
+              <label><span data-i18n="reserve">予備判定数</span><input id="setting-reserve" name="reserve" type="number" min="0" max="500000" step="1000" required /></label>
+              <label><span data-i18n="readiness">今日の状態</span><select id="setting-readiness" name="readiness"><option value="normal" data-i18n="normal">通常</option><option value="tired" data-i18n="tired">疲労</option></select></label>
+              <button type="submit" data-i18n="saveSettings">設定を保存</button>
+            </form>
+          </section>
+
+          <section class="panel" aria-labelledby="capabilities-title">
+            <div class="panel-head"><div><p class="eyebrow">BEATORAJA TABLE URL</p><h2 id="capabilities-title" data-i18n="capabilities">秘密の表URL</h2></div></div>
+            <p data-i18n="capabilityHelp">URLは更新時に一度だけ表示します。共有・ログ記録をしないでください。</p>
+            <div id="capabilities" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="jobs-title">
+            <div class="panel-head"><div><p class="eyebrow">PROCESSING</p><h2 id="jobs-title" data-i18n="jobs">処理履歴とデータ品質</h2></div></div>
+            <div id="quality" class="muted"></div><div id="jobs" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="advisor-title">
+            <div class="panel-head"><div><p class="eyebrow">AI ADVISOR</p><h2 id="advisor-title" data-i18n="advisor">確認待ちの提案</h2></div><button id="refresh-advisor" class="quiet" type="button" data-i18n="refresh">更新</button></div>
+            <p data-i18n="advisorHelp">根拠期間と提供元を確認し、プロフィール所有者だけが承認または却下できます。</p>
+            <div id="advisor-proposals" class="rows"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="import-title">
+            <div class="panel-head"><div><p class="eyebrow">MONTHLY SNAPSHOT</p><h2 id="import-title" data-i18n="import">5DBを提出</h2></div></div>
+            <p data-i18n="importHelp">静止スナップショット5ファイルだけを選択してください。BMS本体、Replay、-wal、-shmは送信しません。</p>
+            <input id="db-files" type="file" multiple accept=".db" aria-describedby="db-hint" />
+            <p id="db-hint" class="muted">songdata.db / songinfo.db / score.db / scorelog.db / scoredatalog.db</p>
+            <button id="prepare-upload" type="button" data-i18n="prepare">hash確認して提出</button>
+            <progress id="upload-progress" value="0" max="100" hidden>0%</progress>
+          </section>
+
+          <section class="panel danger" aria-labelledby="privacy-title">
+            <div class="panel-head"><div><p class="eyebrow">DATA CONTROL</p><h2 id="privacy-title" data-i18n="privacy">データ管理</h2></div></div>
+            <p data-i18n="privacyHelp">Exportと削除はログイン中のプロフィールだけが対象です。削除は7日以内なら取り消せます。</p>
+            <div class="actions"><button id="export" class="secondary" type="button" data-i18n="export">Exportを作成</button><button id="delete" class="destructive" type="button" data-i18n="delete">削除を申請</button><button id="cancel-delete" class="secondary" type="button" data-i18n="cancel">削除を取り消す</button></div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <dialog id="token-dialog" aria-labelledby="token-title">
+      <h2 id="token-title" data-i18n="tokenTitle">このtokenは一度だけ表示されます</h2>
+      <p data-i18n="tokenHelp">IR設定へ保存し、共有・スクリーンショット・ログ記録をしないでください。</p>
+      <code id="device-token"></code>
+      <div class="actions"><button id="copy-token" type="button" data-i18n="copy">コピー</button><button id="close-token" class="secondary" type="button" data-i18n="saved">保存しました</button></div>
+    </dialog>
+    <dialog id="capability-dialog" aria-labelledby="capability-dialog-title">
+      <h2 id="capability-dialog-title" data-i18n="capabilityOnce">この秘密URLは一度だけ表示されます</h2>
+      <p data-i18n="capabilityHelp">URLは更新時に一度だけ表示します。共有・ログ記録をしないでください。</p>
+      <code id="capability-url"></code>
+      <div class="actions"><button id="copy-capability" type="button" data-i18n="copy">コピー</button><button id="close-capability" class="secondary" type="button" data-i18n="saved">保存しました</button></div>
+    </dialog>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

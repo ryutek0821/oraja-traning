@@ -64,6 +64,11 @@ class InfoRow(DynamicRow):
 
 
 @dataclass(frozen=True, slots=True)
+class ChartPatternRow(DynamicRow):
+    """Optional analysis row produced by oraja-constellator."""
+
+
+@dataclass(frozen=True, slots=True)
 class ScoreLogRow(DynamicRow):
     """One schema-version-tolerant row from ``scorelog``."""
 
@@ -102,6 +107,20 @@ def open_live(
     return conn
 
 
+def open_private_copy(
+    path: str | Path, *, busy_timeout_ms: int = 1_000
+) -> sqlite3.Connection:
+    """Open an owned live-DB copy, allowing recovery only on that copy."""
+
+    conn = sqlite3.connect(
+        _sqlite_uri(path, "mode=rw"),
+        uri=True,
+        timeout=busy_timeout_ms / 1_000,
+    )
+    _configure_read_only(conn, busy_timeout_ms)
+    return conn
+
+
 def open_snapshot(
     path: str | Path, *, busy_timeout_ms: int = 1_000
 ) -> sqlite3.Connection:
@@ -131,6 +150,29 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Return the runtime column set for ``table`` using ``PRAGMA table_info``."""
 
     return set(_table_column_names(conn, table))
+
+
+def _primary_key_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    quoted = _quoted_identifier(table)
+    positions = (
+        (int(row[5]), str(row[1]))
+        for row in conn.execute(f"PRAGMA table_info({quoted})")
+        if int(row[5]) > 0
+    )
+    return tuple(name for _position, name in sorted(positions))
+
+
+def _require_overwrite_scoredatalog_schema(conn: sqlite3.Connection) -> None:
+    expected = ("sha256", "mode")
+    actual = _primary_key_columns(conn, "scoredatalog")
+    if actual == expected:
+        return
+    rendered = "<none>" if not actual else f"({', '.join(actual)})"
+    raise ReaderSchemaError(
+        "unsupported scoredatalog schema: expected overwrite-only PRIMARY KEY "
+        f"(sha256, mode), found {rendered}; append-style scoredatalog tables "
+        "cannot be collected safely"
+    )
 
 
 def _require_columns(table: str, actual: Iterable[str], required: set[str]) -> None:
@@ -187,6 +229,7 @@ _SCORE_REQUIRED = {
 def read_scoredatalog(conn: sqlite3.Connection) -> list[ScoreRow]:
     """Read the complete latest-play snapshot with runtime column detection."""
 
+    _require_overwrite_scoredatalog_schema(conn)
     return _select_rows(
         conn,
         "scoredatalog",
@@ -323,6 +366,25 @@ def read_songinfo(
         conn,
         "information",
         InfoRow,
+        sha256s,
+        {"sha256"},
+    )
+
+
+def read_chart_patterns(
+    conn: sqlite3.Connection, sha256s: Iterable[str] | None = None
+) -> list[ChartPatternRow]:
+    """Read optional high-resolution pattern analysis without requiring it."""
+
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bmscf_chart_analysis'"
+    ).fetchone()
+    if exists is None:
+        return []
+    return _read_by_hashes(
+        conn,
+        "bmscf_chart_analysis",
+        ChartPatternRow,
         sha256s,
         {"sha256"},
     )
