@@ -645,16 +645,18 @@ async function enqueuePlay(
   env: Env,
   identity: DeviceIdentity,
   event: { event_id: string },
-  ack: PlayAck,
   digest: string,
-): Promise<void> {
-  await env.JOB_QUEUE.send({
-    type: "play.accepted.v1",
-    job_id: ack.job_id,
-    event_id: event.event_id,
-    profile_id: identity.profileId,
-    revision: ack.revision,
-    input_digest: digest,
+  requestIdValue: string,
+) {
+  return new JobDispatcher(new D1JobLedger(env.CONTROL_DB), env.JOB_QUEUE).acceptAndEnqueue({
+    accountId: identity.accountId,
+    profileId: identity.profileId,
+    jobKind: "play",
+    eventId: event.event_id,
+    requestId: requestIdValue,
+    correlationId: event.event_id,
+    inputDigest: digest,
+    inputKey: `play-event:${event.event_id}`,
   });
 }
 
@@ -701,11 +703,14 @@ async function handlePlayRoute(request: Request, env: Env, origin?: string): Pro
       ack.event_id !== event.event_id ||
       ack.idempotency_key !== event.event_id
     ) throw new ApiError("temporary_unavailable", 503, true, 5);
-    if (ack.enqueue_required) {
-      await enqueuePlay(env, identity, event, ack, digest);
-      await markPlayEnqueued(stub, event.event_id);
-    }
-    return json(publicPlayAck(ack), ack.status === "accepted" ? 202 : 200, origin);
+    const accepted = await enqueuePlay(env, identity, event, digest, requestIdValue);
+    if (ack.enqueue_required) await markPlayEnqueued(stub, event.event_id);
+    const ledgerAck: PlayAck = {
+      ...ack,
+      job_id: accepted.job.jobId,
+      revision: accepted.job.revision,
+    };
+    return json(publicPlayAck(ledgerAck), ack.status === "accepted" ? 202 : 200, origin);
   } catch (error) {
     return irErrorResponse(error, requestIdValue, origin);
   }
@@ -975,7 +980,10 @@ export default {
       for (const deletionId of due.deletionIds) await finalizeDeletion(env.CONTROL_DB, deletionId, scheduledAt);
       return;
     }
-    if (schedule === "daily-backup") await processExportSnapshots(env, scheduledAt);
+    if (schedule === "daily-backup") {
+      await processExportSnapshots(env, scheduledAt);
+      return;
+    }
     const ledger = new D1JobLedger(env.CONTROL_DB);
     await dispatchSchedule(
       ledger,

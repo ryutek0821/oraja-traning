@@ -51,3 +51,11 @@ test("completed uploads enqueue one immutable owner-scoped workflow input", () =
   assert.match(worker, /inputDigest: completed\.manifestSha256/);
   assert.match(worker, /accountId: context\.accountId/);
 });
+
+test("scheduled and play jobs resolve durable inputs and preserve their job kind", () => {
+  assert.match(bridge, /ORDER BY completed_at DESC, created_at DESC LIMIT 1/);
+  assert.match(bridge, /internal\/play-events/);
+  assert.match(bridge, /x-container-job-kind/);
+  assert.match(bridge, /x-container-play-event/);
+  assert.match(bridge, /MAX_PLAY_EVENT_BYTES/);
+});

@@ -35,6 +35,8 @@ except ImportError:  # pragma: no cover - package/module execution fallback
 
 
 MAX_MANIFEST_HEADER_BYTES = 64 * 1024
+MAX_PLAY_EVENT_HEADER_BYTES = 16 * 1024
+JOB_KINDS = {"initial", "monthly", "play", "regenerate"}
 SAFE_BUNDLE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 FRAMED_MAGIC = b"ORAJA5DB1\n"
 FRAMED_MAGIC_V2 = b"ORAJA5DB2\n"
@@ -181,6 +183,50 @@ def _decode_manifest_header(value: str) -> Mapping[str, Any]:
     return manifest
 
 
+def _decode_play_event_header(value: str, manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+    if len(value.encode("ascii", errors="ignore")) > MAX_PLAY_EVENT_HEADER_BYTES * 2:
+        raise ManifestError("play event header is too large", code="payload_too_large")
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        event = parse_json(decoded)
+    except (ValueError, UnicodeError) as exc:
+        raise ManifestError("play event header is invalid", code="invalid_json") from exc
+    if len(decoded) > MAX_PLAY_EVENT_HEADER_BYTES or not isinstance(event, Mapping):
+        raise ManifestError("play event header is invalid", code="invalid_contract")
+    row = event.get("row")
+    required = {"sha256", "mode", "date", "playcount", "clear"}
+    if (
+        event.get("contract") != "container-play-event"
+        or event.get("schema_version") != 1
+        or event.get("profile_id") != manifest.get("profile_id")
+        or not isinstance(event.get("event_id"), str)
+        or re.fullmatch(r"[0-9a-f-]{36}", str(event.get("event_id"))) is None
+        or not isinstance(event.get("payload_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(event.get("payload_digest"))) is None
+        or not isinstance(row, Mapping)
+        or not required.issubset(row)
+        or not isinstance(row.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256"))) is None
+        or any(not isinstance(row.get(key), int) for key in ("mode", "date", "playcount", "clear"))
+    ):
+        raise ManifestError("play event contract is invalid", code="invalid_contract")
+    return event
+
+
+def _readiness_probe(adapter: ContainerAdapter, input_root: Path, allow_fixture: bool) -> bool:
+    if not callable(getattr(adapter, "run_job", None)) or not isinstance(adapter.artifact_store, MemoryArtifactStore):
+        return False
+    if allow_fixture and not input_root.is_dir():
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="oraja-ready-") as temporary:
+            probe = Path(temporary) / "probe"
+            probe.write_bytes(b"ready")
+            return probe.read_bytes() == b"ready"
+    except OSError:
+        return False
+
+
 def _safe_fixture_path(root: Path, name: str) -> Path:
     if SAFE_BUNDLE_NAME.fullmatch(name) is None:
         raise ManifestError("bundle name is invalid", code="invalid_contract")
@@ -221,6 +267,15 @@ class ProcessorHandler(HealthHandler):
             header_manifest = self.headers.get("X-Container-Input-Manifest")
             if header_manifest:
                 manifest = _decode_manifest_header(header_manifest)
+                job_kind = self.headers.get("X-Container-Job-Kind") or ""
+                if job_kind not in JOB_KINDS:
+                    raise ManifestError("job kind is invalid", code="unsupported_job_type")
+                play_header = self.headers.get("X-Container-Play-Event")
+                if job_kind == "play" and not play_header:
+                    raise ManifestError("play event is required", code="invalid_contract")
+                if job_kind != "play" and play_header:
+                    raise ManifestError("play event is not allowed", code="invalid_contract")
+                play_event = _decode_play_event_header(play_header, manifest) if play_header else None
                 raw_length = self.headers.get("Content-Length")
                 try:
                     content_length = int(raw_length or "-1")
@@ -233,23 +288,27 @@ class ProcessorHandler(HealthHandler):
                     with tempfile.TemporaryDirectory(prefix="oraja-framed-") as temporary:
                         source_dir = Path(temporary)
                         table_context = _materialize_framed_input(_BoundedBody(self.rfile, content_length), source_dir)
-                        result = self.adapter.run(
+                        result = self.adapter.run_job(
+                            job_kind,
                             manifest,
                             bundle=source_dir,
                             revision=revision,
                             generated_at=str(manifest.get("requested_at")),
                             table_context=table_context,
+                            play_event=play_event,
                         )
                 else:
                     input_bundle = manifest.get("input_bundle")
                     expected_size = input_bundle.get("size_bytes") if isinstance(input_bundle, Mapping) else None
                     if not isinstance(expected_size, int) or content_length != expected_size:
                         raise ManifestError("content length does not match manifest", code="invalid_contract")
-                    result = self.adapter.run(
+                    result = self.adapter.run_job(
+                        job_kind,
                         manifest,
                         bundle=_BoundedBody(self.rfile, content_length),
                         revision=revision,
                         generated_at=str(manifest.get("requested_at")),
+                        play_event=play_event,
                     )
             else:
                 request = self._read_json_request()
@@ -259,7 +318,11 @@ class ProcessorHandler(HealthHandler):
                 bundle_name = request.get("bundle_name")
                 if not isinstance(bundle_name, str):
                     raise ManifestError("bundle_name is required", code="invalid_contract")
-                result = self.adapter.run(
+                job_kind = request.get("job_kind", "initial")
+                if not isinstance(job_kind, str) or job_kind not in JOB_KINDS:
+                    raise ManifestError("job kind is invalid", code="unsupported_job_type")
+                result = self.adapter.run_job(
+                    job_kind,
                     manifest,
                     bundle=_safe_fixture_path(self.input_root, bundle_name),
                     table_context=request.get("table_context") if isinstance(request.get("table_context"), Mapping) else None,
@@ -317,6 +380,7 @@ def _build_handler() -> type[ProcessorHandler]:
 
     BoundProcessorHandler.adapter = adapter
     BoundProcessorHandler.input_root = input_root
+    BoundProcessorHandler.ready = _readiness_probe(adapter, input_root, allow_fixture)
     return BoundProcessorHandler
 
 

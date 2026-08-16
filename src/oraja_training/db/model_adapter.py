@@ -48,13 +48,27 @@ def _observations(conn: sqlite3.Connection) -> list[Observation]:
 
     rows = conn.execute(
         """
+        WITH semantic_events AS (
+          SELECT p.*,
+                 row_number() OVER (
+                   PARTITION BY p.sha256, p.mode, p.played_at, p.playcount
+                   ORDER BY CASE p.source
+                              WHEN 'collector' THEN 0
+                              WHEN 'official_ir' THEN 1
+                              WHEN 'daily_snapshot' THEN 2
+                              ELSE 3
+                            END,
+                            p.ingested_at DESC, p.id DESC
+                 ) AS semantic_rank
+            FROM plays AS p
+           WHERE p.source IN ('collector', 'official_ir', 'daily_snapshot')
+        )
         SELECT p.id, p.played_at, p.completed, te.table_id, te.level,
                f.density_p99, f.scratch_rate
-          FROM plays AS p
+          FROM semantic_events AS p
           JOIN chart_features AS f ON f.sha256 = p.sha256
           JOIN table_entries AS te ON te.sha256 = p.sha256
-         WHERE p.source IN ('collector', 'daily_snapshot')
-           AND p.completed IS NOT NULL
+         WHERE p.semantic_rank = 1 AND p.completed IS NOT NULL
            AND p.is_course = 0
            AND f.density_p99 IS NOT NULL
            AND f.scratch_rate IS NOT NULL

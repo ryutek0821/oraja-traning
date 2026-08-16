@@ -67,22 +67,150 @@ def _insert_play(
     *,
     sha256: str,
     played_at: int,
-    completed: int,
+    completed: int | None,
     serial: int,
     mode: int = 0,
+    source: str = "collector",
+    source_generation: int | None = None,
+    playcount: int | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO plays(
           sha256, mode, played_at, playcount, source_generation, source,
           clear, completed, is_course, payload_hash, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, 'collector', ?, ?, 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """,
         (
-            sha256, mode, played_at, serial, serial, 4 if completed else 1,
-            completed, f"experiment-{serial}", played_at,
+            sha256,
+            mode,
+            played_at,
+            serial if playcount is None else playcount,
+            serial if source_generation is None else source_generation,
+            source,
+            4 if completed else 1,
+            completed,
+            f"experiment-{serial}",
+            played_at,
         ),
     )
+
+
+def test_resolve_ignores_non_scorable_play_with_unique_scorable_play(
+    tmp_path,
+) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        experiment_id = _start(conn)
+        assignment = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="non-scorable-coexists",
+            session_at=BASE,
+            candidate_sets=_sets(),
+            assigned_at=BASE,
+        )
+        retention = assignment["selected"]
+        with conn:
+            _insert_play(
+                conn,
+                sha256=retention["sha256"],
+                mode=retention["mode"],
+                played_at=BASE + DAY_SECONDS + 10,
+                completed=None,
+                serial=1,
+            )
+            _insert_play(
+                conn,
+                sha256=retention["sha256"],
+                mode=retention["mode"],
+                played_at=BASE + DAY_SECONDS + 20,
+                completed=1,
+                serial=2,
+            )
+
+        counts = resolve_targets(
+            conn, experiment_id=experiment_id, now=BASE + 2 * DAY_SECONDS
+        )
+        assert counts == {
+            "resolved": 1,
+            "missing": 1,
+            "duplicate": 0,
+            "pending": 0,
+        }
+        target = conn.execute(
+            """
+            SELECT target.status, target.outcome, play.completed
+            FROM experiment_targets target
+            LEFT JOIN plays play ON play.id = target.resolved_play_id
+            WHERE target.session_id = ? AND target.target_kind = 'retention'
+              AND target.interval_days = 1
+            """,
+            (assignment["session_id"],),
+        ).fetchone()
+        assert tuple(target) == ("resolved", 1, 1)
+    finally:
+        conn.close()
+
+
+def test_resolve_deduplicates_official_ir_and_collector_copy(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        experiment_id = _start(conn)
+        assignment = assign_session(
+            conn,
+            experiment_id=experiment_id,
+            session_key="semantic-play-copy",
+            session_at=BASE,
+            candidate_sets=_sets(),
+            assigned_at=BASE,
+        )
+        retention = assignment["selected"]
+        played_at = BASE + DAY_SECONDS + 10
+        with conn:
+            _insert_play(
+                conn,
+                sha256=retention["sha256"],
+                mode=retention["mode"],
+                played_at=played_at,
+                completed=0,
+                serial=1,
+                source="official_ir",
+                source_generation=-3,
+                playcount=1,
+            )
+            _insert_play(
+                conn,
+                sha256=retention["sha256"],
+                mode=retention["mode"],
+                played_at=played_at,
+                completed=1,
+                serial=2,
+                source="collector",
+                source_generation=0,
+                playcount=1,
+            )
+
+        counts = resolve_targets(
+            conn, experiment_id=experiment_id, now=BASE + 2 * DAY_SECONDS
+        )
+        assert counts == {
+            "resolved": 1,
+            "missing": 1,
+            "duplicate": 0,
+            "pending": 0,
+        }
+        target = conn.execute(
+            """SELECT target.status, target.outcome, play.source
+               FROM experiment_targets target
+               LEFT JOIN plays play ON play.id = target.resolved_play_id
+               WHERE target.session_id = ? AND target.target_kind = 'retention'
+                 AND target.interval_days = 1""",
+            (assignment["session_id"],),
+        ).fetchone()
+        assert tuple(target) == ("resolved", 1, "collector")
+    finally:
+        conn.close()
 
 
 def test_assignment_is_deterministic_balanced_and_session_level(tmp_path) -> None:

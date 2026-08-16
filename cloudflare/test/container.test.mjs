@@ -16,6 +16,9 @@ test("Container entrypoint keeps the streamed manifest boundary and health route
   const entrypoint = await readFile(new URL("container/entrypoint.py", root), "utf8");
   const health = await readFile(new URL("container/health.py", root), "utf8");
   assert.match(entrypoint, /X-Container-Input-Manifest/);
+  assert.match(entrypoint, /X-Container-Job-Kind/);
+  assert.match(entrypoint, /X-Container-Play-Event/);
+  assert.match(entrypoint, /self\.adapter\.run_job/);
   assert.match(entrypoint, /self\.path != "\/v1\/jobs"/);
   assert.match(entrypoint, /ORAJA_ALLOW_PLAINTEXT_FIXTURE/);
   assert.match(entrypoint, /class _BoundedBody/);
@@ -23,4 +26,6 @@ test("Container entrypoint keeps the streamed manifest boundary and health route
   assert.match(health, /"\/healthz"/);
   assert.match(health, /"\/readyz"/);
   assert.match(health, /"\/version"/);
+  assert.match(entrypoint, /_readiness_probe/);
+  assert.doesNotMatch(health, /ready = True/);
 });

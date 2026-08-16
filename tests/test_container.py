@@ -195,6 +195,52 @@ def test_container_pipeline_uses_core_and_replays_immutable_artifacts() -> None:
         assert first.output_manifest["raw_db_exported"] is False
 
 
+def test_container_job_dispatch_applies_one_incremental_ir_play(tmp_path: Path) -> None:
+    source = build_synthetic_fixture(tmp_path / "source")
+    catalog = load_catalog(source)
+    context = _table_context(source)
+    bundle = _bundle(tmp_path)
+    manifest = _manifest(bundle)
+    chart = catalog["owned"][0]
+    event = {
+        "contract": "container-play-event",
+        "schema_version": 1,
+        "event_id": "018f0f0f-0f30-7f0f-8f0f-0f0f0f0f0f0f",
+        "profile_id": PROFILE_ID,
+        "payload_digest": "3" * 64,
+        "row": {
+            "sha256": chart["sha256"],
+            "mode": 0,
+            "date": 1_786_400_000,
+            "playcount": 999,
+            "clear": 4,
+            "notes": 1000,
+            "passnotes": 1000,
+            "minbp": 10,
+            "epg": 500,
+            "lpg": 0,
+            "egr": 0,
+            "lgr": 0,
+            "egd": 0,
+            "lgd": 0,
+            "ebd": 0,
+            "lbd": 0,
+            "epr": 0,
+            "lpr": 0,
+            "ems": 0,
+            "lms": 0,
+        },
+    }
+    incremental = ContainerAdapter(
+        decryptor=PassthroughDecryptor(),
+        clock=lambda: 1_786_400_000,
+    ).run_job("play", manifest, bundle=bundle, table_context=context, play_event=event)
+    assert incremental.counters["accepted_events"] == 7
+
+    with pytest.raises(ContainerError, match="unsupported"):
+        ContainerAdapter().run_job("delete", manifest)
+
+
 def test_container_refuses_to_publish_tables_without_owned_catalog_input(tmp_path: Path) -> None:
     build_synthetic_fixture(tmp_path / "source")
     bundle = _bundle(tmp_path)

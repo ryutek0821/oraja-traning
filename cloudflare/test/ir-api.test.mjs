@@ -45,3 +45,10 @@ test("CORS exposes the device-management methods without widening payload routes
   assert.match(worker, /GET,POST,PATCH,DELETE,OPTIONS/);
   assert.match(worker, /content-type,authorization,x-csrf-token,x-request-id/);
 });
+
+test("accepted IR plays enter the durable job ledger", () => {
+  assert.match(worker, /jobKind: "play"/);
+  assert.match(worker, /inputKey: `play-event:\$\{event\.event_id\}`/);
+  assert.match(worker, /acceptAndEnqueue/);
+  assert.doesNotMatch(worker, /type: "play\.accepted\.v1"/);
+});

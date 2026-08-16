@@ -26,7 +26,7 @@ def json_response(
 class HealthHandler(BaseHTTPRequestHandler):
     """Base handler shared by health-only and processing entrypoints."""
 
-    ready = True
+    ready = False
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         if self.path in {"/", "/healthz"}:

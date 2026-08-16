@@ -25,6 +25,21 @@ test("authorization codes and tokens are exactly bound to the MCP resource", () 
   assert.match(index, /destination\.searchParams\.set\("iss"/);
 });
 
+test("redirect URIs allow HTTPS or HTTP loopback only", () => {
+  assert.match(oauth, /const secure = url\.protocol === "https:"/);
+  assert.match(oauth, /url\.protocol === "http:" && isLoopbackHostname\(url\.hostname\)/);
+  assert.match(oauth, /normalized === "localhost" \|\| normalized === "\[::1\]"/);
+  assert.match(oauth, /octets\[0\] === "127"/);
+});
+
+test("authorization code consumption and token insertion share one guarded batch", () => {
+  assert.match(oauth, /const results = await db\.batch\(\[/);
+  assert.match(oauth, /UPDATE oauth_authorization_codes SET used_at = \?1 WHERE code_hash = \?2 AND used_at IS NULL/);
+  assert.match(oauth, /WHERE EXISTS \(\s*SELECT 1 FROM oauth_authorization_codes WHERE code_hash = \?11 AND used_at = \?12/);
+  assert.match(oauth, /results\.some\(\(result\) => \(result\.meta\?\.changes \?\? 0\) !== 1\)/);
+  assert.doesNotMatch(oauth, /const consumed = await db/);
+});
+
 test("refresh rotation detects reuse and revokes the whole grant", () => {
   assert.match(migration, /CREATE TABLE oauth_grants/);
   assert.match(migration, /reuse_detected_at INTEGER/);

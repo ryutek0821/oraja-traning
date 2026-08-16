@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from oraja_training.collect.normalize import derive_play, payload_hash
+from oraja_training.domain.types import DomainValidationError, OFFICIAL_IR_GENERATION
 
 
 def _row() -> dict:
@@ -57,6 +58,18 @@ def test_ir_import_keeps_raw_values_but_nulls_judgement_derivations() -> None:
     assert play["bp_rate"] == 1.01
     for column in ("judged", "empty_poor", "survival", "completed"):
         assert play[column] is None
+
+
+def test_official_ir_has_a_reserved_scorable_generation() -> None:
+    play = derive_play(
+        _row(), source="official_ir", source_generation=OFFICIAL_IR_GENERATION
+    )
+    assert OFFICIAL_IR_GENERATION == -3
+    assert play["source_generation"] == -3
+    assert play["completed"] == 1
+
+    with pytest.raises(DomainValidationError):
+        derive_play(_row(), source="official_ir", source_generation=-4)
 
 
 @pytest.mark.parametrize(

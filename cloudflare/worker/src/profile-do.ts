@@ -79,6 +79,57 @@ function portableState(value: unknown): unknown {
     .map(([key, item]) => [key, portableState(item)]));
 }
 
+function containerPlayEvent(record: StoredPlayEvent): Record<string, unknown> {
+  const score = irScore(record, record.profile_internal_id);
+  return {
+    contract: "container-play-event",
+    schema_version: 1,
+    event_id: record.event_id,
+    profile_id: record.profile_internal_id,
+    payload_digest: record.payload_digest,
+    row: {
+      sha256: score.sha256,
+      mode: score.lntype,
+      date: score.date,
+      playcount: record.revision,
+      clear: score.clear,
+      notes: score.notes,
+      passnotes: score.passnotes,
+      minbp: score.minbp,
+      maxcombo: score.maxcombo,
+      option: score.option,
+      seed: score.seed,
+      assist: score.assist,
+      gauge: score.gauge,
+      epg: score.epg,
+      lpg: score.lpg,
+      egr: score.egr,
+      lgr: score.lgr,
+      egd: score.egd,
+      lgd: score.lgd,
+      ebd: score.ebd,
+      lbd: score.lbd,
+      epr: score.epr,
+      lpr: score.lpr,
+      ems: score.ems,
+      lms: score.lms,
+    },
+  };
+}
+
+
+function ackFor(record: StoredPlayEvent, status: PlayAck["status"], enqueueRequired: boolean): PlayAck {
+  return {
+    status,
+    event_id: record.event_id,
+    idempotency_key: record.event_id,
+    job_id: record.job_id,
+    revision: record.revision,
+    retryable: false,
+    enqueue_required: enqueueRequired,
+  };
+}
+
 function publicPlay(record: StoredPlayEvent): Record<string, unknown> {
   return {
     event_id: record.event.event_id,
@@ -220,18 +271,6 @@ function exportPlay(record: StoredPlayEvent): Record<string, unknown> {
   };
 }
 
-function ackFor(record: StoredPlayEvent, status: PlayAck["status"], enqueueRequired: boolean): PlayAck {
-  return {
-    status,
-    event_id: record.event_id,
-    idempotency_key: record.event_id,
-    job_id: record.job_id,
-    revision: record.revision,
-    retryable: false,
-    enqueue_required: enqueueRequired,
-  };
-}
-
 function newJobId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   const timestamp = BigInt(Math.max(0, Math.floor(Date.now())));
@@ -274,6 +313,10 @@ export class ProfileDurableObject extends DurableObject {
     }
     if (request.method === "POST" && url.pathname === "/internal/privacy/purge") {
       return this.purge(request);
+    }
+    const readEventMatch = /^\/internal\/play-events\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && readEventMatch) {
+      return this.readPlayEvent(decodeURIComponent(readEventMatch[1]));
     }
     const enqueueMatch = /^\/internal\/play-events\/([^/]+)\/enqueued$/.exec(url.pathname);
     if (request.method === "POST" && enqueueMatch) {
@@ -376,6 +419,17 @@ export class ProfileDurableObject extends DurableObject {
         return true;
       });
       return marked ? response({ marked: true }) : response({ error: { code: "not_found" } }, 404);
+    } catch {
+      return response({ error: { code: "temporary_unavailable" } }, 503);
+    }
+  }
+
+  private async readPlayEvent(eventId: string): Promise<Response> {
+    if (!/^[0-9a-f-]{36}$/.test(eventId)) return response({ error: { code: "invalid_event_id" } }, 400);
+    try {
+      const stored = await this.storage().get<unknown>(`play:${eventId}`);
+      if (!isStoredPlayEvent(stored)) return response({ error: { code: "not_found" } }, 404);
+      return response(containerPlayEvent(stored));
     } catch {
       return response({ error: { code: "temporary_unavailable" } }, 503);
     }

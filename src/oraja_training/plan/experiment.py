@@ -652,11 +652,28 @@ def resolve_targets(
                 status = "duplicate"
                 note = "transfer chart played before evaluation window"
             else:
-                plays = conn.execute(
+                scorable_plays = conn.execute(
                     """
-                    SELECT id, completed FROM plays
-                    WHERE sha256 = ? AND mode = ? AND is_course = 0
-                      AND played_at >= ? AND played_at < ?
+                    WITH semantic_plays AS (
+                      SELECT id, completed, played_at,
+                             row_number() OVER (
+                               PARTITION BY sha256, mode, played_at, playcount
+                               ORDER BY CASE source
+                                          WHEN 'collector' THEN 0
+                                          WHEN 'official_ir' THEN 1
+                                          WHEN 'daily_snapshot' THEN 2
+                                          WHEN 'legacy_last_snapshot' THEN 3
+                                          ELSE 4
+                                        END,
+                                        ingested_at DESC, id DESC
+                             ) AS semantic_rank
+                      FROM plays
+                      WHERE sha256 = ? AND mode = ? AND is_course = 0
+                        AND played_at >= ? AND played_at < ?
+                        AND completed IS NOT NULL
+                    )
+                    SELECT id, completed FROM semantic_plays
+                    WHERE semantic_rank = 1
                     ORDER BY played_at, id
                     """,
                     (
@@ -664,13 +681,10 @@ def resolve_targets(
                         target["window_closes_at"],
                     ),
                 ).fetchall()
-                scorable = [
-                    play for play in plays if play["completed"] is not None
-                ]
-                if len(scorable) > 1:
+                if len(scorable_plays) > 1:
                     status, note = "duplicate", "multiple plays in evaluation window"
-                elif len(scorable) == 1:
-                    candidate_play_id = int(scorable[0]["id"])
+                elif len(scorable_plays) == 1:
+                    candidate_play_id = int(scorable_plays[0]["id"])
                     already_used = conn.execute(
                         """
                         SELECT 1 FROM experiment_targets other
@@ -688,7 +702,7 @@ def resolve_targets(
                     else:
                         status = "resolved"
                         play_id = candidate_play_id
-                        outcome = int(bool(scorable[0]["completed"]))
+                        outcome = int(bool(scorable_plays[0]["completed"]))
                 else:
                     status = "missing"
                     note = "no scorable play in evaluation window"

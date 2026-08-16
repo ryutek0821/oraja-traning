@@ -27,7 +27,7 @@ import time
 from typing import Any, BinaryIO, Protocol
 import zipfile
 
-from oraja_training.collect import backfill, snapshot
+from oraja_training.collect import backfill, derive_play, snapshot
 from oraja_training.collect.source import source_signature
 from oraja_training.db import readers, store
 from oraja_training.db.feature_adapter import SQLiteFeatureRepository
@@ -599,6 +599,22 @@ class ContainerAdapter:
     def run_single_play_incremental(self, manifest: Mapping[str, Any], **kwargs: Any) -> JobResult:
         return self.run(manifest, _entrypoint="single_play_incremental", **kwargs)
 
+    def run_job(self, job_kind: str, manifest: Mapping[str, Any], **kwargs: Any) -> JobResult:
+        dispatch = {
+            "initial": self.run_backfill,
+            "monthly": self.run_monthly_audit,
+            "play": self.run_single_play_incremental,
+            "regenerate": self.run_monthly_audit,
+        }
+        handler = dispatch.get(job_kind)
+        if handler is None:
+            raise ContainerError("unsupported container job type", code="unsupported_job_type", status=422)
+        if job_kind == "play" and not isinstance(kwargs.get("play_event"), Mapping):
+            raise ContainerError("play event is required", code="invalid_contract", status=422)
+        if job_kind != "play" and kwargs.get("play_event") is not None:
+            raise ContainerError("play event is not allowed", code="invalid_contract", status=422)
+        return handler(manifest, **kwargs)
+
     def run(
         self,
         manifest: Mapping[str, Any],
@@ -613,6 +629,7 @@ class ContainerAdapter:
         recommendation_input: RecommendationInput | None = None,
         recommendation_repository: Any | None = None,
         table_context: Mapping[str, Any] | None = None,
+        play_event: Mapping[str, Any] | None = None,
         revision: int = 1,
         generated_at: str | None = None,
         cancellation: CancellationToken | None = None,
@@ -689,6 +706,7 @@ class ContainerAdapter:
                 recommendation_input=recommendation_input,
                 recommendation_repository=recommendation_repository,
                 table_context=table_context,
+                play_event=play_event,
                 entrypoint=entrypoint,
                 token=token,
                 started=started,
@@ -846,17 +864,28 @@ class ContainerAdapter:
         recommendation_input: RecommendationInput | None,
         recommendation_repository: Any | None,
         table_context: Mapping[str, Any] | None,
+        play_event: Mapping[str, Any] | None,
         entrypoint: str,
         token: CancellationToken,
         started: float,
     ) -> tuple[FitResult, Any, dict[str, Any]]:
         try:
-            if entrypoint == "five_db_backfill":
+            if entrypoint in {"five_db_backfill", "monthly_audit", "single_play_incremental"}:
                 backfill.run(source_dir, assistant_path, clock=self.clock)
                 token.check()
                 snapshot.run(source_dir / "score.db", source_dir / "scoredatalog.db", assistant_path, clock=self.clock)
-            elif entrypoint in {"monthly_audit", "single_play_incremental"}:
-                snapshot.run(source_dir / "score.db", source_dir / "scoredatalog.db", assistant_path, clock=self.clock)
+                if entrypoint == "single_play_incremental":
+                    if not isinstance(play_event, Mapping) or not isinstance(play_event.get("row"), Mapping):
+                        raise ContainerError("play event is invalid", code="invalid_contract", status=422)
+                    with closing(store.init(assistant_path)) as assistant:
+                        with assistant:
+                            play = derive_play(
+                                play_event["row"],
+                                source="official_ir",
+                                source_generation=-3,
+                                ingested_at=int(self.clock()),
+                            )
+                            store.insert_play(assistant, play)
             else:
                 raise ContainerError("unsupported container job type", code="unsupported_job_type", status=422)
             self._check_deadline(started, token)

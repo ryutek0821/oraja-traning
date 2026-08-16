@@ -175,11 +175,22 @@ function parseScopes(value: unknown): OAuthScope[] {
   return scopes as OAuthScope[];
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  if (normalized === "localhost" || normalized === "[::1]") return true;
+  const octets = normalized.split(".");
+  return octets.length === 4
+    && octets[0] === "127"
+    && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255);
+}
+
 function validRedirectUri(value: unknown): string {
   if (typeof value !== "string" || value.length > 2048) throw new ApiError("invalid_redirect_uri", 400);
   try {
     const url = new URL(value);
-    if ((url.protocol !== "https:" && url.hostname !== "localhost") || url.hash) throw new Error("scheme");
+    const secure = url.protocol === "https:";
+    const loopback = url.protocol === "http:" && isLoopbackHostname(url.hostname);
+    if ((!secure && !loopback) || url.hash) throw new Error("scheme");
   } catch {
     throw new ApiError("invalid_redirect_uri", 400);
   }
@@ -519,11 +530,6 @@ export async function exchangeAuthorizationCode(
   if (!activeClient || !activeGrant) throw new ApiError("invalid_grant", 400);
   const verifierHash = await sha256Hex(input.codeVerifier);
   if (!constantTimeHexEqual(base64url(hexBytes(verifierHash)), row.code_challenge)) throw new ApiError("invalid_grant", 400);
-  const consumed = await db
-    .prepare("UPDATE oauth_authorization_codes SET used_at = ?1 WHERE code_hash = ?2 AND used_at IS NULL")
-    .bind(now, row.code_hash)
-    .run();
-  if ((consumed.meta?.changes ?? 0) !== 1) throw new ApiError("invalid_grant", 400);
   const response = await issueTokenPair(db, {
     clientId: row.client_id,
     accountId: row.account_id,
@@ -532,7 +538,7 @@ export async function exchangeAuthorizationCode(
     familyId: `family_${randomSecret(18)}`,
     resource: row.resource,
     scope: row.scope,
-  }, now);
+  }, now, row.code_hash);
   await appendOAuthAudit(db, {
     eventType: "oauth.token_issued", status: "success", requestId: input.requestId,
     accountId: row.account_id, profileId: row.profile_id, resource: row.resource, clientId: row.client_id,
@@ -544,25 +550,41 @@ async function issueTokenPair(
   db: D1Database,
   owner: { clientId: string; accountId: string; profileId: string; grantId: string; familyId: string; resource: string; scope: string },
   now: number,
+  authorizationCodeHash: string,
 ): Promise<OAuthTokenResponse> {
   const accessToken = randomSecret(32);
   const refreshToken = randomSecret(32);
   const accessHash = await sha256Hex(accessToken);
   const refreshHash = await sha256Hex(refreshToken);
-  await db.batch([
+  const markerWords = crypto.getRandomValues(new Uint32Array(2));
+  const claimMarker = -((markerWords[0] & 0xfffff) * 0x100000000 + markerWords[1] + 1);
+  const results = await db.batch([
+    db.prepare(
+      "UPDATE oauth_authorization_codes SET used_at = ?1 WHERE code_hash = ?2 AND used_at IS NULL",
+    ).bind(claimMarker, authorizationCodeHash),
     db.prepare(
       `INSERT INTO oauth_tokens(
          token_hash, client_id, account_id, profile_id, scope, created_at, expires_at,
          grant_id, resource, token_kind, family_id
-       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'access', ?10)`,
-    ).bind(accessHash, owner.clientId, owner.accountId, owner.profileId, owner.scope, now, now + 3600, owner.grantId, owner.resource, owner.familyId),
+       ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'access', ?10
+           WHERE EXISTS (
+             SELECT 1 FROM oauth_authorization_codes WHERE code_hash = ?11 AND used_at = ?12
+           )`,
+    ).bind(accessHash, owner.clientId, owner.accountId, owner.profileId, owner.scope, now, now + 3600, owner.grantId, owner.resource, owner.familyId, authorizationCodeHash, claimMarker),
     db.prepare(
       `INSERT INTO oauth_tokens(
          token_hash, client_id, account_id, profile_id, scope, created_at, expires_at,
          grant_id, resource, token_kind, family_id
-       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'refresh', ?10)`,
-    ).bind(refreshHash, owner.clientId, owner.accountId, owner.profileId, owner.scope, now, now + 30 * 86400, owner.grantId, owner.resource, owner.familyId),
+       ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'refresh', ?10
+           WHERE EXISTS (
+             SELECT 1 FROM oauth_authorization_codes WHERE code_hash = ?11 AND used_at = ?12
+           )`,
+    ).bind(refreshHash, owner.clientId, owner.accountId, owner.profileId, owner.scope, now, now + 30 * 86400, owner.grantId, owner.resource, owner.familyId, authorizationCodeHash, claimMarker),
+    db.prepare(
+      "UPDATE oauth_authorization_codes SET used_at = ?1 WHERE code_hash = ?2 AND used_at = ?3",
+    ).bind(now, authorizationCodeHash, claimMarker),
   ]);
+  if (results.some((result) => (result.meta?.changes ?? 0) !== 1)) throw new ApiError("invalid_grant", 400);
   return {
     access_token: accessToken,
     refresh_token: refreshToken,

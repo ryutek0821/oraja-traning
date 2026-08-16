@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -13,10 +15,36 @@ function run(script, ...args) {
   });
 }
 
-test("configuration, migrations, and contract catalog pass their checks", () => {
-  for (const script of ["check-config.mjs", "migrations.mjs", "schema-check.mjs"]) {
+test("configuration and migrations pass their checks", () => {
+  for (const script of ["check-config.mjs", "migrations.mjs"]) {
     const result = run(script, ...(script === "migrations.mjs" ? ["check"] : []));
     assert.equal(result.status, 0, `${script}: ${result.stderr}`);
+  }
+});
+
+test("schema checker validates positive examples and rejects negative fixtures", () => {
+  const result = run("schema-check.mjs");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /8 valid fixtures, 8 invalid fixtures rejected/);
+});
+
+test("public scan rejects a tracked database", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oraja-public-scan-"));
+  try {
+    const initialized = spawnSync("git", ["init", "--quiet"], { cwd: directory, encoding: "utf8" });
+    assert.equal(initialized.status, 0, initialized.stderr);
+    await writeFile(join(directory, "private.db"), "private score data");
+    const added = spawnSync("git", ["add", "private.db"], { cwd: directory, encoding: "utf8" });
+    assert.equal(added.status, 0, added.stderr);
+
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL("scripts/public-scan.mjs", root))], {
+      cwd: directory,
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /private\.db: tracked database files are forbidden/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

@@ -11,6 +11,7 @@ import {
 
 export type ContainerBridgeEnv = {
   CONTROL_DB: D1Database;
+  PROFILE_DO: DurableObjectNamespace;
   RAW_BUCKET: R2Bucket;
   ARTIFACT_BUCKET: R2Bucket;
   PYTHON_PROCESSOR: DurableObjectNamespace;
@@ -54,6 +55,7 @@ const MAX_CONTAINER_RESPONSE_BYTES = 96 * 1024 * 1024;
 const MAGIC = new TextEncoder().encode("ORAJA5DB2\n");
 const encoder = new TextEncoder();
 const MAX_TABLE_CONTEXT_BYTES = 16 * 1024 * 1024;
+const MAX_PLAY_EVENT_BYTES = 16 * 1024;
 
 export class ContainerBridgeError extends Error {
   constructor(
@@ -263,6 +265,46 @@ function parseInputPointer(value: string | null): string {
   return match[1].toLowerCase();
 }
 
+async function resolveUploadId(job: JobEnvelope, db: D1Database, scope: string): Promise<string> {
+  const direct = /^upload-session:([0-9a-f-]{36})$/i.exec(job.inputKey ?? "");
+  if (direct && UUID.test(direct[1])) return direct[1].toLowerCase();
+  const deferred = job.jobKind === "monthly" || job.jobKind === "regenerate"
+    || (job.jobKind === "play" && job.inputKey === `play-event:${job.eventId}`);
+  if (!deferred) throw new ContainerBridgeError("input_manifest_pointer_missing", false);
+  const latest = await db.prepare(
+    `SELECT upload_id FROM upload_sessions
+      WHERE profile_scope = ?1 AND state = 'completed'
+      ORDER BY completed_at DESC, created_at DESC LIMIT 1`,
+  ).bind(scope).first<{ upload_id: string }>();
+  if (!latest || !UUID.test(latest.upload_id)) {
+    throw new ContainerBridgeError("input_manifest_not_found", true);
+  }
+  return latest.upload_id.toLowerCase();
+}
+
+async function loadPlayEvent(job: JobEnvelope, env: ContainerBridgeEnv): Promise<string | null> {
+  if (job.jobKind !== "play") return null;
+  if (job.inputKey !== `play-event:${job.eventId}`) {
+    throw new ContainerBridgeError("play_event_pointer_invalid", false);
+  }
+  const stub = env.PROFILE_DO.get(env.PROFILE_DO.idFromName(job.profileId));
+  const response = await stub.fetch(
+    `https://profile.internal/internal/play-events/${encodeURIComponent(job.eventId)}`,
+  );
+  if (!response.ok) throw new ContainerBridgeError("play_event_unavailable", response.status >= 500);
+  const value = await response.json() as Record<string, unknown>;
+  if (value.contract !== "container-play-event" || value.schema_version !== 1
+    || value.event_id !== job.eventId || value.profile_id !== job.profileId
+    || value.payload_digest !== job.inputDigest || typeof value.row !== "object" || value.row === null) {
+    throw new ContainerBridgeError("play_event_contract_invalid", false);
+  }
+  const encoded = canonicalJson(value);
+  if (encoder.encode(encoded).byteLength > MAX_PLAY_EVENT_BYTES) {
+    throw new ContainerBridgeError("play_event_too_large", false);
+  }
+  return encodeBase64Url(encoded);
+}
+
 async function immutablePut(bucket: R2Bucket, key: string, content: Uint8Array, digest: string, contentType: string): Promise<void> {
   const existing = await bucket.head(key);
   if (existing) {
@@ -297,15 +339,16 @@ function validateOutputIdentity(job: JobEnvelope, response: ContainerResponse): 
 export async function processContainerJob(job: JobEnvelope, env: ContainerBridgeEnv): Promise<ContainerBridgeResult> {
   if (!env.ENVELOPE_MASTER_KEY) throw new ContainerBridgeError("envelope_key_unavailable", true);
   if (job.trustDomain !== "official") throw new ContainerBridgeError("unsupported_trust_domain", false);
-  const uploadId = parseInputPointer(job.inputKey);
   const scope = await profileScope(job.profileId);
+  const uploadId = await resolveUploadId(job, env.CONTROL_DB, scope);
   const session = await new D1UploadSessionStore(env.CONTROL_DB).getCompletedSession(scope, uploadId);
   if (!session) throw new ContainerBridgeError("input_manifest_not_found", true);
   const tableContext = await loadTableContext(job, env.CONTROL_DB);
   const expectedInputDigest = job.jobKind === "regenerate" && job.eventId.startsWith("settings:")
     ? await regenerationInputDigest(job.profileId, session.manifestSha256, tableContext.settingsRevision)
-    : session.manifestSha256;
+    : job.jobKind === "initial" ? session.manifestSha256 : job.inputDigest;
   if (expectedInputDigest !== job.inputDigest) throw new ContainerBridgeError("input_digest_mismatch", false);
+  const playEvent = await loadPlayEvent(job, env);
   const byName = new Map(session.files.map((file) => [file.fileName, file]));
   const files = FIVE_DB_FILE_NAMES.map((name) => byName.get(name));
   if (files.some((file) => !file)) throw new ContainerBridgeError("input_file_set_invalid", false);
@@ -350,15 +393,18 @@ export async function processContainerJob(job: JobEnvelope, env: ContainerBridge
   const body = framedStream(ordered, objects, scope, cryptoBox, tableContext.bytes, tableContextDigest);
   const length = transportLength(ordered, tableContext.bytes, tableContextDigest);
   const stub = env.PYTHON_PROCESSOR.get(env.PYTHON_PROCESSOR.idFromName(job.jobId));
+  const headers: Record<string, string> = {
+    "content-type": "application/octet-stream",
+    "content-length": String(length),
+    "x-container-input-manifest": encodeBase64Url(canonicalJson(inputManifest)),
+    "x-container-output-revision": String(job.revision),
+    "x-container-transport": "five-db-framed-v2",
+    "x-container-job-kind": job.jobKind,
+  };
+  if (playEvent) headers["x-container-play-event"] = playEvent;
   const response = await stub.fetch("http://python-processor/v1/jobs", {
     method: "POST",
-    headers: {
-      "content-type": "application/octet-stream",
-      "content-length": String(length),
-      "x-container-input-manifest": encodeBase64Url(canonicalJson(inputManifest)),
-      "x-container-output-revision": String(job.revision),
-      "x-container-transport": "five-db-framed-v2",
-    },
+    headers,
     body,
   });
   if (!response.ok) {

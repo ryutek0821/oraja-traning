@@ -21,6 +21,8 @@ test("success outcome and latest pointer share one D1 batch", () => {
 test("processor bridge verifies immutable input and artifacts before publish", () => {
   assert.match(workflow, /processContainerJob\(job, env\)/);
   assert.match(workflow, /input_manifest_pointer_missing/);
+  assert.match(workflow, /job\.jobKind === "play"/);
+  assert.match(workflow, /job\.jobKind === "monthly" \|\| job\.jobKind === "regenerate"/);
   assert.match(workflow, /artifact_manifest_missing/);
   assert.doesNotMatch(workflow, /processor_integration_unavailable/);
   assert.match(worker, /export \{ GenerateWorkflow \} from "\.\/workflow"/);

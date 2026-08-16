@@ -122,3 +122,36 @@ def test_multiple_table_memberships_create_one_normalized_observation(tmp_path) 
         observations[0].features[0], expected_frontier / 1.5, abs_tol=1e-9
     )
     assert abs(observations[0].features[0]) < 10  # not the raw alt level 100
+
+
+def test_official_ir_is_observed_and_deduplicates_daily_copy(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        _populate(conn, density_signal=True, count=2)
+        with conn:
+            conn.execute("DELETE FROM plays")
+            for index in range(2):
+                sha256 = f"{index:064x}"
+                played_at = 1_700_000_000 + index
+                conn.execute(
+                    """INSERT INTO plays(
+                        sha256, mode, played_at, playcount, source_generation,
+                        source, clear, completed, is_course, payload_hash,
+                        ingested_at
+                       ) VALUES (?, 0, ?, 1, -3, 'official_ir', 4, 1, 0, ?, ?)""",
+                    (sha256, played_at, f"official-{index}", played_at),
+                )
+            conn.execute(
+                """INSERT INTO plays(
+                    sha256, mode, played_at, playcount, source_generation,
+                    source, clear, completed, is_course, payload_hash,
+                    ingested_at
+                   ) VALUES (?, 0, ?, 1, -2, 'daily_snapshot', 1, 0, 0, ?, ?)""",
+                (f"{1:064x}", 1_700_000_001, "daily-copy", 1_700_000_100),
+            )
+
+        observations = _observations(conn)
+        assert len(observations) == 2
+        assert [observation.label for observation in observations] == [1.0, 1.0]
+    finally:
+        conn.close()

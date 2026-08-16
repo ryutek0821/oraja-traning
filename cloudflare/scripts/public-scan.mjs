@@ -10,11 +10,13 @@ const forbidden = [
 ];
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
-const files = execFileSync("git", ["ls-files"], { cwd: root, encoding: "utf8" })
+const trackedFiles = execFileSync("git", ["ls-files"], { cwd: root, encoding: "utf8" })
   .split("\n")
-  .filter(Boolean)
-  .filter((file) => !file.startsWith(".git/") && !file.endsWith(".db"));
-const findings = [];
+  .filter(Boolean);
+const files = trackedFiles.filter((file) => !file.startsWith(".git/") && !/\.db$/i.test(file));
+const findings = trackedFiles
+  .filter((file) => /\.db$/i.test(file))
+  .map((file) => `${file}: tracked database files are forbidden`);
 for (const file of files) {
   let source;
   try {

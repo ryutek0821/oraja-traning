@@ -74,6 +74,9 @@ class ProfileContext:
         return self.seed_namespace or self.profile_id
 
 
+OFFICIAL_IR_GENERATION = -3
+
+
 @dataclass(frozen=True, slots=True)
 class Play:
     """Normalized play value; it contains no SQLite row or connection."""
@@ -110,9 +113,14 @@ class Play:
             raise DomainValidationError("play.sha256 must be a non-empty string")
         if not isinstance(self.source, str) or not self.source.strip():
             raise DomainValidationError("play.source must be a non-empty string")
-        # -1 is the IR-import namespace and -2 is the daily-snapshot
-        # namespace; both are valid non-poller generations.
-        if self.playcount < 0 or self.source_generation < -2 or self.lost_events < 0:
+        # -1 is the IR-import namespace, -2 is the daily-snapshot namespace,
+        # and -3 is the official IR event namespace.  Zero and positive values
+        # remain collector generations.
+        if (
+            self.playcount < 0
+            or self.source_generation < OFFICIAL_IR_GENERATION
+            or self.lost_events < 0
+        ):
             raise DomainValidationError("play counters must not be negative")
 
     def as_record(self) -> dict[str, Any]:

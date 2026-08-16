@@ -1279,8 +1279,6 @@ export class UploadService {
       return { state: "completed", unchanged: session.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256, submissionKind: session.submissionKind };
     }
     ensureActive(session, Math.floor(this.nowProvider()));
-    const ownedObjects: string[] = [];
-    const ownedRefs: StoredFileRef[] = [];
     try {
       for (const file of session.files) {
         if (file.state === "deduplicated" || file.state === "completed") continue;
@@ -1291,7 +1289,6 @@ export class UploadService {
         const object = await this.bucket.get(file.objectKey);
         if (!object) fail("object_integrity_failed", 422);
         await verifyEncryptedObject(object, file, scope, this.cryptoBox);
-        ownedObjects.push(file.objectKey);
         const ref = await this.store.putDedup({
           profileScope: scope,
           sha256: file.sha256,
@@ -1299,7 +1296,6 @@ export class UploadService {
           objectKey: file.objectKey,
           keyVersion: file.encryption.keyVersion,
         });
-        if (ref.objectKey === file.objectKey) ownedRefs.push(ref);
         if (ref.objectKey !== file.objectKey) await this.bucket.delete(file.objectKey);
         await this.store.markFileCompleted(scope, uploadId, file.fileName, ref);
       }
@@ -1311,8 +1307,7 @@ export class UploadService {
       await this.store.markCompleted(scope, uploadId, completedAt);
       return { state: "completed", unchanged: refreshed.files.every((file) => file.state === "deduplicated"), uploadId, manifestSha256: session.manifestSha256, submissionKind: session.submissionKind };
     } catch (error) {
-      await Promise.all(ownedRefs.map((ref) => this.store.removeDedup(ref).catch(() => undefined)));
-      await this.cleanupSessionObjects(scope, session, ownedObjects);
+      await this.cleanupSessionObjects(scope, session);
       await this.store.markAborted(scope, uploadId, "aborted").catch(() => undefined);
       if (error instanceof UploadProtocolError) throw error;
       throw new UploadProtocolError("upload_failed", 502);
@@ -1324,7 +1319,7 @@ export class UploadService {
     const session = await this.store.getSession(scope, uploadId);
     if (!session) fail("session_not_found", 404);
     if (session.state === "completed") return { state: "aborted", uploadId };
-    await this.cleanupSessionObjects(scope, session, []);
+    await this.cleanupSessionObjects(scope, session);
     await this.store.markAborted(scope, uploadId, "aborted");
     return { state: "aborted", uploadId };
   }
@@ -1333,9 +1328,8 @@ export class UploadService {
     const sessions = await this.store.listExpired(now);
     let objects = 0;
     for (const session of sessions) {
-      await this.cleanupSessionObjects(session.profileScope, session, []);
+      objects += await this.cleanupSessionObjects(session.profileScope, session);
       await this.store.markAborted(session.profileScope, session.uploadId, "expired");
-      objects += session.files.filter((file) => file.createdObjectKey).length;
     }
     return { sessions: sessions.length, objects };
   }
@@ -1343,17 +1337,19 @@ export class UploadService {
   private async cleanupSessionObjects(
     scope: string,
     session: UploadSessionRecord,
-    alreadyCompleted: string[],
-  ): Promise<void> {
-    const keys = new Set<string>(alreadyCompleted);
+  ): Promise<number> {
+    const keys = new Set<string>();
     for (const file of session.files) {
-      if (file.createdObjectKey) keys.add(file.createdObjectKey);
+      if (file.createdObjectKey) {
+        const canonical = await this.store.findDedup(scope, file.sha256, file.sizeBytes);
+        if (canonical?.objectKey !== file.createdObjectKey) keys.add(file.createdObjectKey);
+      }
       if (file.state === "upload_required" && file.r2UploadId) {
         await this.bucket.resumeMultipartUpload(file.objectKey, file.r2UploadId).abort().catch(() => undefined);
       }
     }
     await Promise.all([...keys].map((key) => this.bucket.delete(key).catch(() => undefined)));
-    void scope;
+    return keys.size;
   }
 }
 

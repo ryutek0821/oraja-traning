@@ -30,12 +30,17 @@ WITH ranked_state AS (
   SELECT p.*,
          row_number() OVER (
            PARTITION BY p.sha256, p.mode, p.played_at, p.playcount
-           ORDER BY CASE p.source WHEN 'collector' THEN 0 ELSE 1 END,
+           ORDER BY CASE p.source
+                      WHEN 'collector' THEN 0
+                      WHEN 'official_ir' THEN 1
+                      WHEN 'daily_snapshot' THEN 2
+                      ELSE 3
+                    END,
                     p.ingested_at DESC, p.id DESC
          ) AS semantic_rank
   FROM plays AS p
   WHERE p.mode IN (0, 1, 2) AND p.is_course = 0
-    AND p.source IN ('collector', 'daily_snapshot')
+    AND p.source IN ('collector', 'daily_snapshot', 'official_ir')
 ), recent_ranked AS (
   SELECT p.*,
          row_number() OVER (
@@ -163,9 +168,17 @@ def _warmup_adjustment(conn: sqlite3.Connection) -> int:
             FROM plays
             WHERE sha256 = ? AND played_at >= ? AND played_at < ?
               AND is_course = 0
-              AND source IN ('collector', 'daily_snapshot')
+              AND source IN ('collector', 'daily_snapshot', 'official_ir')
               AND completed IS NOT NULL
-            ORDER BY played_at, id LIMIT 1
+            ORDER BY played_at,
+              CASE source
+                WHEN 'collector' THEN 0
+                WHEN 'official_ir' THEN 1
+                WHEN 'daily_snapshot' THEN 2
+                ELSE 3
+              END,
+              ingested_at DESC, id DESC
+            LIMIT 1
             """,
             (sha256, observation_start, window_end),
         ).fetchone()

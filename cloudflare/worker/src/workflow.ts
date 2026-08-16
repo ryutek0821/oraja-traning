@@ -22,9 +22,11 @@ import { processContainerJob, type ContainerBridgeResult } from "./container-bri
 
 export type WorkflowEnv = {
   CONTROL_DB: D1Database;
+  PROFILE_DO: DurableObjectNamespace;
   RAW_BUCKET: R2Bucket;
   ARTIFACT_BUCKET: R2Bucket;
   PYTHON_PROCESSOR: DurableObjectNamespace;
+  ENVELOPE_MASTER_KEY?: string;
 };
 
 export type WorkflowPayload = JobEnvelope;
@@ -139,7 +141,14 @@ async function runStep<T extends Record<string, unknown>>(
 function defaultActivities(env: WorkflowEnv, ledger: D1JobLedger): WorkflowActivities {
   return {
     async verifyR2Input(job) {
-      if (!job.inputKey?.startsWith("upload-session:")) {
+      const validPointer = job.jobKind === "initial"
+        ? job.inputKey?.startsWith("upload-session:")
+        : job.jobKind === "play"
+          ? job.inputKey === `play-event:${job.eventId}`
+          : job.jobKind === "monthly" || job.jobKind === "regenerate"
+            ? job.inputKey === null || job.inputKey.startsWith("upload-session:")
+            : false;
+      if (!validPointer) {
         throw new WorkflowActivityError("input_manifest_pointer_missing", false);
       }
       return { verified: true, inputDigest: job.inputDigest };
