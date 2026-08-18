@@ -170,7 +170,7 @@ heartbeatで送信します。Cockpitは日付切替後、新しい送信前で�
 時計が90秒を超えてずれていても受信が続く間は`STALE`にせず、時刻ずれを`WARN`表示します。
 
 ログオン中に状態を確認する場合はTkinterモニターを使います。`score.db`を省略するとGUIの
-「参照」から選択でき、選択したDB、Mac URL、tokenファイルの**パスだけ**を
+「参照」から選択でき、選択したDB、送信先URL、tokenファイルの**パスだけ**を
 `%LOCALAPPDATA%\oraja-training\progress-monitor.json`へ保存します。token値は保存しません。
 
 ```powershell
@@ -179,11 +179,15 @@ heartbeatで送信します。Cockpitは日付切替後、新しい送信前で�
   -TokenFile "$env:LOCALAPPDATA\oraja-training\progress-token.txt"
 ```
 
-モニターにはLIVE／STALE／ERROR、最終送信、累積・本日打鍵数、次回heartbeat、再試行エラーを
-表示し、「今すぐ送信」と「終了」を操作できます。設定後、ログオン時に自動表示するタスクを
-登録できます。`-LogonType Interactive`（Task SchedulerのInteractiveToken）で現在ユーザーの
-デスクトップだけに起動し、管理者権限は使いません。モニターは多重起動を防止し、異常終了時は
-最大3回再起動します。起動診断は
+モニターにはLIVE／STALE／ERROR、送信状態のON／OFF、実際の送信先URL、最終送信、累積・
+本日打鍵数、次回heartbeat、再試行エラーを表示します。「送信を有効にする」をOFFにすると
+モニターを閉じずに自動送信とheartbeatを停止し、「今すぐ送信」も無効になります。ONへ戻すと
+設定を検証してワーカーを1本だけ起動します。状態と送信先URLは設定へ保存され、次回起動時に
+復元されます。旧設定にON／OFF項目がない場合は従来どおりONとして自動開始します。
+
+設定後、ログオン時に自動表示するタスクを登録できます。`-LogonType Interactive`
+（Task SchedulerのInteractiveToken）で現在ユーザーのデスクトップだけに起動し、管理者権限は
+使いません。モニターは多重起動を防止し、異常終了時は最大3回再起動します。起動診断は
 `%LOCALAPPDATA%\oraja-training\logs\progress-monitor.log`へ記録します。
 
 ```powershell

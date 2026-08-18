@@ -34,8 +34,11 @@ class MonitorSettings:
     source_id: str = "RYU-DESKTOP2"
     poll_interval: float = 5.0
     heartbeat: float = 30.0
+    send_enabled: bool = True
 
     def normalized(self) -> MonitorSettings:
+        if not isinstance(self.send_enabled, bool):
+            raise ValueError("送信ON/OFFはtrueまたはfalseで指定してください")
         score_db = Path(self.score_db).expanduser().resolve(strict=True)
         token_file = Path(self.token_file).expanduser().resolve(strict=True)
         if not score_db.is_file():
@@ -77,6 +80,30 @@ class MonitorSettings:
             heartbeat=heartbeat,
         )
 
+    def for_storage(self) -> MonitorSettings:
+        """Normalize saved values without requiring send-ready paths while OFF."""
+
+        if self.send_enabled:
+            return self.normalized()
+        if not isinstance(self.send_enabled, bool):
+            raise ValueError("送信ON/OFFはtrueまたはfalseで指定してください")
+
+        score_db = self.score_db.strip()
+        token_file = self.token_file.strip()
+        return replace(
+            self,
+            score_db=(
+                str(Path(score_db).expanduser().resolve()) if score_db else ""
+            ),
+            server_url=self.server_url.strip().rstrip("/"),
+            token_file=(
+                str(Path(token_file).expanduser().resolve()) if token_file else ""
+            ),
+            source_id=self.source_id.strip(),
+            poll_interval=float(self.poll_interval),
+            heartbeat=float(self.heartbeat),
+        )
+
     def read_token(self) -> str:
         token = Path(self.token_file).read_text(encoding="utf-8").strip()
         if not token:
@@ -113,6 +140,8 @@ def load_monitor_settings(path: str | Path) -> MonitorSettings:
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"進捗モニター設定に不明な項目があります: {sorted(unknown)}")
+    if "send_enabled" in value and not isinstance(value["send_enabled"], bool):
+        raise ValueError("送信ON/OFFはtrueまたはfalseで指定してください")
     try:
         return MonitorSettings(**value)
     except TypeError as error:
@@ -120,9 +149,9 @@ def load_monitor_settings(path: str | Path) -> MonitorSettings:
 
 
 def save_monitor_settings(path: str | Path, settings: MonitorSettings) -> Path:
-    """Atomically save paths and intervals; token material is never persisted."""
+    """Atomically save settings; token material is never persisted."""
 
-    normalized = settings.normalized()
+    normalized = settings.for_storage()
     target = Path(path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
@@ -254,6 +283,64 @@ class ProgressMonitorWorker:
         self._wake.set()
 
 
+class ProgressMonitorController:
+    """Own exactly one sender worker and expose safe lifecycle transitions."""
+
+    def __init__(
+        self,
+        *,
+        worker_factory: Callable[..., ProgressMonitorWorker] = ProgressMonitorWorker,
+        thread_factory: Callable[..., threading.Thread] = threading.Thread,
+    ) -> None:
+        self._worker_factory = worker_factory
+        self._thread_factory = thread_factory
+        self._worker: ProgressMonitorWorker | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._worker is not None
+
+    def start(
+        self,
+        settings: MonitorSettings,
+        on_snapshot: Callable[[MonitorSnapshot], None],
+    ) -> MonitorSettings:
+        normalized = settings.normalized()
+        replacement = self._worker_factory(normalized, on_snapshot)
+        self.stop()
+        replacement_thread = self._thread_factory(
+            target=replacement.run,
+            daemon=True,
+        )
+        self._worker = replacement
+        self._thread = replacement_thread
+        try:
+            replacement_thread.start()
+        except Exception:
+            replacement.stop()
+            self._worker = None
+            self._thread = None
+            raise
+        return normalized
+
+    def send_now(self) -> bool:
+        if self._worker is None:
+            return False
+        self._worker.send_now()
+        return True
+
+    def stop(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+        if self._thread is not None:
+            self._thread.join(timeout=6.0)
+            if self._thread.is_alive():
+                raise RuntimeError("旧送信処理の停止を確認できません")
+        self._worker = None
+        self._thread = None
+
+
 def run_progress_monitor(
     *,
     config_path: str | Path | None = None,
@@ -289,15 +376,22 @@ def run_progress_monitor(
         settings,
         **{key: value for key, value in overlays.items() if value is not None},
     )
+    auto_start = bool(
+        settings.send_enabled
+        and settings.score_db
+        and settings.server_url
+        and settings.token_file
+    )
 
     root = tk.Tk()
     root.title("Oraja Training 進捗モニター")
-    root.geometry("620x470")
-    root.minsize(560, 440)
+    root.geometry("620x520")
+    root.minsize(560, 490)
 
     style = ttk.Style(root)
     style.configure("Count.TLabel", font=("Segoe UI", 18, "bold"))
     style.configure("Status.TLabel", font=("Segoe UI", 16, "bold"))
+    style.configure("SendState.TLabel", font=("Segoe UI", 11, "bold"))
 
     score_var = tk.StringVar(value=settings.score_db)
     url_var = tk.StringVar(value=settings.server_url)
@@ -310,6 +404,8 @@ def run_progress_monitor(
     next_var = tk.StringVar(value="—")
     error_var = tk.StringVar(value=startup_error or "設定を確認しています")
     destination_var = tk.StringVar(value=settings.server_url or "未設定")
+    send_enabled_var = tk.BooleanVar(value=auto_start)
+    send_state_var = tk.StringVar(value="ON" if auto_start else "OFF")
 
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
@@ -318,7 +414,24 @@ def run_progress_monitor(
     status_label = ttk.Label(header, textvariable=status_var, style="Status.TLabel")
     status_label.configure(foreground="#C62828" if startup_error else "#A56A00")
     status_label.pack(side="left")
-    ttk.Label(header, textvariable=destination_var).pack(side="right")
+
+    sender_summary = ttk.Frame(outer, padding=(0, 8, 0, 0))
+    sender_summary.pack(fill="x")
+    ttk.Label(sender_summary, text="送信状態").grid(row=0, column=0, sticky="w")
+    send_state_label = ttk.Label(
+        sender_summary,
+        textvariable=send_state_var,
+        style="SendState.TLabel",
+    )
+    send_state_label.grid(row=0, column=1, sticky="w", padx=(8, 24))
+    ttk.Label(sender_summary, text="送信先 URL").grid(row=0, column=2, sticky="w")
+    ttk.Label(sender_summary, textvariable=destination_var).grid(
+        row=0,
+        column=3,
+        sticky="w",
+        padx=(8, 0),
+    )
+    sender_summary.columnconfigure(3, weight=1)
 
     counts = ttk.Frame(outer, padding=(0, 14))
     counts.pack(fill="x")
@@ -362,7 +475,9 @@ def run_progress_monitor(
         row=0, column=1, sticky="ew", padx=8
     )
     ttk.Button(config_frame, text="参照", command=choose_score_db).grid(row=0, column=2)
-    ttk.Label(config_frame, text="Mac URL").grid(row=1, column=0, sticky="w", pady=6)
+    ttk.Label(config_frame, text="送信先 URL").grid(
+        row=1, column=0, sticky="w", pady=6
+    )
     ttk.Entry(config_frame, textvariable=url_var).grid(
         row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=6
     )
@@ -383,12 +498,11 @@ def run_progress_monitor(
     buttons.pack(fill="x", side="bottom")
 
     snapshots: Queue[tuple[int, MonitorSnapshot]] = Queue()
-    worker: ProgressMonitorWorker | None = None
-    worker_thread: threading.Thread | None = None
+    controller = ProgressMonitorController()
     worker_generation = 0
     latest: MonitorSnapshot | None = None
 
-    def settings_from_form() -> MonitorSettings:
+    def settings_from_form(*, send_enabled: bool) -> MonitorSettings:
         return MonitorSettings(
             score_db=score_var.get().strip(),
             server_url=url_var.get().strip(),
@@ -396,18 +510,17 @@ def run_progress_monitor(
             source_id=source_var.get().strip(),
             poll_interval=settings.poll_interval,
             heartbeat=settings.heartbeat,
+            send_enabled=send_enabled,
         )
 
-    def stop_worker() -> None:
-        nonlocal worker, worker_thread
-        if worker is not None:
-            worker.stop()
-        if worker_thread is not None:
-            worker_thread.join(timeout=6.0)
-            if worker_thread.is_alive():
-                raise RuntimeError("旧送信処理の停止を確認できません")
-        worker = None
-        worker_thread = None
+    def update_send_controls(enabled: bool) -> None:
+        send_enabled_var.set(enabled)
+        send_state_var.set("ON" if enabled else "OFF")
+        send_state_label.configure(foreground="#148A43" if enabled else "#6B7280")
+        if enabled and controller.active:
+            send_now_button.state(["!disabled"])
+        else:
+            send_now_button.state(["disabled"])
 
     def show_start_error(error: Exception) -> None:
         status_var.set("ERROR")
@@ -416,7 +529,7 @@ def run_progress_monitor(
         messagebox.showerror("進捗モニター設定", str(error), parent=root)
 
     def start_worker() -> None:
-        nonlocal worker, worker_thread, worker_generation, settings, latest
+        nonlocal worker_generation, settings, latest
         # Invalidate queued snapshots before validating replacement settings.
         worker_generation += 1
         generation = worker_generation
@@ -424,48 +537,79 @@ def run_progress_monitor(
         status_var.set("STALE")
         status_label.configure(foreground="#A56A00")
         try:
-            candidate = settings_from_form().normalized()
-            replacement = ProgressMonitorWorker(
+            candidate = settings_from_form(send_enabled=True).normalized()
+            controller.stop()
+            save_monitor_settings(config, candidate)
+            candidate = controller.start(
                 candidate,
-                lambda snapshot, generation=generation: snapshots.put(
-                    (generation, snapshot)
-                ),
+                lambda snapshot, generation=generation: snapshots.put((generation, snapshot)),
             )
         except Exception as error:
             try:
-                stop_worker()
+                controller.stop()
+                disabled = settings_from_form(send_enabled=False)
+                save_monitor_settings(config, disabled)
+                settings = disabled
             except Exception as stop_error:
                 error = RuntimeError(f"{error} / {stop_error}")
+            update_send_controls(False)
+            destination_var.set(url_var.get().strip().rstrip("/") or "未設定")
+            next_var.set("—")
             show_start_error(error)
             return
-        try:
-            stop_worker()
-            save_monitor_settings(config, candidate)
-        except Exception as error:
-            show_start_error(error)
-            return
-        worker = replacement
         settings = candidate
         destination_var.set(candidate.server_url)
         error_var.set("送信を開始しています")
-        worker_thread = threading.Thread(target=worker.run, daemon=True)
-        worker_thread.start()
+        update_send_controls(True)
+
+    def stop_sending() -> None:
+        nonlocal worker_generation, settings, latest
+        worker_generation += 1
+        latest = None
+        disabled = settings_from_form(send_enabled=False)
+        try:
+            controller.stop()
+            save_monitor_settings(config, disabled)
+        except Exception as error:
+            update_send_controls(controller.active)
+            show_start_error(error)
+            return
+        settings = disabled
+        destination_var.set(disabled.server_url.strip().rstrip("/") or "未設定")
+        next_var.set("—")
+        error_var.set("送信は停止しています")
+        update_send_controls(False)
+
+    def toggle_sending() -> None:
+        if send_enabled_var.get():
+            start_worker()
+        else:
+            stop_sending()
 
     def send_now() -> None:
-        if worker is None:
-            start_worker()
-        elif worker is not None:
-            worker.send_now()
+        if not send_enabled_var.get():
+            return
+        controller.send_now()
 
     def close() -> None:
         try:
-            stop_worker()
+            controller.stop()
         except RuntimeError:
             pass
         root.destroy()
 
-    ttk.Button(buttons, text="保存して開始", command=start_worker).pack(side="left")
-    ttk.Button(buttons, text="今すぐ送信", command=send_now).pack(side="left", padx=8)
+    ttk.Checkbutton(
+        buttons,
+        text="送信を有効にする",
+        variable=send_enabled_var,
+        command=toggle_sending,
+    ).pack(side="left")
+    ttk.Button(buttons, text="保存して開始", command=start_worker).pack(
+        side="left", padx=(8, 0)
+    )
+    send_now_button = ttk.Button(buttons, text="今すぐ送信", command=send_now)
+    send_now_button.pack(side="left", padx=8)
+    send_now_button.state(["disabled"])
     ttk.Button(buttons, text="終了", command=close).pack(side="right")
 
     def refresh() -> None:
@@ -504,7 +648,9 @@ def run_progress_monitor(
 
     root.protocol("WM_DELETE_WINDOW", close)
     root.after(100, refresh)
-    if settings.score_db and settings.server_url and settings.token_file:
+    if auto_start:
         root.after(150, start_worker)
+    elif startup_error is None:
+        error_var.set("送信は停止しています")
     root.mainloop()
     return 0
