@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,6 +8,7 @@ import sqlite3
 
 from oraja_training.serve.progress_monitor import (
     MonitorSettings,
+    ProgressMonitorController,
     ProgressMonitorWorker,
     load_monitor_settings,
     save_monitor_settings,
@@ -113,10 +114,39 @@ def test_monitor_config_persists_token_path_but_not_secret(tmp_path: Path) -> No
     assert save_monitor_settings(config, settings) == config.resolve()
     payload = config.read_text(encoding="utf-8")
     assert "private-token" not in payload
-    assert json.loads(payload)["token_file"] == str(
+    saved = json.loads(payload)
+    assert saved["token_file"] == str(
         Path(settings.token_file).resolve()
     )
+    assert saved["send_enabled"] is True
     assert load_monitor_settings(config) == settings.normalized()
+
+
+def test_monitor_config_defaults_legacy_settings_to_on(tmp_path: Path) -> None:
+    config = tmp_path / "legacy-monitor.json"
+    legacy = asdict(_settings(tmp_path).normalized())
+    legacy.pop("send_enabled")
+    config.write_text(json.dumps(legacy), encoding="utf-8")
+
+    assert load_monitor_settings(config).send_enabled is True
+
+
+def test_monitor_config_saves_off_with_incomplete_destination(tmp_path: Path) -> None:
+    config = tmp_path / "disabled-monitor.json"
+    disabled = MonitorSettings(
+        server_url="  not-yet-a-url/ ",
+        source_id=" RYU-DESKTOP2 ",
+        send_enabled=False,
+    )
+
+    save_monitor_settings(config, disabled)
+
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["send_enabled"] is False
+    assert saved["server_url"] == "not-yet-a-url"
+    loaded = load_monitor_settings(config)
+    assert loaded.send_enabled is False
+    assert loaded.server_url == "not-yet-a-url"
 
 
 def test_monitor_worker_sends_on_change_heartbeat_and_manual_request(
@@ -164,6 +194,69 @@ def test_monitor_worker_sends_on_change_heartbeat_and_manual_request(
     assert len(sent) == 4
 
 
+def test_monitor_controller_restarts_one_worker_and_blocks_manual_when_off(
+    tmp_path: Path,
+) -> None:
+    workers = []
+    threads = []
+
+    class FakeWorker:
+        def __init__(self, settings, on_snapshot):
+            self.settings = settings
+            self.on_snapshot = on_snapshot
+            self.stopped = False
+            self.manual_requests = 0
+            workers.append(self)
+
+        def run(self):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+        def send_now(self):
+            self.manual_requests += 1
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
+            self.alive = False
+            threads.append(self)
+
+        def start(self):
+            self.alive = True
+
+        def join(self, timeout):
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    controller = ProgressMonitorController(
+        worker_factory=FakeWorker,
+        thread_factory=FakeThread,
+    )
+    settings = _settings(tmp_path)
+
+    controller.start(settings, lambda _snapshot: None)
+    first_worker = workers[0]
+    first_thread = threads[0]
+    controller.start(settings, lambda _snapshot: None)
+
+    assert first_worker.stopped is True
+    assert first_thread.alive is False
+    assert sum(thread.alive for thread in threads) == 1
+    assert controller.send_now() is True
+    assert workers[-1].manual_requests == 1
+
+    controller.stop()
+
+    assert controller.active is False
+    assert controller.send_now() is False
+    assert not any(thread.alive for thread in threads)
+
+
 def test_monitor_worker_survives_read_or_network_errors(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
@@ -204,7 +297,7 @@ def test_monitor_reports_stale_if_heartbeat_exceeds_server_freshness(
     assert worker.poll_once().status == "STALE"
 
 
-def test_monitor_ui_keeps_all_issue_60_status_fields_and_controls() -> None:
+def test_monitor_ui_keeps_status_fields_and_exposes_send_state_controls() -> None:
     source = (
         ROOT / "src" / "oraja_training" / "serve" / "progress_monitor.py"
     ).read_text(encoding="utf-8")
@@ -217,10 +310,14 @@ def test_monitor_ui_keeps_all_issue_60_status_fields_and_controls() -> None:
         'text="本日の打鍵数"',
         'text="最終送信"',
         'text="次回heartbeat"',
-        'text="Mac URL"',
+        'text="送信状態"',
+        'text="送信先 URL"',
+        'text="送信を有効にする"',
         'text="score.db"',
         'text="今すぐ送信"',
         'text="終了"',
+        'send_state_var.set("ON" if enabled else "OFF")',
+        'send_now_button.state(["disabled"])',
         "filedialog.askopenfilename",
     ):
         assert required in source
