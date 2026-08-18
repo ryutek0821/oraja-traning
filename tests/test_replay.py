@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from oraja_training.collect import replay
+from oraja_training.filesystem import sqlite_file_identity
+
+
+WINDOWS_DEVICE_ID = 16_012_189_180_544_750_605
 
 
 def _write(path: Path, payload: object) -> None:
@@ -45,6 +49,90 @@ def test_read_keeps_only_allowlisted_metadata(tmp_path) -> None:
     assert "keyinput" not in meta.__slots__
     assert "unknownFutureField" not in meta.__slots__
     assert (path.stat().st_mtime_ns, path.read_bytes()) == before
+
+
+@pytest.mark.parametrize(
+    ("device", "inode"),
+    [
+        (0, 0),
+        ((1 << 63) - 1, (1 << 63) - 1),
+        (-1, -1),
+        (-(1 << 63), -(1 << 63)),
+    ],
+)
+def test_sqlite_file_identity_preserves_signed_pairs(device, inode) -> None:
+    assert sqlite_file_identity(device, inode) == (device, inode)
+
+
+@pytest.mark.parametrize(
+    ("device", "inode", "expected"),
+    [
+        (
+            WINDOWS_DEVICE_ID,
+            (1 << 127) + 17,
+            (-1_345_291_826_494_320_866, -4_457_856_881_217_741_841),
+        ),
+        (
+            (1 << 64) - 1,
+            (1 << 128) - 1,
+            (4_231_273_984_629_928_422, -1_054_004_813_654_259_457),
+        ),
+    ],
+)
+def test_sqlite_file_identity_hashes_wide_pairs_deterministically(
+    device, inode, expected
+) -> None:
+    assert sqlite_file_identity(device, inode) == expected
+
+
+@pytest.mark.parametrize(
+    ("device", "inode", "field"),
+    [
+        (-(1 << 63) - 1, 0, "device"),
+        (1 << 64, 0, "device"),
+        (0, -(1 << 63) - 1, "inode"),
+        (0, 1 << 128, "inode"),
+    ],
+)
+def test_sqlite_file_identity_rejects_values_outside_supported_ranges(
+    device, inode, field
+) -> None:
+    with pytest.raises(OverflowError, match=field):
+        sqlite_file_identity(device, inode)
+
+
+@pytest.mark.parametrize(
+    ("device", "inode", "field"),
+    [(True, 1, "device"), (1.0, 1, "device"), (1, "1", "inode")],
+)
+def test_sqlite_file_identity_rejects_non_integer_values(device, inode, field) -> None:
+    with pytest.raises(TypeError, match=field):
+        sqlite_file_identity(device, inode)
+
+
+def test_read_normalizes_unsigned_windows_file_ids(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "slot.brd"
+    _write(path, _payload())
+    original_stat = Path.stat
+
+    def windows_stat(candidate: Path, *args, **kwargs):
+        value = original_stat(candidate, *args, **kwargs)
+        if candidate != path:
+            return value
+        return SimpleNamespace(
+            st_dev=WINDOWS_DEVICE_ID,
+            st_ino=(1 << 127) + 17,
+            st_size=value.st_size,
+            st_mtime_ns=value.st_mtime_ns,
+        )
+
+    monkeypatch.setattr(Path, "stat", windows_stat)
+
+    metadata = replay.read(path)
+
+    assert (metadata.device, metadata.inode) == sqlite_file_identity(
+        WINDOWS_DEVICE_ID, (1 << 127) + 17
+    )
 
 
 @pytest.mark.parametrize("payload", [[], [ _payload() ]])

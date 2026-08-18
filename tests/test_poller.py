@@ -5,6 +5,7 @@ from pathlib import Path
 import gzip
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,10 @@ from oraja_training.collect import replay
 from oraja_training.collect.poller import Poller
 from oraja_training.db import readers
 from oraja_training.db import store
+from oraja_training.filesystem import sqlite_file_identity
+
+
+WINDOWS_DEVICE_ID = 16_012_189_180_544_750_605
 
 
 SCORE_DDL = """
@@ -338,6 +343,98 @@ def test_replay_exact_match_history_overwrite_and_invalid_counter(tmp_path) -> N
         assert {row[2] for row in history} == {"matched"}
         columns = {row[1] for row in poller.conn.execute("PRAGMA table_info(replay_metadata)")}
         assert "keyinput" not in columns
+
+
+def test_replay_windows_unsigned_file_id_is_persisted_and_stable(
+    tmp_path, monkeypatch
+) -> None:
+    source = _source_dir(tmp_path)
+    slot = source / "replay" / "slot.brd"
+    _replay(slot)
+    original_stat = Path.stat
+    windows_inode = [(1 << 127) + 17]
+
+    def windows_stat(candidate: Path, *args, **kwargs):
+        value = original_stat(candidate, *args, **kwargs)
+        if candidate != slot:
+            return value
+        return SimpleNamespace(
+            st_dev=WINDOWS_DEVICE_ID,
+            st_ino=windows_inode[0],
+            st_size=value.st_size,
+            st_mtime_ns=value.st_mtime_ns,
+        )
+
+    monkeypatch.setattr(Path, "stat", windows_stat)
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_050) as poller:
+        first = poller.tick(force=True)
+        persisted = poller.conn.execute(
+            "SELECT device, inode FROM replay_scan_state WHERE path = ?", (str(slot),)
+        ).fetchone()
+
+    assert first.replay_scanned == 1
+    assert persisted is not None
+    assert tuple(persisted) == sqlite_file_identity(
+        WINDOWS_DEVICE_ID,
+        windows_inode[0],
+    )
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_051) as restarted:
+        assert restarted.tick().replay_scanned == 0
+        windows_inode[0] += 1
+        changed = restarted.tick()
+        updated = restarted.conn.execute(
+            "SELECT inode FROM replay_scan_state WHERE path = ?", (str(slot),)
+        ).fetchone()
+
+    assert changed.replay_scanned == 1
+    assert updated is not None
+    assert updated[0] == sqlite_file_identity(
+        WINDOWS_DEVICE_ID, windows_inode[0]
+    )[1]
+
+
+def test_invalid_replay_windows_wide_identity_is_persisted_once(
+    tmp_path, monkeypatch
+) -> None:
+    source = _source_dir(tmp_path)
+    slot = source / "replay" / "broken.brd"
+    slot.parent.mkdir()
+    slot.write_bytes(b"not-gzip")
+    windows_inode = (1 << 127) + 19
+    original_stat = Path.stat
+
+    def windows_stat(candidate: Path, *args, **kwargs):
+        value = original_stat(candidate, *args, **kwargs)
+        if candidate != slot:
+            return value
+        return SimpleNamespace(
+            st_dev=WINDOWS_DEVICE_ID,
+            st_ino=windows_inode,
+            st_size=value.st_size,
+            st_mtime_ns=value.st_mtime_ns,
+        )
+
+    monkeypatch.setattr(Path, "stat", windows_stat)
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_075) as poller:
+        first = poller.tick(force=True)
+        persisted = poller.conn.execute(
+            "SELECT device, inode, outcome FROM replay_scan_state WHERE path = ?",
+            (str(slot),),
+        ).fetchone()
+
+    expected = sqlite_file_identity(WINDOWS_DEVICE_ID, windows_inode)
+    assert first.replay_invalid == 1
+    assert persisted is not None
+    assert tuple(persisted) == (*expected, "invalid")
+
+    with Poller(source, tmp_path / "assistant.db", clock=lambda: 4_076) as restarted:
+        second = restarted.tick()
+
+    assert second.replay_scanned == 0
+    assert second.replay_invalid == 0
 
 
 def test_replay_batches_eventually_ingest_over_128_files_across_restart(
