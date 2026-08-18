@@ -8,6 +8,8 @@ import sqlite3
 import json
 from typing import Any
 
+from oraja_training.filesystem import sqlite_file_identity
+
 
 SCHEMA_VERSION = 10
 BEATORAJA_DB_NAMES = {
@@ -583,6 +585,16 @@ def load_replay_scan_states(
     }
 
 
+def _normalized_replay_scan_states(
+    observations: Iterable[Mapping[str, Any]],
+) -> Iterable[dict[str, Any]]:
+    for observation in observations:
+        device, inode = sqlite_file_identity(
+            observation["device"], observation["inode"]
+        )
+        yield {**observation, "device": device, "inode": inode}
+
+
 def upsert_replay_scan_states(
     conn: sqlite3.Connection, observations: Iterable[Mapping[str, Any]]
 ) -> None:
@@ -604,7 +616,7 @@ def upsert_replay_scan_states(
           outcome = excluded.outcome,
           checked_at = excluded.checked_at
         """,
-        observations,
+        _normalized_replay_scan_states(observations),
     )
 
 

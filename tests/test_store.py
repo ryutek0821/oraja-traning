@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from oraja_training.db import store
+from oraja_training.filesystem import sqlite_file_identity
 
 
 def test_init_creates_complete_versioned_schema(tmp_path) -> None:
@@ -288,6 +289,40 @@ def test_init_migrates_v7_pattern_safety_columns_additively(tmp_path) -> None:
         assert conn.execute(
             "SELECT sha256 FROM chart_pattern_features"
         ).fetchone()[0] == "a" * 64
+    finally:
+        conn.close()
+
+
+def test_replay_scan_state_normalizes_unsigned_windows_file_ids(tmp_path) -> None:
+    conn = store.init(tmp_path / "assistant.db")
+    try:
+        store.upsert_replay_scan_states(
+            conn,
+            [
+                {
+                    "path": "slot.brd",
+                    "device": 16_012_189_180_544_750_605,
+                    "inode": (1 << 127) + 17,
+                    "mtime_ns": 3,
+                    "compressed_size": 4,
+                    "outcome": "valid",
+                    "checked_at": 5,
+                }
+            ],
+        )
+        conn.commit()
+
+        expected = sqlite_file_identity(
+            16_012_189_180_544_750_605,
+            (1 << 127) + 17,
+        )
+        assert store.load_replay_scan_states(conn)["slot.brd"] == (
+            expected[0],
+            expected[1],
+            3,
+            4,
+            "valid",
+        )
     finally:
         conn.close()
 

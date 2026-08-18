@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from oraja_training.filesystem import sqlite_file_identity
+
 
 MAX_COMPRESSED_BYTES = 2 * 1024 * 1024
 MAX_JSON_BYTES = 8 * 1024 * 1024
@@ -145,10 +147,11 @@ def read(path: str | Path) -> ReplayMeta:
         raise ReplayReadError("gauge is outside the supported range 0..5")
     rand_value = payload.get("rand")
 
+    device, inode = sqlite_file_identity(before.st_dev, before.st_ino)
     return ReplayMeta(
         path=replay_path,
-        device=before.st_dev,
-        inode=before.st_ino,
+        device=device,
+        inode=inode,
         content_hash=digest.hexdigest(),
         compressed_size=before.st_size,
         mtime_ns=before.st_mtime_ns,

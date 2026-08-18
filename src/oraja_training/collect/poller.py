@@ -15,6 +15,7 @@ from oraja_training.collect.normalize import derive_play, payload_hash
 from oraja_training.collect import replay
 from oraja_training.collect.source import SourceSignature, source_signature
 from oraja_training.db import readers, store
+from oraja_training.filesystem import sqlite_file_identity
 
 
 LOGGER = logging.getLogger(__name__)
@@ -237,8 +238,15 @@ class Poller:
                 stat = path.stat()
             except FileNotFoundError:
                 continue
+            device, inode = sqlite_file_identity(stat.st_dev, stat.st_ino)
             signals.append(
-                (str(path), stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                (
+                    str(path),
+                    device,
+                    inode,
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                )
             )
         return tuple(signals)
 
