@@ -19,7 +19,11 @@ class _Response(BytesIO):
 
 def test_send_progress_posts_cumulative_snapshot(monkeypatch) -> None:
     captured = {}
-    monkeypatch.setattr(progress_sender, "_read_latest_judged", lambda _path: 123_456)
+    monkeypatch.setattr(
+        progress_sender,
+        "read_progress_counts",
+        lambda _path, **_kwargs: progress_sender.ProgressCounts(123_456, 2_345),
+    )
 
     def open_request(request, timeout):
         captured["request"] = request
@@ -41,6 +45,7 @@ def test_send_progress_posts_cumulative_snapshot(monkeypatch) -> None:
     assert payload == {
         "source_id": "RYU-DESKTOP2",
         "current_judged": 123_456,
+        "today_judged": 2_345,
         "observed_at": 2_000,
     }
     assert result == {"status": "accepted"}
@@ -55,7 +60,7 @@ def test_daemon_retries_a_locked_database(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(
         progress_sender,
-        "_read_latest_judged",
+        "read_progress_counts",
         lambda _path: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
     )
     monkeypatch.setattr(
@@ -71,14 +76,18 @@ def test_daemon_retries_a_locked_database(monkeypatch, capsys) -> None:
 
 def test_daemon_heartbeats_when_the_counter_does_not_change(monkeypatch) -> None:
     monotonic = iter((0.0, 31.0))
-    sent: list[int] = []
+    sent: list[tuple[int, int | None]] = []
     sleeps = [0]
-    monkeypatch.setattr(progress_sender, "_read_latest_judged", lambda _path: 42)
+    monkeypatch.setattr(
+        progress_sender,
+        "read_progress_counts",
+        lambda _path: progress_sender.ProgressCounts(42, 7),
+    )
     monkeypatch.setattr(progress_sender.time, "monotonic", lambda: next(monotonic))
     monkeypatch.setattr(
         progress_sender,
         "send_progress_snapshot",
-        lambda _url, _token, current, **_kwargs: sent.append(current),
+        lambda _url, _token, current, today, **_kwargs: sent.append((current, today)),
     )
 
     def sleep(_seconds):
@@ -89,4 +98,4 @@ def test_daemon_heartbeats_when_the_counter_does_not_change(monkeypatch) -> None
     monkeypatch.setattr(progress_sender.time, "sleep", sleep)
     with pytest.raises(StopIteration):
         progress_sender.run_sender("score.db", "http://example.test", "token")
-    assert sent == [42, 42]
+    assert sent == [(42, 7), (42, 7)]

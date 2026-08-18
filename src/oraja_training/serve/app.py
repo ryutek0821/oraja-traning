@@ -17,10 +17,7 @@ import time
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-
-JUDGEMENT_COLUMNS = (
-    "epg", "lpg", "egr", "lgr", "egd", "lgd", "ebd", "lbd", "epr", "lpr"
-)
+from .progress_counts import JUDGEMENT_COLUMNS, progress_date, read_progress_counts
 
 _EXPORT_ROUTES = {
     "/table/recommend/header.json": ("table", "recommend", "header.json"),
@@ -46,20 +43,7 @@ def _read_json(path: Path) -> Any:
 
 
 def _read_latest_judged(score_db: Path) -> int:
-    uri = f"{score_db.expanduser().resolve(strict=True).as_uri()}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=0.1)
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("PRAGMA busy_timeout = 100")
-        columns = ", ".join(f'"{name}"' for name in JUDGEMENT_COLUMNS)
-        row = connection.execute(
-            f"SELECT {columns} FROM player ORDER BY date DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("player table is empty")
-        return sum(max(0, int(value or 0)) for value in row)
-    finally:
-        connection.close()
+    return read_progress_counts(score_db).current_judged
 
 
 def _validate_progress_bind(host: str, progress_token: str | None) -> None:
@@ -109,6 +93,8 @@ class TrainingHTTPServer(ThreadingHTTPServer):
         )
         self.target_judged = max(1, int(target_judged))
         self.last_current_judged: int | None = None
+        self.last_today_judged: int | None = None
+        self.last_progress_date = None
         self.progress_state = (
             Path(progress_state).expanduser().resolve()
             if progress_state is not None
@@ -123,10 +109,12 @@ class TrainingHTTPServer(ThreadingHTTPServer):
     def receive_progress(self, payload: Any) -> tuple[HTTPStatus, dict[str, Any]]:
         if not isinstance(payload, dict):
             return HTTPStatus.BAD_REQUEST, {"error": "JSON object required"}
-        if set(payload) != {"source_id", "current_judged", "observed_at"}:
+        required = {"source_id", "current_judged", "observed_at"}
+        if set(payload) not in (required, required | {"today_judged"}):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid progress payload"}
         source_id = payload["source_id"]
         current = payload["current_judged"]
+        today_judged = payload.get("today_judged")
         observed_at = payload["observed_at"]
         now = int(time.time())
         if (
@@ -140,6 +128,14 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             or current < 0
             or observed_at < 0
             or observed_at > now + 300
+            or (
+                today_judged is not None
+                and (
+                    type(today_judged) is not int
+                    or today_judged < 0
+                    or today_judged > current
+                )
+            )
         ):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid progress payload"}
         if self.progress_state is None:
@@ -172,12 +168,22 @@ class TrainingHTTPServer(ThreadingHTTPServer):
                 if observed_at == old_time and current != old_current:
                     return HTTPStatus.CONFLICT, {"error": "conflicting progress snapshot"}
                 if observed_at == old_time and current == old_current:
+                    if (
+                        "today_judged" in payload
+                        and "today_judged" in previous
+                        and today_judged != previous["today_judged"]
+                    ):
+                        return HTTPStatus.CONFLICT, {
+                            "error": "conflicting progress snapshot"
+                        }
                     return HTTPStatus.OK, {"status": "accepted", **previous}
 
             state = {
                 "source_id": source_id,
                 "current_judged": current,
+                "today_judged": today_judged,
                 "observed_at": observed_at,
+                "observed_date": progress_date(observed_at).isoformat(),
                 "received_at": now,
             }
             self.progress_state.parent.mkdir(parents=True, exist_ok=True)
@@ -195,9 +201,11 @@ class TrainingHTTPServer(ThreadingHTTPServer):
         return HTTPStatus.OK, {"status": "accepted", **state}
 
     def status(self) -> dict[str, Any]:
+        now = int(time.time())
+        today = progress_date(now)
         stale = False
         errors: list[str] = []
-        warning: str | None = None
+        warnings: list[str] = []
         clock_skew_seconds: int | None = None
         baseline = 0
         try:
@@ -208,12 +216,16 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             errors.append("manifestを読み取れません")
 
         current: int | None = None
+        daily: int | None = None
         source = "baseline"
         remote_observed_at: int | None = None
         remote_received_at: int | None = None
+        remote_observed_date: str | None = None
         if self.progress_state is not None:
             try:
                 progress = _read_json(self.progress_state)
+                if not isinstance(progress, dict):
+                    raise TypeError("progress state must be an object")
                 current = max(0, int(progress["current_judged"]))
                 remote_observed_at = int(progress["observed_at"])
                 source = str(progress["source_id"])
@@ -222,13 +234,32 @@ class TrainingHTTPServer(ThreadingHTTPServer):
                 )
                 clock_skew_seconds = remote_observed_at - remote_received_at
                 if abs(clock_skew_seconds) > self.progress_stale_after:
-                    warning = (
+                    warnings.append(
                         f"{source}の観測時刻が受信時刻と"
                         f"{abs(clock_skew_seconds)}秒ずれています"
                     )
-                if int(time.time()) - remote_received_at > self.progress_stale_after:
+                if now - remote_received_at > self.progress_stale_after:
                     stale = True
                     errors.append(f"{source}からの進捗が停止しています")
+                observed_day = progress_date(remote_observed_at)
+                remote_observed_date = observed_day.isoformat()
+                stored_day = progress.get("observed_date")
+                if stored_day is not None and stored_day != remote_observed_date:
+                    warnings.append(f"{source}の保存済み観測日が不整合です")
+                raw_daily = progress.get("today_judged")
+                if observed_day < today:
+                    daily = 0
+                elif observed_day > today:
+                    warnings.append(f"{source}の観測日が未来です")
+                elif (
+                    type(raw_daily) is int
+                    and 0 <= raw_daily <= current
+                ):
+                    daily = raw_daily
+                else:
+                    warnings.append(
+                        f"{source}の本日打鍵数を安全に復元できません"
+                    )
             except FileNotFoundError:
                 pass
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -246,17 +277,31 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             errors.append("score.dbが設定されていません")
         elif current is None:
             try:
-                current = _read_latest_judged(self.score_db)
+                counts = read_progress_counts(self.score_db, now=now)
+                current = counts.current_judged
+                daily = counts.today_judged
                 self.last_current_judged = current
+                self.last_today_judged = daily
+                self.last_progress_date = today
                 source = "local-score-db"
             except (OSError, ValueError, RuntimeError, sqlite3.Error):
                 stale = True
                 errors.append("score.dbを読み取れません")
                 current = self.last_current_judged
+                if self.last_progress_date is not None:
+                    if self.last_progress_date < today:
+                        daily = 0
+                    elif self.last_progress_date == today:
+                        daily = self.last_today_judged
 
         if current is None:
             current = baseline
-        live = max(0, current - baseline)
+        if daily is None:
+            live = max(0, current - baseline)
+            if current != baseline and not warnings:
+                warnings.append("本日打鍵数を累積値から互換算出しています")
+        else:
+            live = max(0, daily)
         target = self.target_judged
         return {
             "target_judged": target,
@@ -264,9 +309,10 @@ class TrainingHTTPServer(ThreadingHTTPServer):
             "current_judged": current,
             "progress_source": source,
             "progress_observed_at": remote_observed_at,
+            "progress_observed_date": remote_observed_date,
             "progress_received_at": remote_received_at,
             "progress_clock_skew_seconds": clock_skew_seconds,
-            "progress_warning": warning,
+            "progress_warning": " / ".join(warnings) if warnings else None,
             "live_judged": live,
             "remaining_judged": max(0, target - live),
             "progress": min(1.0, live / target),
