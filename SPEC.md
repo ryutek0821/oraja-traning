@@ -271,6 +271,40 @@ CREATE TABLE table_entries (
 CREATE UNIQUE INDEX idx_table_entries
   ON table_entries(table_id, level, COALESCE(sha256, md5));
 
+-- 外部分類表の取得単位。難易度表とは独立し、取得失敗時は最終正常行を保持する。
+CREATE TABLE classification_sources (
+  source_id             TEXT PRIMARY KEY,
+  family                TEXT NOT NULL,
+  page_url              TEXT NOT NULL,
+  header_url            TEXT,
+  data_url              TEXT,
+  content_digest        TEXT,
+  fetched_at            INTEGER,
+  stale                 INTEGER NOT NULL DEFAULT 0,
+  entry_count           INTEGER,
+  classification_count  INTEGER,
+  matched_count         INTEGER,
+  last_error            TEXT
+);
+
+-- 複合ラベルは分類軸ごとに1行へ正規化する。
+CREATE TABLE chart_classifications (
+  source_id             TEXT NOT NULL REFERENCES classification_sources(source_id),
+  source_key            TEXT NOT NULL,
+  sha256                TEXT,
+  md5                   TEXT,
+  local_sha256          TEXT REFERENCES charts(sha256),
+  family                TEXT NOT NULL,
+  base_scale            TEXT NOT NULL,
+  base_level            INTEGER NOT NULL,
+  classification_scale  TEXT NOT NULL,
+  classification_level  INTEGER NOT NULL,
+  raw_level             TEXT NOT NULL,
+  title                 TEXT,
+  match_status          TEXT NOT NULL,
+  PRIMARY KEY(source_id, source_key, classification_scale)
+);
+
 CREATE TABLE model_state (
   target           TEXT NOT NULL,    -- completed | bp_rate | clear_easy
   version          INTEGER NOT NULL,
@@ -321,7 +355,7 @@ CREATE TABLE experiment_sessions (...); -- session arm、候補hash、選択確�
 CREATE TABLE experiment_targets (...);  -- retention/transfer × 1/3/7/14日
 ```
 
-**`schema_version` は 10**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxy、version 9でReplay走査状態、version 10で実験の元候補hashを加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POORを含めており、`ems`/`lms`を保存していないため**正しい値を復元できない**。version 1の`assistant.db`を開いたら、黙って読まずに「削除してbackfillをやり直せ」という明示的なエラーで停止すること。
+**`schema_version` は 11**。version 2からは日次取込等、version 3からはReplay metadata履歴、version 5で自己実験テーブル、version 6で任意の譜面パターン解析、version 7で難易度表照合数、version 8でWARMUP安全proxy、version 9でReplay走査状態、version 10で実験の元候補hash、version 11で外部譜面分類sourceと正規化行を加える加算的マイグレーションを行う。version 1 からの in-place マイグレーションは**しない**。version 1 は `judged` に空POORを含めており、`ems`/`lms`を保存していないため**正しい値を復元できない**。version 1の`assistant.db`を開いたら、黙って読まずに「削除してbackfillをやり直せ」という明示的なエラーで停止すること。
 
 ### A-4.1 派生値の規則
 
@@ -379,6 +413,8 @@ src/oraja_training/
 
   tables/fetch.py      fetch_table(table_id, header_url) -> TableData  # ETag対応・キャッシュ
   tables/match.py      resolve(entries, charts) -> MatchReport         # 突合率を返す
+  tables/classification.py  複合分類ラベルの検証・正規化
+  db/classification_adapter.py  外部分類のsource単位更新・参照
 
   features/songinfo.py decode_distribution(s) -> list[list[int]]       # 7列 × 秒
                        decode_speedchange(s) / decode_lanenotes(s)

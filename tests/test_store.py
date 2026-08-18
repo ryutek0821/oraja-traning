@@ -12,7 +12,7 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
     path = tmp_path / "assistant.db"
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         tables = {
             row[0]
             for row in conn.execute(
@@ -42,6 +42,8 @@ def test_init_creates_complete_versioned_schema(tmp_path) -> None:
             "experiment_sessions",
             "experiment_targets",
             "chart_pattern_features",
+            "classification_sources",
+            "chart_classifications",
         }.issubset(tables)
         play_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(plays)")
@@ -112,7 +114,7 @@ def test_init_migrates_v2_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_imports'"
@@ -136,7 +138,7 @@ def test_init_migrates_v3_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='replay_metadata'"
@@ -160,7 +162,7 @@ def test_init_migrates_v4_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_targets'"
@@ -215,7 +217,7 @@ def test_init_migrates_v5_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
         assert conn.execute(
             "SELECT 1 FROM sqlite_master "
@@ -251,7 +253,7 @@ def test_init_migrates_v6_table_coverage_columns(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         columns = {row[1] for row in conn.execute("PRAGMA table_info(table_sources)")}
         assert {"entry_count", "matched_count"}.issubset(columns)
         assert conn.execute(
@@ -280,7 +282,7 @@ def test_init_migrates_v7_pattern_safety_columns_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(chart_pattern_features)")
@@ -350,7 +352,7 @@ def test_init_migrates_v8_replay_scan_state_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute(
             "SELECT path FROM replay_metadata"
         ).fetchone()[0] == "slot.brd"
@@ -407,12 +409,42 @@ def test_init_migrates_v9_experiment_input_hash_additively(tmp_path) -> None:
 
     conn = store.init(path)
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute(
             "SELECT input_candidate_hash FROM experiment_sessions"
         ).fetchone()[0] == "effective-hash"
         assert conn.execute(
             "SELECT outcome FROM replay_scan_state WHERE path='slot.brd'"
         ).fetchone()[0] == "valid"
+    finally:
+        conn.close()
+
+
+def test_init_migrates_v10_classification_tables_additively(tmp_path) -> None:
+    path = tmp_path / "assistant.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            store.SCHEMA_V2 + store.SCHEMA_V3 + store.SCHEMA_V4
+            + store.SCHEMA_V5 + store.SCHEMA_V6 + store.SCHEMA_V7
+            + store.SCHEMA_V8 + store.SCHEMA_V9 + store.SCHEMA_V10
+        )
+        conn.execute("INSERT INTO schema_version VALUES (10)")
+        conn.execute(
+            "INSERT INTO charts VALUES (?, NULL, 'Chart', NULL, 1, 7, NULL, 1)",
+            ("a" * 64,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = store.init(path)
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='chart_classifications'"
+        ).fetchone()
+        assert conn.execute("SELECT title FROM charts").fetchone()[0] == "Chart"
     finally:
         conn.close()

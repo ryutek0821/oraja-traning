@@ -46,6 +46,12 @@ from oraja_training.plan import (
     recommendation_output,
     table_payloads,
 )
+from oraja_training.tables.classification import (
+    DEFAULT_CLASSIFICATION_SOURCES,
+    ClassificationError,
+    ClassificationSourceSpec,
+    parse_classification_level,
+)
 
 from .manifest import (
     DATABASE_NAMES,
@@ -572,6 +578,312 @@ def _seed_table_catalog(
         )
 
 
+def _seed_classification_catalog(
+    connection: sqlite3.Connection,
+    context: Mapping[str, Any],
+    fetched_at: int,
+) -> None:
+    sources = context.get("classification_sources")
+    rows = context.get("classification_entries")
+    manifest_hash = context.get("classification_manifest_sha256")
+    if sources is None and rows is None and manifest_hash is None:
+        return
+    payload = {"sources": sources, "entries": rows}
+    if (
+        not isinstance(sources, list)
+        or not 1 <= len(sources) <= 16
+        or not isinstance(rows, list)
+        or not 1 <= len(rows) <= 20_000
+        or not isinstance(manifest_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+        or hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+        != manifest_hash
+    ):
+        raise ContainerError(
+            "classification catalog is invalid",
+            code="invalid_contract",
+            status=422,
+        )
+
+    supported_sources = {
+        source.source_id: source for source in DEFAULT_CLASSIFICATION_SOURCES
+    }
+    accepted_sources: dict[str, tuple[str, str, str | None, str | None, str]] = {}
+    accepted_specs: dict[str, ClassificationSourceSpec] = {}
+    for source in sources:
+        if not isinstance(source, Mapping):
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            )
+        source_id = source.get("source_id")
+        family = source.get("family")
+        page_url = source.get("page_url")
+        header_url = source.get("header_url")
+        data_url = source.get("data_url")
+        content_digest = source.get("content_digest")
+        source_spec = (
+            supported_sources.get(source_id) if isinstance(source_id, str) else None
+        )
+        if (
+            not isinstance(source_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", source_id) is None
+            or source_id in accepted_sources
+            or source_spec is None
+            or not isinstance(family, str)
+            or re.fullmatch(r"[a-z_]{1,32}", family) is None
+            or family != source_spec.family
+            or not isinstance(page_url, str)
+            or not page_url.startswith("https://")
+            or len(page_url) > 2048
+            or (
+                header_url is not None
+                and (
+                    not isinstance(header_url, str)
+                    or not header_url.startswith("https://")
+                    or len(header_url) > 2048
+                )
+            )
+            or (
+                data_url is not None
+                and (
+                    not isinstance(data_url, str)
+                    or not data_url.startswith("https://")
+                    or len(data_url) > 2048
+                )
+            )
+            or not isinstance(content_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", content_digest) is None
+        ):
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            )
+        assert source_spec is not None
+        accepted_sources[source_id] = (
+            family,
+            page_url,
+            header_url,
+            data_url,
+            content_digest,
+        )
+        accepted_specs[source_id] = source_spec
+
+    sha_index = {
+        str(row[0]): str(row[0])
+        for row in connection.execute("SELECT sha256 FROM charts")
+    }
+    md5_index: dict[str, list[str]] = {}
+    for sha256, md5 in connection.execute(
+        "SELECT sha256, md5 FROM charts WHERE md5 IS NOT NULL"
+    ):
+        md5_index.setdefault(str(md5), []).append(str(sha256))
+
+    accepted_rows: list[tuple[object, ...]] = []
+    seen: set[tuple[str, str, str]] = set()
+    expected_axes: dict[
+        tuple[str, str],
+        tuple[
+            str,
+            int,
+            str,
+            frozenset[tuple[str, int]],
+            str | None,
+            str | None,
+            str | None,
+        ],
+    ] = {}
+    supplied_axes: dict[tuple[str, str], set[tuple[str, int]]] = {}
+    entry_keys: dict[str, set[str]] = {source_id: set() for source_id in accepted_sources}
+    matched_keys: dict[str, set[str]] = {source_id: set() for source_id in accepted_sources}
+    classification_counts = {source_id: 0 for source_id in accepted_sources}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            )
+        source_id = row.get("source_id")
+        sha256 = row.get("sha256")
+        md5 = row.get("md5")
+        base_scale = row.get("base_scale")
+        base_level = row.get("base_level")
+        scale = row.get("classification_scale")
+        level = row.get("classification_level")
+        raw_level = row.get("raw_level")
+        title = row.get("title")
+        if (
+            not isinstance(source_id, str)
+            or source_id not in accepted_sources
+            or (
+                sha256 is not None
+                and (
+                    not isinstance(sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                )
+            )
+            or (
+                md5 is not None
+                and (
+                    not isinstance(md5, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", md5) is None
+                )
+            )
+            or (sha256 is None and md5 is None)
+            or base_scale not in {"sl", "st"}
+            or not isinstance(base_level, int)
+            or isinstance(base_level, bool)
+            or not 0 <= base_level <= 99
+            or not isinstance(scale, str)
+            or not 1 <= len(scale) <= 32
+            or not isinstance(level, int)
+            or isinstance(level, bool)
+            or not -99 <= level <= 99
+            or not isinstance(raw_level, str)
+            or not 1 <= len(raw_level) <= 128
+            or (title is not None and (not isinstance(title, str) or len(title) > 512))
+        ):
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            )
+        source_key = f"sha256:{sha256}" if sha256 is not None else f"md5:{md5}"
+        try:
+            parsed_base, parsed_level, parsed_axes = parse_classification_level(
+                raw_level, accepted_specs[source_id]
+            )
+        except ClassificationError as exc:
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            ) from exc
+        entry_identity = (source_id, source_key)
+        expected = (
+            parsed_base,
+            parsed_level,
+            raw_level,
+            frozenset(parsed_axes),
+            sha256,
+            md5,
+            title,
+        )
+        previous = expected_axes.setdefault(entry_identity, expected)
+        if (
+            previous != expected
+            or base_scale != parsed_base
+            or base_level != parsed_level
+            or (scale, level) not in expected[3]
+        ):
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            )
+        supplied_axes.setdefault(entry_identity, set()).add((scale, level))
+        identity = (str(source_id), source_key, scale)
+        if identity in seen:
+            raise ContainerError(
+                "classification catalog is invalid",
+                code="invalid_contract",
+                status=422,
+            )
+        seen.add(identity)
+        local_sha256 = sha_index.get(str(sha256)) if sha256 is not None else None
+        match_status = "sha256"
+        if local_sha256 is None:
+            md5_matches = md5_index.get(str(md5), []) if md5 is not None else []
+            if len(md5_matches) == 1:
+                local_sha256, match_status = md5_matches[0], "md5"
+            elif len(md5_matches) > 1:
+                match_status = "ambiguous_local_hash"
+            else:
+                match_status = "not_owned"
+        family = accepted_sources[str(source_id)][0]
+        accepted_rows.append(
+            (
+                source_id,
+                source_key,
+                sha256,
+                md5,
+                local_sha256,
+                family,
+                base_scale,
+                base_level,
+                scale,
+                level,
+                raw_level,
+                title,
+                match_status,
+            )
+        )
+        entry_keys[str(source_id)].add(source_key)
+        classification_counts[str(source_id)] += 1
+        if local_sha256 is not None:
+            matched_keys[str(source_id)].add(source_key)
+
+    if any(
+        supplied_axes.get(identity, set()) != set(expected[3])
+        for identity, expected in expected_axes.items()
+    ):
+        raise ContainerError(
+            "classification catalog is invalid",
+            code="invalid_contract",
+            status=422,
+        )
+
+    with connection:
+        for source_id, values in accepted_sources.items():
+            family, page_url, header_url, data_url, content_digest = values
+            connection.execute(
+                """
+                INSERT INTO classification_sources(
+                  source_id, family, page_url, header_url, data_url,
+                  content_digest, fetched_at, stale, entry_count,
+                  classification_count, matched_count, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL)
+                ON CONFLICT(source_id) DO UPDATE SET
+                  family=excluded.family, page_url=excluded.page_url,
+                  header_url=excluded.header_url, data_url=excluded.data_url,
+                  content_digest=excluded.content_digest,
+                  fetched_at=excluded.fetched_at, stale=0,
+                  entry_count=excluded.entry_count,
+                  classification_count=excluded.classification_count,
+                  matched_count=excluded.matched_count, last_error=NULL
+                """,
+                (
+                    source_id,
+                    family,
+                    page_url,
+                    header_url,
+                    data_url,
+                    content_digest,
+                    fetched_at,
+                    len(entry_keys[source_id]),
+                    classification_counts[source_id],
+                    len(matched_keys[source_id]),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM chart_classifications WHERE source_id = ?",
+                (source_id,),
+            )
+        connection.executemany(
+            """
+            INSERT INTO chart_classifications(
+              source_id, source_key, sha256, md5, local_sha256, family,
+              base_scale, base_level, classification_scale,
+              classification_level, raw_level, title, match_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            accepted_rows,
+        )
+
+
 class ContainerAdapter:
     """Run one validated input manifest in an isolated temporary workspace."""
 
@@ -902,6 +1214,9 @@ class ContainerAdapter:
                 )
                 if table_context is not None:
                     _seed_table_catalog(assistant, table_context, int(self.clock()))
+                    _seed_classification_catalog(
+                        assistant, table_context, int(self.clock())
+                    )
                     recommendation_repository = SQLiteRecommendationRepository(assistant)
                 recommendation: Any | None = None
                 session: Any | None = None

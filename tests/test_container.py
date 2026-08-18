@@ -90,6 +90,40 @@ def _table_context(source: Path) -> dict[str, object]:
         connection.close()
     entries = [row for row in catalog["table_entries"] if row["sha256"] is not None]
     encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    owned = catalog["owned"][0]
+    classification_sources = [
+        {
+            "source_id": "slst-delay",
+            "family": "delay",
+            "page_url": "https://example.test/slst-delay/",
+            "header_url": "https://example.test/slst-delay/header.json",
+            "data_url": "https://example.test/slst-delay/data.json",
+            "content_digest": "7" * 64,
+        }
+    ]
+    classification_entries = [
+        {
+            "source_id": "slst-delay",
+            "sha256": owned["sha256"],
+            "md5": owned["md5"],
+            "base_scale": "sl",
+            "base_level": 10,
+            "classification_scale": scale,
+            "classification_level": level,
+            "raw_level": "sl10,dl-2,///10",
+            "title": owned["title"],
+        }
+        for scale, level in (("dl", -2), ("///", 10))
+    ]
+    classification_payload = {
+        "sources": classification_sources,
+        "entries": classification_entries,
+    }
+    classification_encoded = json.dumps(
+        classification_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
     return {
         "profile_id": PROFILE_ID,
         "display_name": "Synthetic",
@@ -102,7 +136,21 @@ def _table_context(source: Path) -> dict[str, object]:
         },
         "catalog_manifest_sha256": hashlib.sha256(encoded).hexdigest(),
         "catalog_entries": entries,
+        "classification_manifest_sha256": hashlib.sha256(
+            classification_encoded
+        ).hexdigest(),
+        "classification_sources": classification_sources,
+        "classification_entries": classification_entries,
     }
+
+
+def _resign_classifications(context: dict[str, object]) -> None:
+    payload = {
+        "sources": context["classification_sources"],
+        "entries": context["classification_entries"],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    context["classification_manifest_sha256"] = hashlib.sha256(encoded).hexdigest()
 
 
 def test_input_manifest_enforces_profile_partition_and_official_trust_domain() -> None:
@@ -155,14 +203,27 @@ def test_container_pipeline_uses_core_and_replays_immutable_artifacts() -> None:
         bundle = _bundle(root)
         manifest = _manifest(bundle)
         artifacts = MemoryArtifactStore()
+        assistant_db = root / "assistant.db"
         adapter = ContainerAdapter(
             artifact_store=artifacts,
             decryptor=PassthroughDecryptor(),
             clock=lambda: 1_786_400_000,
         )
 
-        first = adapter.run(manifest, bundle=bundle, revision=1, table_context=table_context)
-        second = adapter.run(manifest, bundle=bundle, revision=1, table_context=table_context)
+        first = adapter.run(
+            manifest,
+            bundle=bundle,
+            assistant_db=assistant_db,
+            revision=1,
+            table_context=table_context,
+        )
+        second = adapter.run(
+            manifest,
+            bundle=bundle,
+            assistant_db=assistant_db,
+            revision=1,
+            table_context=table_context,
+        )
 
         assert first.output_manifest == second.output_manifest
         assert first.output_manifest_sha256 == second.output_manifest_sha256
@@ -193,6 +254,11 @@ def test_container_pipeline_uses_core_and_replays_immutable_artifacts() -> None:
             input_manifest=validate_input_manifest(manifest),
         )
         assert first.output_manifest["raw_db_exported"] is False
+        with sqlite3.connect(assistant_db) as connection:
+            assert connection.execute(
+                "SELECT classification_scale, classification_level, match_status "
+                "FROM chart_classifications ORDER BY classification_scale"
+            ).fetchall() == [("///", 10, "sha256"), ("dl", -2, "sha256")]
 
 
 def test_container_job_dispatch_applies_one_incremental_ir_play(tmp_path: Path) -> None:
@@ -254,6 +320,66 @@ def test_container_rejects_table_context_with_mismatched_catalog_digest(tmp_path
     bundle = _bundle(tmp_path)
     context = _table_context(tmp_path / "source")
     context["catalog_entries"][0]["level"] = "tampered"
+    with pytest.raises(ContainerError) as failure:
+        ContainerAdapter(decryptor=PassthroughDecryptor()).run(
+            _manifest(bundle), bundle=bundle, table_context=context
+        )
+    assert failure.value.code == "invalid_contract"
+
+
+def test_container_rejects_mismatched_classification_digest(tmp_path: Path) -> None:
+    build_synthetic_fixture(tmp_path / "source")
+    bundle = _bundle(tmp_path)
+    context = _table_context(tmp_path / "source")
+    context["classification_entries"][0]["classification_level"] = 99
+    with pytest.raises(ContainerError) as failure:
+        ContainerAdapter(decryptor=PassthroughDecryptor()).run(
+            _manifest(bundle), bundle=bundle, table_context=context
+        )
+    assert failure.value.code == "invalid_contract"
+
+
+def test_container_rejects_resigned_unknown_classification_axis(tmp_path: Path) -> None:
+    build_synthetic_fixture(tmp_path / "source")
+    bundle = _bundle(tmp_path)
+    context = _table_context(tmp_path / "source")
+    row = context["classification_entries"][0]
+    row["classification_scale"] = "unknown"
+    row["raw_level"] = "sl10,unknown-2,///10"
+    _resign_classifications(context)
+
+    with pytest.raises(ContainerError) as failure:
+        ContainerAdapter(decryptor=PassthroughDecryptor()).run(
+            _manifest(bundle), bundle=bundle, table_context=context
+        )
+    assert failure.value.code == "invalid_contract"
+
+
+def test_container_rejects_resigned_inconsistent_classification_row(
+    tmp_path: Path,
+) -> None:
+    build_synthetic_fixture(tmp_path / "source")
+    bundle = _bundle(tmp_path)
+    context = _table_context(tmp_path / "source")
+    context["classification_entries"][0]["base_level"] = 9
+    _resign_classifications(context)
+
+    with pytest.raises(ContainerError) as failure:
+        ContainerAdapter(decryptor=PassthroughDecryptor()).run(
+            _manifest(bundle), bundle=bundle, table_context=context
+        )
+    assert failure.value.code == "invalid_contract"
+
+
+def test_container_rejects_resigned_split_classification_identity(
+    tmp_path: Path,
+) -> None:
+    build_synthetic_fixture(tmp_path / "source")
+    bundle = _bundle(tmp_path)
+    context = _table_context(tmp_path / "source")
+    context["classification_entries"][1]["md5"] = "8" * 32
+    _resign_classifications(context)
+
     with pytest.raises(ContainerError) as failure:
         ContainerAdapter(decryptor=PassthroughDecryptor()).run(
             _manifest(bundle), bundle=bundle, table_context=context

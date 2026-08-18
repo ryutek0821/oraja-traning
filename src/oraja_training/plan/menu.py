@@ -142,6 +142,7 @@ class Candidate:
     warmup_load: float
     chart_seconds: float | None
     practice_low: bool | None
+    classifications: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +177,7 @@ class Session:
     reserve_target: int
     core_expected_judged: int
     reserve_expected_judged: int
-    weakness_axes: tuple[str, str]
+    weakness_axes: tuple[str, ...]
     baseline_judged: int
     import_id: int
     model_version: int
@@ -336,6 +337,7 @@ def _quantile(values: Sequence[float], fraction: float) -> float:
 def _load_candidates(
     records: Sequence[Mapping[str, Any]],
     model: ModelSnapshot | None,
+    classifications: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[
     list[Candidate], tuple[str, str], int, tuple[TableFrontier, ...]
 ]:
@@ -354,6 +356,20 @@ def _load_candidates(
         sha256 = str(row["sha256"])
         grouped.setdefault(sha256, []).append(row)
     deduped = [memberships[0] for memberships in grouped.values()]
+    classifications_by_sha256: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for classification in classifications:
+        sha256 = classification.get("sha256")
+        if isinstance(sha256, str) and sha256 in grouped:
+            classifications_by_sha256[sha256].append(dict(classification))
+    for values in classifications_by_sha256.values():
+        values.sort(
+            key=lambda value: (
+                str(value.get("family", "")),
+                str(value.get("classification_scale", "")),
+                str(value.get("classification_level", "")),
+                str(value.get("source_id", "")),
+            )
+        )
 
     feature_ranks: dict[str, list[float]] = {}
     for axis in FEATURE_AXES:
@@ -575,9 +591,44 @@ def _load_candidates(
                     None if row.get("practice_low") is None
                     else bool(row.get("practice_low"))
                 ),
+                classifications=tuple(
+                    classifications_by_sha256.get(str(row["sha256"]), ())
+                ),
             )
         )
     return candidates, (axes[0], axes[1]), model_version, table_frontiers
+
+
+def _classification_weakness_axes(
+    candidates: Sequence[Candidate],
+    *,
+    limit: int = 2,
+) -> tuple[str, ...]:
+    outcomes: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for candidate in candidates:
+        if candidate.playcount <= 0:
+            continue
+        labels: set[str] = set()
+        for classification in candidate.classifications:
+            family = classification.get("family")
+            scale = classification.get("classification_scale")
+            if not isinstance(family, str) or not isinstance(scale, str):
+                continue
+            labels.add(f"pattern:{family}:{scale}")
+        for label in labels:
+            outcomes[label][1] += 1
+            if candidate.clear < 4:
+                outcomes[label][0] += 1
+    ordered = sorted(
+        outcomes,
+        key=lambda label: (
+            -(outcomes[label][0] / outcomes[label][1]),
+            -outcomes[label][0],
+            -outcomes[label][1],
+            label,
+        ),
+    )
+    return tuple(ordered[:limit])
 
 
 def _expected(candidate: Candidate) -> int:
@@ -1017,7 +1068,9 @@ def build_session_from_input(
     import_id = recommendation_input.import_id
     baseline_judged = recommendation_input.baseline_judged
     candidates, axes, model_version, table_frontiers = _load_candidates(
-        recommendation_input.candidates, recommendation_input.model
+        recommendation_input.candidates,
+        recommendation_input.model,
+        recommendation_input.classifications,
     )
     table_warnings = _table_warnings(
         recommendation_input.table_sources, candidates, table_frontiers
@@ -1114,7 +1167,7 @@ def build_session_from_input(
         reserve_target=effective_settings.reserve_judged,
         core_expected_judged=core_total,
         reserve_expected_judged=reserve_total,
-        weakness_axes=axes,
+        weakness_axes=axes + _classification_weakness_axes(candidates),
         baseline_judged=baseline_judged,
         import_id=import_id,
         model_version=model_version,
@@ -1260,6 +1313,14 @@ def table_payloads(session: Session) -> dict[str, Any]:
         ],
         "mode": "beat-7k",
     }
+    def classification_comment(candidate: Candidate) -> str:
+        labels = tuple(
+            f"{value.get('classification_scale')}"
+            f"{value.get('classification_level')}"
+            for value in candidate.classifications
+        )
+        return f" / patterns {', '.join(labels)}" if labels else ""
+
     recommend_score = [
         {
             "sha256": candidate.sha256,
@@ -1273,6 +1334,7 @@ def table_payloads(session: Session) -> dict[str, Any]:
                     for rating in candidate.ratings
                 )
                 + f" / target {candidate.target}"
+                + classification_comment(candidate)
             ),
         }
         for candidate in session.personal

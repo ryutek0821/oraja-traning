@@ -11,7 +11,7 @@ from typing import Any
 from oraja_training.filesystem import sqlite_file_identity
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 BEATORAJA_DB_NAMES = {
     "score.db",
     "scoredatalog.db",
@@ -387,6 +387,51 @@ UPDATE experiment_sessions SET input_candidate_hash = candidate_hash;
 """
 
 
+SCHEMA_V11 = """
+CREATE TABLE classification_sources (
+  source_id             TEXT PRIMARY KEY,
+  family                TEXT NOT NULL,
+  page_url              TEXT NOT NULL,
+  header_url            TEXT,
+  data_url              TEXT,
+  content_digest        TEXT,
+  fetched_at            INTEGER,
+  stale                 INTEGER NOT NULL DEFAULT 0,
+  entry_count           INTEGER,
+  classification_count  INTEGER,
+  matched_count         INTEGER,
+  last_error            TEXT,
+  CHECK(stale IN (0, 1)),
+  CHECK(content_digest IS NULL OR length(content_digest) = 64)
+);
+
+CREATE TABLE chart_classifications (
+  source_id             TEXT NOT NULL REFERENCES classification_sources(source_id)
+                          ON DELETE CASCADE,
+  source_key            TEXT NOT NULL,
+  sha256                TEXT,
+  md5                   TEXT,
+  local_sha256          TEXT REFERENCES charts(sha256),
+  family                TEXT NOT NULL,
+  base_scale            TEXT NOT NULL,
+  base_level            INTEGER NOT NULL,
+  classification_scale  TEXT NOT NULL,
+  classification_level  INTEGER NOT NULL,
+  raw_level             TEXT NOT NULL,
+  title                 TEXT,
+  match_status          TEXT NOT NULL,
+  PRIMARY KEY(source_id, source_key, classification_scale),
+  CHECK(sha256 IS NOT NULL OR md5 IS NOT NULL),
+  CHECK(length(source_key) <= 80),
+  CHECK(length(raw_level) <= 128)
+);
+CREATE INDEX idx_chart_classifications_local
+  ON chart_classifications(local_sha256, family);
+CREATE INDEX idx_chart_classifications_source_hash
+  ON chart_classifications(sha256, md5);
+"""
+
+
 PLAY_COLUMNS = (
     "sha256",
     "mode",
@@ -451,7 +496,7 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n"
                 + SCHEMA_V2 + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
-                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10 + SCHEMA_V11
             )
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
@@ -467,6 +512,7 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V3 + SCHEMA_V4 + SCHEMA_V5
                 + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+                + SCHEMA_V11
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -479,7 +525,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V4 + SCHEMA_V5 + SCHEMA_V6
-                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+                + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10 + SCHEMA_V11
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -492,7 +538,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V5 + SCHEMA_V6 + SCHEMA_V7
-                + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+                + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10 + SCHEMA_V11
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -505,7 +551,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V6 + SCHEMA_V7 + SCHEMA_V8
-                + SCHEMA_V9 + SCHEMA_V10
+                + SCHEMA_V9 + SCHEMA_V10 + SCHEMA_V11
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -518,7 +564,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V7 + SCHEMA_V8 + SCHEMA_V9
-                + SCHEMA_V10
+                + SCHEMA_V10 + SCHEMA_V11
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -531,6 +577,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         try:
             conn.executescript(
                 "BEGIN IMMEDIATE;\n" + SCHEMA_V8 + SCHEMA_V9 + SCHEMA_V10
+                + SCHEMA_V11
             )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
@@ -541,7 +588,9 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 8:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V9 + SCHEMA_V10)
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA_V9 + SCHEMA_V10 + SCHEMA_V11
+            )
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:
@@ -551,7 +600,17 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if current == 9:
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V10)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V10 + SCHEMA_V11)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    if current == 10:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V11)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
         except Exception:

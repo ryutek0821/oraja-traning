@@ -14,6 +14,10 @@ from typing import Sequence
 from oraja_training.collect import backfill, snapshot
 from oraja_training.collect.poller import Poller, TickResult
 from oraja_training.db import readers, store
+from oraja_training.db.classification_adapter import (
+    record_classification_error,
+    replace_classification_source,
+)
 from oraja_training.db.recommendation_adapter import SQLiteRecommendationRepository
 from oraja_training.domain import ProfileContext
 from oraja_training.features import build_all
@@ -28,7 +32,13 @@ from oraja_training.plan.experiment import (
     start_experiment,
 )
 from oraja_training.serve import create_progress_token, run_sender, send_progress, serve
-from oraja_training.tables import fetch_table, resolve
+from oraja_training.tables import (
+    DEFAULT_CLASSIFICATION_SOURCES,
+    ClassificationSourceSpec,
+    build_classification_batch,
+    fetch_table,
+    resolve,
+)
 
 
 DEFAULT_TABLES = (
@@ -96,6 +106,29 @@ def _parser() -> argparse.ArgumentParser:
     refresh.add_argument(
         "--table", action="append", default=[], metavar="ID=URL",
         help="source table page/header; defaults to GENOCIDE, Overjoy, Satellite and Stella",
+    )
+
+    classifications = subcommands.add_parser(
+        "classifications", help="external chart-classification operations"
+    )
+    classification_commands = classifications.add_subparsers(
+        dest="classifications_command", required=True
+    )
+    classification_refresh = classification_commands.add_parser(
+        "refresh", help="fetch, normalize and match supported classification tables"
+    )
+    classification_refresh.add_argument(
+        "--assistant-db", type=Path, default=Path("assistant.db")
+    )
+    classification_refresh.add_argument(
+        "--cache-dir", type=Path, default=Path(".cache/classifications")
+    )
+    classification_refresh.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="ID=URL",
+        help="override a supported source URL; defaults to the four sl/st pattern tables",
     )
 
     features = subcommands.add_parser("features", help="songinfo feature operations")
@@ -314,6 +347,80 @@ def _refresh_tables(
         conn.close()
 
 
+def _classification_specs(values: Sequence[str]) -> tuple[ClassificationSourceSpec, ...]:
+    if not values:
+        return DEFAULT_CLASSIFICATION_SOURCES
+    supported = {source.source_id: source for source in DEFAULT_CLASSIFICATION_SOURCES}
+    specs: list[ClassificationSourceSpec] = []
+    seen: set[str] = set()
+    for value in values:
+        source_id, separator, url = value.partition("=")
+        source_id, url = source_id.strip(), url.strip()
+        if not separator or not source_id or not url:
+            raise ValueError(f"invalid --source {value!r}; expected ID=URL")
+        if source_id not in supported:
+            raise ValueError(f"unsupported classification source {source_id!r}")
+        if source_id in seen:
+            raise ValueError(f"duplicate classification source {source_id!r}")
+        seen.add(source_id)
+        original = supported[source_id]
+        specs.append(
+            ClassificationSourceSpec(
+                original.source_id, original.family, url, original.scales
+            )
+        )
+    return tuple(specs)
+
+
+def _refresh_classifications(
+    assistant_db: Path,
+    cache_dir: Path,
+    specs: Sequence[ClassificationSourceSpec],
+) -> dict[str, object]:
+    conn = store.init(assistant_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        charts = [dict(row) for row in conn.execute("SELECT * FROM charts")]
+        if not charts:
+            raise RuntimeError("assistant DB has no charts; run initialize first")
+        summaries: list[dict[str, object]] = []
+        errors: list[dict[str, str]] = []
+        for source in specs:
+            try:
+                table = fetch_table(
+                    source.source_id, source.url, cache_dir=cache_dir
+                )
+                batch = build_classification_batch(source, table, charts)
+                with conn:
+                    replace_classification_source(conn, batch)
+                summaries.append(
+                    {
+                        "source_id": source.source_id,
+                        "family": source.family,
+                        "entries": batch.entry_count,
+                        "classifications": batch.classification_count,
+                        "matched": batch.matched_count,
+                        "match_rate": (
+                            batch.matched_count / batch.entry_count
+                            if batch.entry_count
+                            else 0.0
+                        ),
+                        "content_digest": batch.content_digest,
+                        "stale": table.stale,
+                    }
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                with conn:
+                    record_classification_error(conn, source, error)
+                errors.append({"source_id": source.source_id, "error": str(exc)})
+        if not summaries:
+            raise RuntimeError(f"no classification source refreshed: {errors}")
+        return {"classifications": summaries, "errors": errors}
+    finally:
+        conn.close()
+
+
 def _build_features(songinfo_db: Path, assistant_db: Path) -> int:
     source = readers.open_snapshot(songinfo_db)
     destination = store.init(assistant_db)
@@ -465,6 +572,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "tables":
         result = _refresh_tables(
             args.assistant_db, args.cache_dir, _table_specs(args.table)
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command == "classifications":
+        result = _refresh_classifications(
+            args.assistant_db,
+            args.cache_dir,
+            _classification_specs(args.source),
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0

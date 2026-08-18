@@ -42,8 +42,23 @@ oraja-training tables refresh \
 Shift_JIS/JavaScript旧形式をコード実行せず解析し、hashがない項目は正規化titleがローカルで
 一意な場合だけ照合します。照合数/全項目数は保存され、低照合率をメニュー警告へ出します。
 
+作者から利用許可を得たDJHemorrhoid/tablesの譜面分類は、リポジトリをfork・同梱せず
+公開JSONから独立した分類データとして取り込みます。
+
+```console
+oraja-training classifications refresh \
+  --assistant-db ./assistant.db
+```
+
+既定では`slst-code-stream`（乱打/重発狂）、`slst-mini-jack`（微縦連/連打複合）、
+`slst-arm`（Ude/腕）、`slst-delay`（dl/`///`）の4表を対象にします。`sl10,dl-2,///10`
+のような複合ラベルは基礎難易度と分類軸ごとの行へ正規化し、SHA-256優先・MD5補助で
+ローカル譜面へ照合します。取得内容のdigestと照合状態を保存し、一部の取得が失敗しても
+そのsourceの最後の正常な行は残します。分類は難易度尺度や学習特徴へ暗黙に混ぜず、
+推薦入力から参照可能な独立データです。キャッシュ先は`.cache/classifications/`です。
+
 schema version 1の既存`assistant.db`は正しい値へ復元できないため、in-place移行しません。
-version 2以降は履歴を保持して段階的に移行します。現行schema versionは10です。
+version 2以降は履歴を保持して段階的に移行します。現行schema versionは11です。
 
 ## 毎日の更新
 

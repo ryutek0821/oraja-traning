@@ -215,6 +215,7 @@ class RecommendationInput:
     model: ModelSnapshot | None = None
     table_sources: tuple[Mapping[str, Any], ...] = ()
     warmup_adjustment: int = 0
+    classifications: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.import_id < 0 or self.baseline_judged < 0:
