@@ -18,6 +18,7 @@ from oraja_training.plan.menu import (
     build_session_from_input,
     next_training_date,
     recommendation_output,
+    table_payloads,
     training_day,
     write_export,
 )
@@ -105,6 +106,42 @@ def _warmup_records() -> tuple[dict[str, object], ...]:
         )
     )
     return tuple(rows)
+
+
+def test_external_classifications_reach_candidates_and_display() -> None:
+    row = _record(999, level=4, clear=6)
+    classification = {
+        "sha256": row["sha256"],
+        "source_id": "slst-code-stream",
+        "family": "code_stream",
+        "base_scale": "sl",
+        "base_level": 4,
+        "classification_scale": "乱打",
+        "classification_level": 5,
+        "raw_level": "sl4,乱打5",
+        "match_status": "sha256",
+    }
+    candidates, _, _, _ = _load_candidates((row,), None, (classification,))
+    assert candidates[0].classifications == (classification,)
+
+    session = build_session_from_input(
+        RecommendationInput(
+            ProfileContext(),
+            1,
+            0,
+            (row,),
+            classifications=(classification,),
+        ),
+        menu_date="2026-08-15",
+        target_judged=100,
+        reserve_judged=0,
+        clock=lambda: NOW,
+    )
+    assert "pattern:code_stream:乱打" in session.weakness_axes
+    score = table_payloads(session)["table/recommend/score.json"]
+    assert "patterns 乱打5" in score[0]["comment"]
+
+
 def test_training_day_uses_local_0400_across_dst_and_month_boundaries() -> None:
     assert training_day(datetime.fromisoformat("2026-08-14T03:59:59+09:00"), "Asia/Tokyo").isoformat() == "2026-08-13"
     assert training_day(datetime.fromisoformat("2026-08-14T04:00:00+09:00"), "Asia/Tokyo").isoformat() == "2026-08-14"

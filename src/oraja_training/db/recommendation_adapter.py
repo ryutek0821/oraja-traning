@@ -16,6 +16,7 @@ from oraja_training.domain.types import (
     RecommendationOutput,
 )
 
+from .classification_adapter import load_chart_classifications
 from .model_adapter import latest_model
 
 
@@ -236,9 +237,11 @@ class SQLiteRecommendationRepository:
         table_sources = tuple(
             _row_mapping(source_cursor, row) for row in source_cursor.fetchall()
         )
+        classifications = load_chart_classifications(self.conn)
         if latest is None:
             return RecommendationInput(
                 profile, 0, 0, (), table_sources=table_sources,
+                classifications=classifications,
                 warmup_adjustment=_warmup_adjustment(self.conn),
             )
         cursor = self.conn.execute(_CANDIDATE_QUERY)
@@ -250,6 +253,7 @@ class SQLiteRecommendationRepository:
             candidates=tuple(rows),
             model=latest_model(self.conn),
             table_sources=table_sources,
+            classifications=classifications,
             warmup_adjustment=_warmup_adjustment(self.conn),
         )
 

@@ -895,7 +895,7 @@ def test_legacy_single_transfer_assignment_remains_idempotent(tmp_path) -> None:
         assert build_candidate_sets(
             conn, experiment_id=experiment_id, session_key="legacy"
         )["transfer"] == legacy_candidates["transfer"]
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute(
             "SELECT count(*) FROM experiment_sessions"
         ).fetchone()[0] == 1
