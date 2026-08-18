@@ -9,7 +9,7 @@ import pytest
 
 from oraja_training.db import store
 from oraja_training.db.recommendation_adapter import SQLiteRecommendationRepository
-from oraja_training.domain import ProfileContext, RecommendationInput
+from oraja_training.domain import ModelSnapshot, ProfileContext, RecommendationInput
 from oraja_training.plan.menu import (
     WARMUP_FEATURES,
     _load_candidates,
@@ -696,6 +696,194 @@ def test_warmup_does_not_fallback_when_no_chart_has_safe_evidence() -> None:
         "warmup: no chart met safe lamp-evidence and feature criteria"
         in session.table_warnings
     )
+
+
+def test_insufficient_table_evidence_keeps_unproven_charts_out_of_daily_menu() -> None:
+    observed = _record(
+        900,
+        table_id="overjoy",
+        level=3,
+        clear=1,
+        playcount=1,
+    )
+    unproven = _record(
+        901,
+        table_id="overjoy",
+        level=3,
+        clear=1,
+        playcount=0,
+    )
+    unproven["last_played"] = 0
+    session = build_session_from_input(
+        RecommendationInput(
+            ProfileContext(),
+            1,
+            0,
+            (observed, unproven),
+            table_sources=({"table_id": "overjoy", "last_error": None},),
+        ),
+        menu_date="2026-08-15",
+        target_judged=100,
+        reserve_judged=0,
+        clock=lambda: NOW,
+    )
+
+    candidate = next(
+        value for value in session.personal if value.sha256 == unproven["sha256"]
+    )
+    frontier = next(
+        value for value in session.table_frontiers if value.table_id == "overjoy"
+    )
+    assert frontier.observations == 1
+    assert frontier.hard_clears == 0
+    assert candidate.p_complete == 0.34
+    assert candidate.tier == "R4 FUTURE"
+    assert candidate.sha256 not in {item.sha256 for item in session.queue}
+    assert any(
+        "overjoy: insufficient lamp evidence for challenge/warmup" in warning
+        for warning in session.table_warnings
+    )
+
+
+def test_validated_model_cannot_promote_a_chart_without_table_evidence() -> None:
+    unproven = _record(
+        902,
+        table_id="overjoy",
+        level=3,
+        clear=1,
+        playcount=0,
+    )
+    unproven["last_played"] = 0
+    model = ModelSnapshot(
+        target="observed_completion",
+        version=1,
+        trained_at=NOW,
+        n_train=200,
+        weights=(0.0, 0.0, 0.0, 0.0),
+        means=(0.0, 0.0, 0.0),
+        scales=(1.0, 1.0, 1.0),
+        feature_names=(
+            "table_completion_margin",
+            "density_p99",
+            "scratch_rate",
+        ),
+    )
+
+    candidates, _, _, frontiers = _load_candidates((unproven,), model)
+
+    assert frontiers[0].observations == 0
+    assert candidates[0].p_complete == 0.34
+    assert candidates[0].tier == "R4 FUTURE"
+
+
+def test_reliable_cross_table_rating_beats_sparse_primary_rating() -> None:
+    rows = [
+        _record(
+            1_000 + index,
+            table_id="satellite",
+            level=index + 1,
+            clear=6 if index < 3 else 1,
+        )
+        for index in range(8)
+    ]
+    rows.append(
+        _record(
+            1_100,
+            table_id="overjoy",
+            level=3,
+            clear=1,
+            playcount=1,
+        )
+    )
+    shared_sha256 = "e" * 64
+    for table_id in ("overjoy", "satellite"):
+        membership = _record(
+            1_200,
+            table_id=table_id,
+            level=3,
+            clear=1,
+            playcount=0,
+            sha256=shared_sha256,
+        )
+        membership["last_played"] = 0
+        rows.append(membership)
+
+    candidates, _, _, frontiers = _load_candidates(tuple(rows), None)
+
+    candidate = next(value for value in candidates if value.sha256 == shared_sha256)
+    by_table = {value.table_id: value for value in frontiers}
+    assert by_table["satellite"].observations == 8
+    assert by_table["satellite"].hard_clears == 3
+    assert by_table["overjoy"].observations == 1
+    assert candidate.table_id == "satellite"
+    assert candidate.tier == "R3 CHALLENGE"
+
+
+def test_direct_hard_clear_survives_sparse_table_guard() -> None:
+    candidates, _, _, frontiers = _load_candidates(
+        (_record(1_300, table_id="overjoy", level=3, clear=6, playcount=1),),
+        None,
+    )
+
+    assert frontiers[0].observations == 1
+    assert frontiers[0].hard_clears == 1
+    assert candidates[0].p_complete == 0.97
+    assert candidates[0].tier == "R0 RECOVERY"
+
+
+def test_direct_easy_clear_remains_a_sparse_table_challenge() -> None:
+    candidates, _, _, frontiers = _load_candidates(
+        (_record(1_301, table_id="overjoy", level=3, clear=4, playcount=1),),
+        None,
+    )
+
+    assert frontiers[0].observations == 1
+    assert frontiers[0].hard_clears == 0
+    assert candidates[0].p_complete == 0.35
+    assert candidates[0].tier == "R3 CHALLENGE"
+
+
+def test_numeric_cross_table_rating_beats_nonnumeric_observed_membership() -> None:
+    rows = [
+        _record(
+            1_400 + index,
+            table_id="genocide",
+            level=index + 1,
+            clear=6 if index < 3 else 1,
+        )
+        for index in range(10)
+    ]
+    rows.extend(
+        _record(
+            1_500 + index,
+            table_id="satellite",
+            level=index + 1,
+            clear=6 if index < 3 else 1,
+        )
+        for index in range(8)
+    )
+    shared_sha256 = "d" * 64
+    for table_id, level in (("genocide", "★???"), ("satellite", 3)):
+        membership = _record(
+            1_600,
+            table_id=table_id,
+            level=level,
+            clear=1,
+            playcount=0,
+            sha256=shared_sha256,
+        )
+        membership["last_played"] = 0
+        rows.append(membership)
+
+    candidates, _, _, frontiers = _load_candidates(tuple(rows), None)
+
+    by_table = {value.table_id: value for value in frontiers}
+    assert by_table["genocide"].observations == 10
+    assert by_table["satellite"].observations == 8
+    candidate = next(value for value in candidates if value.sha256 == shared_sha256)
+    assert candidate.table_id == "satellite"
+    assert candidate.level_number == 3
+    assert candidate.tier == "R3 CHALLENGE"
 
 
 def test_table_frontiers_are_independent_and_all_memberships_are_exported(
