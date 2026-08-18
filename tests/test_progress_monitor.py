@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
+from zoneinfo import ZoneInfo
 
 from oraja_training.serve.progress_monitor import (
     MonitorSettings,
@@ -17,10 +18,13 @@ from oraja_training.serve.progress_sender import ProgressCounts, read_progress_c
 
 _JUDGEMENTS = ("epg", "lpg", "egr", "lgr", "egd", "lgd", "ebd", "lbd", "epr", "lpr")
 ROOT = Path(__file__).resolve().parents[1]
+TOKYO = ZoneInfo("Asia/Tokyo")
 
 
 def _score_db(path: Path, *, latest: datetime | None = None) -> datetime:
-    latest = latest or datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    latest = latest or datetime.now(TOKYO).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
     previous = latest - timedelta(days=1)
     connection = sqlite3.connect(path)
     columns = ", ".join(f'"{name}" INTEGER' for name in _JUDGEMENTS)
@@ -126,10 +130,10 @@ def test_monitor_worker_sends_on_change_heartbeat_and_manual_request(
     monotonic_now = [100.0]
     wall_now = [2_000.0]
     counts = [ProgressCounts(10, 4)]
-    sent: list[tuple[int, int]] = []
+    sent: list[tuple[int, int | None, int]] = []
 
-    def sender(_url, _token, current, *, observed_at, **_kwargs):
-        sent.append((current, observed_at))
+    def sender(_url, _token, current, *, today_judged, observed_at, **_kwargs):
+        sent.append((current, today_judged, observed_at))
         return {"status": "accepted"}
 
     worker = ProgressMonitorWorker(
@@ -144,21 +148,21 @@ def test_monitor_worker_sends_on_change_heartbeat_and_manual_request(
     first = worker.poll_once()
     assert first.status == "LIVE"
     assert first.current_judged == 10
-    assert sent == [(10, 2_000)]
+    assert sent == [(10, 4, 2_000)]
 
     monotonic_now[0] += 5
     wall_now[0] += 5
     worker.poll_once()
-    assert sent == [(10, 2_000)]
+    assert sent == [(10, 4, 2_000)]
 
-    counts[0] = ProgressCounts(12, 6)
+    counts[0] = ProgressCounts(10, 6)
     worker.poll_once()
-    assert sent[-1] == (12, 2_005)
+    assert sent[-1] == (10, 6, 2_005)
 
     monotonic_now[0] += settings.heartbeat
     wall_now[0] += settings.heartbeat
     worker.poll_once()
-    assert sent[-1] == (12, 2_035)
+    assert sent[-1] == (10, 6, 2_035)
 
     worker.poll_once(force=True)
     assert len(sent) == 4

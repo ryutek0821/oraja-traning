@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from io import BytesIO
 import json
+from datetime import datetime
 from email.message import Message
 from http import HTTPStatus
 from pathlib import Path
 import socket
 import sqlite3
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from oraja_training.serve.app import (
     COCKPIT_HTML,
@@ -19,14 +21,26 @@ from oraja_training.serve.app import (
 
 
 JUDGES = ("epg", "lpg", "egr", "lgr", "egd", "lgd", "ebd", "lbd", "epr", "lpr")
+TOKYO = ZoneInfo("Asia/Tokyo")
 
 
-def _score_db(path: Path, values: tuple[int, ...]) -> None:
+def _score_db(
+    path: Path,
+    values: tuple[int, ...],
+    *,
+    observed_at: int | None = None,
+    previous_values: tuple[int, ...] | None = None,
+) -> None:
+    observed_at = observed_at or int(datetime.now(TOKYO).timestamp())
     connection = sqlite3.connect(path)
     columns = ", ".join(f"{name} INTEGER" for name in JUDGES)
     connection.execute(f"CREATE TABLE player (date INTEGER PRIMARY KEY, {columns})")
     placeholders = ", ".join("?" for _ in range(11))
-    connection.execute(f"INSERT INTO player VALUES ({placeholders})", (1, *values))
+    rows = []
+    if previous_values is not None:
+        rows.append((observed_at - 86_400, *previous_values))
+    rows.append((observed_at, *values))
+    connection.executemany(f"INSERT INTO player VALUES ({placeholders})", rows)
     connection.commit()
     connection.close()
 
@@ -38,6 +52,8 @@ def _server(export_dir: Path, score_db: Path | None = None) -> TrainingHTTPServe
     server.score_db = score_db.resolve() if score_db else None
     server.target_judged = 100_000
     server.last_current_judged = None
+    server.last_today_judged = None
+    server.last_progress_date = None
     server.progress_state = None
     server.progress_token = None
     server.progress_source_id = "RYU-DESKTOP2"
@@ -169,14 +185,19 @@ def test_remote_progress_is_authenticated_idempotent_and_used_by_status(
     server.progress_stale_after = 90
     monkeypatch.setattr("oraja_training.serve.app.time.time", lambda: 2_000)
     payload = json.dumps(
-        {"source_id": "RYU-DESKTOP2", "current_judged": 2_500, "observed_at": 2_000}
+        {
+            "source_id": "RYU-DESKTOP2",
+            "current_judged": 2_500,
+            "today_judged": 600,
+            "observed_at": 2_000,
+        }
     ).encode()
 
     assert _post(server, "wrong", payload)[0] == HTTPStatus.UNAUTHORIZED
     assert _post(server, "secret-token", payload)[0] == HTTPStatus.OK
     assert _post(server, "secret-token", payload)[0] == HTTPStatus.OK
     status = server.status()
-    assert status["live_judged"] == 1_500
+    assert status["live_judged"] == 600
     assert status["progress_source"] == "RYU-DESKTOP2"
     assert status["progress_received_at"] == 2_000
     assert status["stale"] is False
@@ -185,6 +206,82 @@ def test_remote_progress_is_authenticated_idempotent_and_used_by_status(
         {"source_id": "RYU-DESKTOP2", "current_judged": 2_499, "observed_at": 2_001}
     ).encode()
     assert _post(server, "secret-token", backwards)[0] == HTTPStatus.CONFLICT
+
+
+def test_local_and_remote_status_use_the_same_tokyo_daily_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    export = tmp_path / "export"
+    export.mkdir()
+    (export / "manifest.json").write_text(
+        '{"baseline_judged":1000}', encoding="utf-8"
+    )
+    observed_at = int(datetime(2026, 8, 18, 12, tzinfo=TOKYO).timestamp())
+    monkeypatch.setattr("oraja_training.serve.app.time.time", lambda: observed_at)
+    score = tmp_path / "score.db"
+    _score_db(
+        score,
+        (250,) * 10,
+        observed_at=observed_at,
+        previous_values=(100,) * 10,
+    )
+    local = _server(export, score).status()
+
+    remote_server = _server(export)
+    remote_server.progress_state = tmp_path / "progress.json"
+    remote_server.progress_state.write_text(
+        json.dumps(
+            {
+                "source_id": "RYU-DESKTOP2",
+                "current_judged": 2_500,
+                "today_judged": 1_500,
+                "observed_at": observed_at,
+                "observed_date": "2026-08-18",
+                "received_at": observed_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+    remote = remote_server.status()
+
+    assert local["live_judged"] == remote["live_judged"] == 1_500
+    assert local["remaining_judged"] == remote["remaining_judged"] == 98_500
+    assert local["progress"] == remote["progress"] == 0.015
+
+
+def test_prior_day_old_progress_state_resets_daily_display(
+    tmp_path: Path, monkeypatch
+) -> None:
+    export = tmp_path / "export"
+    export.mkdir()
+    (export / "manifest.json").write_text(
+        '{"baseline_judged":1000}', encoding="utf-8"
+    )
+    before_midnight = int(
+        datetime(2026, 8, 18, 23, 59, 59, tzinfo=TOKYO).timestamp()
+    )
+    monkeypatch.setattr(
+        "oraja_training.serve.app.time.time", lambda: before_midnight + 2
+    )
+    server = _server(export)
+    server.progress_state = tmp_path / "progress.json"
+    server.progress_state.write_text(
+        json.dumps(
+            {
+                "source_id": "RYU-DESKTOP2",
+                "current_judged": 2_500,
+                "observed_at": before_midnight,
+                "received_at": before_midnight,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = server.status()
+    assert status["live_judged"] == 0
+    assert status["remaining_judged"] == 100_000
+    assert status["progress"] == 0.0
+    assert status["complete"] is False
 
 
 def test_remote_progress_rejects_non_integer_and_unexpected_payloads(

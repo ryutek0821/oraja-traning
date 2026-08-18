@@ -166,7 +166,7 @@ class ProgressMonitorWorker:
         self._send_now = threading.Event()
         self._last_sent_monotonic: float | None = None
         self._last_sent_at: float | None = None
-        self._last_sent_count: int | None = None
+        self._last_sent_counts: ProgressCounts | None = None
         self._last_counts: ProgressCounts | None = None
 
     def poll_once(self, *, force: bool = False) -> MonitorSnapshot:
@@ -178,7 +178,7 @@ class ProgressMonitorWorker:
             due = (
                 force
                 or self._last_sent_monotonic is None
-                or counts.current_judged != self._last_sent_count
+                or counts != self._last_sent_counts
                 or monotonic_now - self._last_sent_monotonic
                 >= self.settings.heartbeat
             )
@@ -187,12 +187,13 @@ class ProgressMonitorWorker:
                     self.settings.server_url,
                     self._token,
                     counts.current_judged,
+                    today_judged=counts.today_judged,
                     source_id=self.settings.source_id,
                     observed_at=int(now),
                 )
                 self._last_sent_monotonic = monotonic_now
                 self._last_sent_at = now
-                self._last_sent_count = counts.current_judged
+                self._last_sent_counts = counts
             remaining = (
                 self.settings.heartbeat
                 if self._last_sent_monotonic is None
