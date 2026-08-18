@@ -58,6 +58,9 @@ QUOTAS = {
 FEATURE_AXES = ("density", "scratch", "ln", "soflan")
 DIFFICULTY_TABLES = ("genocide", "overjoy", "satellite", "stella")
 MIN_TABLE_MATCH_COVERAGE = 0.80
+MIN_FRONTIER_OBSERVATIONS = 8
+MIN_FRONTIER_HARD_CLEARS = 3
+UNPROVEN_COMPLETION = 0.34
 CORE_WARMUP_FEATURES = (
     "density_p90",
     "end_density",
@@ -278,6 +281,14 @@ def _frontier(rows: list[tuple[float, bool]]) -> float:
     return fit_difficulty_frontier(rows)
 
 
+def _frontier_has_evidence(frontier: TableFrontier | None) -> bool:
+    return (
+        frontier is not None
+        and frontier.observations >= MIN_FRONTIER_OBSERVATIONS
+        and frontier.hard_clears >= MIN_FRONTIER_HARD_CLEARS
+    )
+
+
 def _optional_number(row: Mapping[str, Any], key: str) -> float | None:
     value = row.get(key)
     if value is None:
@@ -484,10 +495,17 @@ def _load_candidates(
         primary_rating = min(
             ratings,
             key=lambda rating: (
-                -frontier_by_table.get(
-                    rating.table_id,
-                    TableFrontier(rating.table_id, 0, 0, 0, 0, 0, 0),
-                ).observations,
+                not (
+                    rating.level_number is not None
+                    and _frontier_has_evidence(
+                        frontier_by_table.get(rating.table_id)
+                    )
+                ),
+                -(
+                    frontier_by_table[rating.table_id].observations
+                    if rating.table_id in frontier_by_table
+                    else 0
+                ),
                 DIFFICULTY_TABLES.index(rating.table_id)
                 if rating.table_id in DIFFICULTY_TABLES else len(DIFFICULTY_TABLES),
                 rating.table_id,
@@ -496,15 +514,17 @@ def _load_candidates(
             ),
         )
         primary_frontier = frontier_by_table.get(primary_rating.table_id)
-        if primary_rating.level_number is None:
+        reliable_frontier = (
+            primary_rating.level_number is not None
+            and _frontier_has_evidence(primary_frontier)
+        )
+        if not reliable_frontier:
             completion_margin = 0.0
-            probability = 0.5
+            probability = UNPROVEN_COMPLETION
         else:
-            easy_frontier = (
-                primary_rating.level_number
-                if primary_frontier is None or primary_frontier.observations == 0
-                else primary_frontier.easy
-            )
+            assert primary_frontier is not None
+            assert primary_rating.level_number is not None
+            easy_frontier = primary_frontier.easy
             completion_margin = (easy_frontier - primary_rating.level_number) / 1.5
             probability = _logistic(completion_margin)
         model_probability = predict_snapshot(
@@ -522,14 +542,18 @@ def _load_candidates(
             probability = max(probability, 0.97)
         elif clear >= 5:
             probability = max(probability, 0.90)
-        elif (
-            clear >= 4
-            and int(row.get("recent_successes") or 0) >= 2
-            and int(row.get("recent_failures") or 0) == 0
-        ):
-            probability = max(probability, 0.88)
+        elif clear >= 4:
+            if (
+                int(row.get("recent_successes") or 0) >= 2
+                and int(row.get("recent_failures") or 0) == 0
+            ):
+                probability = max(probability, 0.88)
+            else:
+                probability = max(probability, 0.35)
         elif int(row["playcount"]) > 2:
             probability = max(0.03, probability - 0.05)
+        if not reliable_frontier and clear < 4:
+            probability = min(probability, UNPROVEN_COMPLETION)
         scores = {axis: feature_ranks[axis][index] for axis in FEATURE_AXES}
         warmup_scores = {
             feature: warmup_feature_ranks[feature][index]
@@ -791,8 +815,7 @@ def _select_warmup(
             if (
                 rating.level_number is None
                 or frontier is None
-                or frontier.observations < 8
-                or frontier.hard_clears < 3
+                or not _frontier_has_evidence(frontier)
             ):
                 continue
             anchor = frontier.warmup_anchor + effective_shift
@@ -878,11 +901,18 @@ def _select(
         candidate
         for candidate in candidates
         if candidate.sha256 not in used
+        and candidate.tier != "R4 FUTURE"
         and predicate(candidate)
         and not (readiness == "tired" and candidate.high_load >= 0.80)
     ]
     if not eligible and allow_fallback:
-        eligible = [candidate for candidate in candidates if candidate.sha256 not in used]
+        eligible = [
+            candidate
+            for candidate in candidates
+            if candidate.sha256 not in used
+            and candidate.tier != "R4 FUTURE"
+            and not (readiness == "tired" and candidate.high_load >= 0.80)
+        ]
     eligible.sort(
         key=lambda candidate: _utility(
             candidate,
@@ -1009,15 +1039,14 @@ def _table_warnings(
                 )
             frontier = frontier_by_id.get(table_id)
             if (
-                frontier is None
-                or frontier.observations < 8
-                or frontier.hard_clears < 3
+                not _frontier_has_evidence(frontier)
             ):
                 observations = 0 if frontier is None else frontier.observations
                 hard_clears = 0 if frontier is None else frontier.hard_clears
                 warnings.append(
-                    f"{table_id}: insufficient lamp evidence for warmup "
-                    f"({observations} observations, {hard_clears} HARD+)"
+                    f"{table_id}: insufficient lamp evidence for challenge/warmup "
+                    f"classification ({observations} observations, "
+                    f"{hard_clears} HARD+); unproven charts stay in R4 FUTURE"
                 )
     return tuple(warnings)
 
